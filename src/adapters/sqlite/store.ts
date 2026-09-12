@@ -1,0 +1,1367 @@
+/**
+ * SQLite implementation of the {@link TrainingStore} port, built on the built-in
+ * `node:sqlite` `DatabaseSync` (no dependency, no separate driver process).
+ *
+ * Shape of the implementation:
+ *
+ * - **One connection, serialized.** Every operation goes through a FIFO mutex and an
+ *   `AsyncLocalStorage` transaction scope ({@link concurrency}), so an `await` inside a
+ *   `transaction()` callback can never let an unrelated operation join — or be rolled back
+ *   with — that transaction. Operations invoked *inside* the callback reuse the connection
+ *   directly, which is why there is no deadlock and why they observe their own uncommitted
+ *   writes (the manual-decision revision is meant to be captured that way).
+ * - **Immutable records are content identities.** Snapshots, analyses, tag decisions and
+ *   retrospectives are inserted once; re-saving the same id with a different body throws
+ *   `immutable_violation` instead of overwriting history, and an identical re-save is a
+ *   no-op. Mutable records (problems, submissions, jobs, plans, checkpoints) are upserted,
+ *   with monotonic guards where losing data would corrupt accounting.
+ * - **The head only moves forward.** `saveSnapshot` refuses to install an older version than
+ *   the stored head, so an analysis of a newer snapshot can never be reverted by a late
+ *   write of an old one.
+ * - **Explicit paths.** The adapter creates the parent directory of the configured database
+ *   path only; it never guesses a data directory and never copies a database file with the
+ *   filesystem (backups go through `VACUUM INTO`, which includes WAL content).
+ * - **Bounded reads.** List methods enforce the port's `1..500` page bound and return an
+ *   opaque cursor; ordering is by the domain's stable ids, so paging is deterministic.
+ */
+import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import {
+  DomainError,
+  assertIsoTimestamp,
+  canonicalJson,
+  invariant,
+  isLeaseExpired,
+  problemKey,
+  recoverAfterRestart,
+  transitionJob,
+  type Account,
+  type AnalysisJobState,
+  type AnalysisJobStatus,
+  type AnalysisResult,
+  type ManualTagDecision,
+  type NormalizedProblem,
+  type ProblemRef,
+  type ProblemSnapshot,
+  type Retrospective,
+  type SnapshotHead,
+  type SourceInstance,
+  type Submission,
+  type TagDecision,
+  type TrainingPlan,
+} from '../../domain/index.js';
+import type { Page, PageRequest, ProblemQuery, StoreCapabilities, TrainingStore } from '../../application/ports.js';
+import {
+  STORAGE_PAGE_LIMITS,
+  SYNC_RESOURCES,
+  syncCheckpointKey,
+  type JobLeaseRequest,
+  type SyncCheckpoint,
+  type SyncCheckpointRef,
+  type SyncResource,
+} from '../../application/storage-types.js';
+import { FifoMutex, TransactionScopes, type TransactionScope } from './concurrency.js';
+import { StorageError } from './errors.js';
+import {
+  ACCOUNT_FIELDS,
+  ANALYSIS_FIELDS,
+  JOB_FIELDS,
+  MANUAL_DECISION_FIELDS,
+  PLAN_FIELDS,
+  PROBLEM_FIELDS,
+  RETROSPECTIVE_FIELDS,
+  SNAPSHOT_FIELDS,
+  SOURCE_INSTANCE_FIELDS,
+  SUBMISSION_FIELDS,
+  TAG_DECISION_FIELDS,
+  bodyOf,
+  decodeCursor,
+  encodeCursor,
+  entityFromRow,
+  intColumn,
+  jobCounterRow,
+  jobCounters,
+  nullableTextColumn,
+  parseBody,
+  requireProblemKey,
+  requireSameBody,
+  requireValidSnapshot,
+  snapshotIdentity,
+  textColumn,
+  type Row,
+} from './entities.js';
+import {
+  SCHEMA_VERSION_EMPTY,
+  STORE_MARKER,
+  STORE_SCHEMA_VERSION,
+  backupFileName,
+  configureConnection,
+  detectSchemaState,
+  initializeSchemaV1,
+  readMarker,
+  readUserVersion,
+} from './schema.js';
+
+/** Values this adapter binds into prepared statements. */
+type SqlValue = null | number | string;
+
+const JOB_STATUSES: readonly AnalysisJobStatus[] = [
+  'pending',
+  'running',
+  'paused_quota',
+  'succeeded',
+  'failed',
+  'cancelled',
+];
+
+const SYNC_RESOURCE_VALUES: readonly string[] = SYNC_RESOURCES;
+
+/** Terminal or deliberately paused states a lease claim must not touch. */
+const UNCLAIMABLE: readonly AnalysisJobStatus[] = ['paused_quota', 'succeeded', 'failed', 'cancelled'];
+
+export interface SqliteTrainingStoreOptions {
+  /** Explicit database path. The parent directory is created when missing. */
+  readonly path: string;
+  /** Clock for store-maintained metadata (read timestamps, head version time). */
+  readonly now?: () => string;
+}
+
+function requireId(label: string, value: string): string {
+  invariant(typeof value === 'string' && value.length > 0, 'invalid_input', `${label} is required`, {
+    label,
+    value,
+  });
+  return value;
+}
+
+export class SqliteTrainingStore implements TrainingStore {
+  readonly path: string;
+
+  private readonly connection: DatabaseSync;
+  private readonly clock: () => string;
+  private readonly mutex = new FifoMutex();
+  private readonly scopes = new TransactionScopes();
+  private readonly statements = new Map<string, StatementSync>();
+  private closed = false;
+
+  constructor(options: SqliteTrainingStoreOptions) {
+    const path = options.path;
+    if (typeof path !== 'string' || path.trim().length === 0) {
+      throw new StorageError('invalid_path', 'database path must be a non-empty string', { path });
+    }
+    this.path = path;
+    this.clock = options.now ?? (() => new Date().toISOString());
+    const inMemory = path === ':memory:';
+    if (!inMemory) {
+      const parent = dirname(resolve(path));
+      try {
+        mkdirSync(parent, { recursive: true });
+      } catch (error) {
+        throw new StorageError('invalid_path', `database directory could not be created: ${parent}`, {
+          path,
+          cause: String(error),
+        });
+      }
+    }
+    let connection: DatabaseSync;
+    try {
+      connection = new DatabaseSync(path);
+    } catch (error) {
+      throw new StorageError('open_failed', `database could not be opened: ${path}`, {
+        path,
+        cause: String(error),
+      });
+    }
+    this.connection = connection;
+    try {
+      this.openSchema(inMemory);
+    } catch (error) {
+      // A half-opened store must not leak its file handle.
+      let closeCause: string | null = null;
+      try {
+        connection.close();
+      } catch (closeError) {
+        closeCause = String(closeError);
+      }
+      if (closeCause !== null) {
+        throw new StorageError('open_failed', 'store initialization failed and the database could not be closed', {
+          path,
+          cause: String(error),
+          closeCause,
+        });
+      }
+      if (error instanceof StorageError) {
+        throw error;
+      }
+      throw new StorageError('open_failed', `store could not be opened: ${path}`, { path, cause: String(error) });
+    }
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------------------------
+
+  capabilities(): StoreCapabilities {
+    return {
+      implemented: true,
+      schemaVersion: STORE_SCHEMA_VERSION,
+      transactional: true,
+      notes: [
+        `node:sqlite DatabaseSync; schema marker ${STORE_MARKER}; one serialized connection`,
+        'Databases from a newer schema are rejected before any write; v0 databases are migrated after a consistent backup',
+        'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
+      ],
+    };
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    if (this.scopes.isActiveOwner(this)) {
+      throw new StorageError('close_in_transaction', 'store cannot be closed from inside its own transaction', {
+        path: this.path,
+      });
+    }
+    await this.mutex.run(async () => {
+      if (this.closed) {
+        return;
+      }
+      this.statements.clear();
+      this.connection.close();
+      this.closed = true;
+    });
+  }
+
+  /**
+   * Write a consistent single-file copy of this database (WAL content included).
+   *
+   * The call rejects *before* queueing when it arrives inside this store's own transaction:
+   * the transaction already owns the connection, so waiting for it would deadlock forever.
+   * An operation left over from a transaction that already finished is rejected as
+   * `transaction_scope_escaped`, like every other escaped operation.
+   */
+  async backupTo(path: string): Promise<void> {
+    this.rejectOwnScope('backupTo');
+    // Everything that touches the connection — including the open/closed check — happens
+    // after the mutex is held, so a queued backup observes the store's real state.
+    await this.mutex.run(async () => {
+      this.assertOpen();
+      if (typeof path !== 'string' || path.trim().length === 0) {
+        throw new StorageError('invalid_path', 'backup path must be a non-empty string', { path });
+      }
+      const target = resolve(path);
+      if (target === resolve(this.path)) {
+        throw new StorageError('invalid_path', 'backup target must differ from the database path', { path: target });
+      }
+      const parent = dirname(target);
+      if (!existsSync(parent)) {
+        throw new StorageError('invalid_path', `backup directory does not exist: ${parent}`, { path: target });
+      }
+      if (existsSync(target)) {
+        throw new StorageError('backup_exists', `backup target already exists: ${target}`, { path: target });
+      }
+      this.vacuumInto(target);
+      try {
+        this.verifyBackup(target, STORE_SCHEMA_VERSION, true);
+      } catch (error) {
+        this.removeUnverifiedBackup(target, error);
+      }
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Transactions
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Run `work` inside one store transaction; a throw rolls every write back.
+   *
+   * Nested transactions are **not** supported: the store owns one connection, so two
+   * savepoint-backed callbacks could release or roll back each other's work. A nested
+   * `transaction()` call is therefore rejected with `nested_transaction` before its callback
+   * runs. Operations invoked inside the callback (reads and writes) still reuse the owned
+   * connection, so they see the transaction's own uncommitted writes.
+   */
+  async transaction<T>(work: () => Promise<T>): Promise<T> {
+    if (typeof work !== 'function') {
+      throw new DomainError('invalid_input', 'transaction requires a callback', {});
+    }
+    this.rejectOwnScope('transaction');
+    this.assertOpen();
+    return this.mutex.run(async () => {
+      // A call that queued behind another operation may have outlived a close().
+      this.assertOpen();
+      const scope: TransactionScope = { store: this, active: true };
+      this.connection.exec('BEGIN IMMEDIATE');
+      let value: T;
+      try {
+        value = await this.scopes.run(scope, work);
+      } catch (error) {
+        scope.active = false;
+        this.rollback(error);
+        throw error;
+      }
+      scope.active = false;
+      try {
+        this.connection.exec('COMMIT');
+      } catch (error) {
+        this.rollback(error);
+        throw error;
+      }
+      return value;
+    });
+  }
+
+  /**
+   * Reject a call that arrives inside this store's own transaction scope, before it queues.
+   *
+   * An *active* scope already owns the connection, so `transaction()` and `backupTo()` would
+   * wait on a mutex only their own caller can release: the first is an unsupported nested
+   * transaction, the second a guaranteed deadlock. An *inactive* scope means the call was
+   * started inside a transaction that has since finished; letting it proceed would run
+   * outside the transaction it belongs to, so it is reported like any other escaped operation.
+   */
+  private rejectOwnScope(operation: 'transaction' | 'backupTo'): void {
+    const scope = this.scopes.current();
+    if (scope === undefined || scope.store !== this) {
+      return;
+    }
+    if (!scope.active) {
+      throw new StorageError(
+        'transaction_scope_escaped',
+        `${operation} ran after its owning transaction finished`,
+        { path: this.path, operation },
+      );
+    }
+    if (operation === 'transaction') {
+      throw new StorageError(
+        'nested_transaction',
+        'nested transactions are not supported; run the work in the outer transaction instead',
+        { path: this.path },
+      );
+    }
+    throw new StorageError(
+      'backup_in_transaction',
+      'backupTo cannot run inside a transaction of the same store',
+      { path: this.path },
+    );
+  }
+
+  private rollback(original: unknown): void {
+    try {
+      this.connection.exec('ROLLBACK');
+    } catch (rollbackError) {
+      throw new StorageError('rollback_failed', 'transaction rollback failed', {
+        path: this.path,
+        cause: String(rollbackError),
+        original: String(original),
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Sources, accounts & sync checkpoints
+  // -------------------------------------------------------------------------------------
+
+  async upsertSourceInstances(instances: readonly SourceInstance[]): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      for (const instance of instances) {
+        this.write(
+          `INSERT INTO source_instances (id, platform, base_url, domain, display_name, body)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET platform = excluded.platform, base_url = excluded.base_url,
+             domain = excluded.domain, display_name = excluded.display_name, body = excluded.body`,
+          [
+            requireId('source instance id', instance.id),
+            instance.platform,
+            instance.baseUrl,
+            instance.domain,
+            instance.displayName,
+            bodyOf(instance, SOURCE_INSTANCE_FIELDS),
+          ],
+        );
+      }
+    });
+  }
+
+  async getSourceInstance(id: string): Promise<SourceInstance | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM source_instances WHERE id = ?', [requireId('source instance id', id)]);
+      return row === null ? null : entityFromRow<SourceInstance>('source_instances.body', row);
+    });
+  }
+
+  async listSourceInstances(): Promise<readonly SourceInstance[]> {
+    this.assertOpen();
+    return this.withRead(() =>
+      this.all('SELECT body FROM source_instances ORDER BY id ASC').map((row) =>
+        entityFromRow<SourceInstance>('source_instances.body', row),
+      ),
+    );
+  }
+
+  async upsertAccounts(accounts: readonly Account[]): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      for (const account of accounts) {
+        this.write(
+          `INSERT INTO accounts (id, source_instance_id, handle, display_name, profile_url, body)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET source_instance_id = excluded.source_instance_id,
+             handle = excluded.handle, display_name = excluded.display_name,
+             profile_url = excluded.profile_url, body = excluded.body`,
+          [
+            requireId('account id', account.id),
+            account.sourceInstanceId,
+            account.handle,
+            account.displayName,
+            account.profileUrl,
+            bodyOf(account, ACCOUNT_FIELDS),
+          ],
+        );
+      }
+    });
+  }
+
+  async getAccount(id: string): Promise<Account | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM accounts WHERE id = ?', [requireId('account id', id)]);
+      return row === null ? null : entityFromRow<Account>('accounts.body', row);
+    });
+  }
+
+  async listAccounts(sourceInstanceId: string | null): Promise<readonly Account[]> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const rows =
+        sourceInstanceId === null
+          ? this.all('SELECT body FROM accounts ORDER BY id ASC')
+          : this.all('SELECT body FROM accounts WHERE source_instance_id = ? ORDER BY id ASC', [sourceInstanceId]);
+      return rows.map((row) => entityFromRow<Account>('accounts.body', row));
+    });
+  }
+
+  async getSyncCheckpoint(ref: SyncCheckpointRef): Promise<SyncCheckpoint | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      requireSyncResource(ref.resource);
+      const row = this.find('SELECT body FROM sync_checkpoints WHERE checkpoint_key = ?', [syncCheckpointKey(ref)]);
+      return row === null ? null : entityFromRow<SyncCheckpoint>('sync_checkpoints.body', row);
+    });
+  }
+
+  async saveSyncCheckpoint(checkpoint: SyncCheckpoint): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      requireSyncResource(checkpoint.resource);
+      assertIsoTimestamp('checkpoint updatedAt', checkpoint.updatedAt);
+      const body = canonicalJson({
+        sourceInstanceId: checkpoint.sourceInstanceId,
+        accountId: checkpoint.accountId,
+        resource: checkpoint.resource,
+        cursor: checkpoint.cursor,
+        since: checkpoint.since,
+        updatedAt: checkpoint.updatedAt,
+      });
+      this.write(
+        `INSERT INTO sync_checkpoints (checkpoint_key, source_instance_id, account_id, resource, cursor, since, updated_at, body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(checkpoint_key) DO UPDATE SET cursor = excluded.cursor, since = excluded.since,
+           updated_at = excluded.updated_at, body = excluded.body`,
+        [
+          syncCheckpointKey(checkpoint),
+          checkpoint.sourceInstanceId,
+          checkpoint.accountId,
+          checkpoint.resource,
+          checkpoint.cursor,
+          checkpoint.since,
+          checkpoint.updatedAt,
+          body,
+        ],
+      );
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Problems & submissions
+  // -------------------------------------------------------------------------------------
+
+  async upsertProblems(problems: readonly NormalizedProblem[]): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      for (const problem of problems) {
+        this.writeProblem(problem);
+      }
+    });
+  }
+
+  async listProblems(query: ProblemQuery): Promise<Page<NormalizedProblem>> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const limit = pageLimit(query.limit);
+      const cursor = query.cursor === null ? null : decodeCursor('problem', query.cursor);
+      const filters: string[] = [];
+      const params: SqlValue[] = [];
+      if (query.sourceInstanceId !== undefined && query.sourceInstanceId !== null) {
+        filters.push('source_instance_id = ?');
+        params.push(query.sourceInstanceId);
+      }
+      if (query.accountId !== undefined && query.accountId !== null) {
+        // Account scope = the problems this account actually submitted to, never the whole bank.
+        filters.push(
+          'EXISTS (SELECT 1 FROM submissions s WHERE s.problem_key = problems.key AND s.account_id = ?)',
+        );
+        params.push(query.accountId);
+      }
+      if (cursor !== null) {
+        filters.push('key > ?');
+        params.push(cursor);
+      }
+      const where = filters.length === 0 ? '' : ` WHERE ${filters.join(' AND ')}`;
+      const rows = this.all(`SELECT key, body FROM problems${where} ORDER BY key ASC LIMIT ?`, [
+        ...params,
+        limit + 1,
+      ]);
+      const items = rows
+        .slice(0, limit)
+        .map((row) => entityFromRow<NormalizedProblem>('problems.body', row));
+      const last = items.at(-1);
+      return {
+        items,
+        nextCursor: rows.length > limit && last !== undefined ? encodeCursor('problem', last.key) : null,
+        fetchedAt: this.clock(),
+      };
+    });
+  }
+
+  async upsertSubmissions(submissions: readonly Submission[]): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      for (const submission of submissions) {
+        this.writeSubmission(submission);
+      }
+    });
+  }
+
+  async listSubmissions(accountId: string, query: PageRequest): Promise<Page<Submission>> {
+    this.assertOpen();
+    return this.withRead(() => {
+      requireId('account id', accountId);
+      const limit = pageLimit(query.limit);
+      const cursor = query.cursor === null ? null : decodeCursor('submission', query.cursor);
+      const params: SqlValue[] = [accountId];
+      let where = ' WHERE account_id = ?';
+      if (cursor !== null) {
+        where += ' AND id > ?';
+        params.push(cursor);
+      }
+      const rows = this.all(`SELECT body FROM submissions${where} ORDER BY id ASC LIMIT ?`, [...params, limit + 1]);
+      const items = rows.slice(0, limit).map((row) => entityFromRow<Submission>('submissions.body', row));
+      const last = items.at(-1);
+      return {
+        items,
+        nextCursor: rows.length > limit && last !== undefined ? encodeCursor('submission', last.id) : null,
+        fetchedAt: this.clock(),
+      };
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Snapshots
+  // -------------------------------------------------------------------------------------
+
+  async getCurrentSnapshotHead(ref: ProblemRef): Promise<SnapshotHead | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT snapshot_id, content_hash, version FROM snapshot_heads WHERE problem_key = ?', [
+        problemKey(ref),
+      ]);
+      if (row === null) {
+        return null;
+      }
+      return {
+        snapshotId: textColumn(row, 'snapshot_id'),
+        contentHash: textColumn(row, 'content_hash'),
+        version: intColumn(row, 'version'),
+      };
+    });
+  }
+
+  async getSnapshot(snapshotId: string): Promise<ProblemSnapshot | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM snapshots WHERE snapshot_id = ?', [
+        requireId('snapshot id', snapshotId),
+      ]);
+      return row === null ? null : entityFromRow<ProblemSnapshot>('snapshots.body', row);
+    });
+  }
+
+  async saveSnapshot(snapshot: ProblemSnapshot): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      this.writeSnapshot(snapshot);
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Analyses & jobs
+  // -------------------------------------------------------------------------------------
+
+  async getAnalysis(analysisId: string): Promise<AnalysisResult | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM analyses WHERE analysis_id = ?', [
+        requireId('analysis id', analysisId),
+      ]);
+      return row === null ? null : entityFromRow<AnalysisResult>('analyses.body', row);
+    });
+  }
+
+  async listAnalyses(problemKeyValue: string): Promise<readonly AnalysisResult[]> {
+    this.assertOpen();
+    return this.withRead(() =>
+      this.all('SELECT body FROM analyses WHERE problem_key = ? ORDER BY created_at ASC, analysis_id ASC', [
+        requireProblemKey(problemKeyValue),
+      ]).map((row) => entityFromRow<AnalysisResult>('analyses.body', row)),
+    );
+  }
+
+  async saveAnalysis(result: AnalysisResult): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      requireProblemKey(result.problemKey);
+      const body = bodyOf(result, ANALYSIS_FIELDS);
+      const existing = this.find('SELECT body FROM analyses WHERE analysis_id = ?', [result.analysisId]);
+      if (existing !== null) {
+        requireSameBody('analysis', result.analysisId, textColumn(existing, 'body'), body);
+        return;
+      }
+      this.write(
+        `INSERT INTO analyses (analysis_id, problem_key, snapshot_id, snapshot_version, taxonomy_version, status, created_at, body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          result.analysisId,
+          result.problemKey,
+          result.snapshotId,
+          result.snapshotVersion,
+          result.taxonomyVersion,
+          result.status,
+          result.createdAt,
+          body,
+        ],
+      );
+    });
+  }
+
+  async getJob(jobId: string): Promise<AnalysisJobState | null> {
+    this.assertOpen();
+    return this.withRead(() => this.readJob(requireId('job id', jobId)));
+  }
+
+  async listJobs(status: AnalysisJobStatus | null): Promise<readonly AnalysisJobState[]> {
+    this.assertOpen();
+    return this.withRead(() => {
+      if (status !== null && !JOB_STATUSES.includes(status)) {
+        throw new DomainError('invalid_input', `unknown job status ${String(status)}`, { status });
+      }
+      const rows =
+        status === null
+          ? this.all('SELECT body FROM jobs ORDER BY updated_at DESC, job_id ASC')
+          : this.all('SELECT body FROM jobs WHERE status = ? ORDER BY updated_at DESC, job_id ASC', [status]);
+      return rows.map((row) => entityFromRow<AnalysisJobState>('jobs.body', row));
+    });
+  }
+
+  async saveJob(state: AnalysisJobState): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => this.writeJob(state));
+  }
+
+  async claimJob(request: JobLeaseRequest): Promise<AnalysisJobState | null> {
+    this.assertOpen();
+    const owner = requireId('lease owner', request.owner);
+    assertIsoTimestamp('lease at', request.at);
+    invariant(
+      Number.isInteger(request.leaseMs) && request.leaseMs > 0,
+      'invalid_input',
+      'leaseMs must be a positive integer',
+      { leaseMs: request.leaseMs },
+    );
+    return this.transaction(async () => {
+      const state = this.readJob(requireId('job id', request.jobId));
+      if (state === null || UNCLAIMABLE.includes(state.status)) {
+        return null;
+      }
+      if (state.status === 'running' && !isLeaseExpired(state, request.at)) {
+        return null;
+      }
+      const claimable =
+        state.status === 'running' ? transitionJob(state, { type: 'requeue', at: request.at }) : state;
+      const claimed = transitionJob(claimable, {
+        type: 'start',
+        owner,
+        at: request.at,
+        leaseMs: request.leaseMs,
+      });
+      this.writeJob(claimed);
+      return claimed;
+    });
+  }
+
+  async recoverExpiredJobs(now: string): Promise<number> {
+    this.assertOpen();
+    assertIsoTimestamp('now', now);
+    return this.transaction(async () => {
+      const rows = this.all(`SELECT body FROM jobs WHERE status = 'running' ORDER BY job_id ASC`);
+      let recovered = 0;
+      for (const row of rows) {
+        const state = entityFromRow<AnalysisJobState>('jobs.body', row);
+        if (!isLeaseExpired(state, now)) {
+          continue;
+        }
+        this.writeJob(recoverAfterRestart(state, now));
+        recovered += 1;
+      }
+      return recovered;
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Tag decisions
+  // -------------------------------------------------------------------------------------
+
+  async listTagDecisions(problemKeyValue: string): Promise<readonly TagDecision[]> {
+    this.assertOpen();
+    return this.withRead(() =>
+      this.all('SELECT body FROM tag_decisions WHERE problem_key = ? ORDER BY decided_at ASC, decision_id ASC', [
+        requireProblemKey(problemKeyValue),
+      ]).map((row) => entityFromRow<TagDecision>('tag_decisions.body', row)),
+    );
+  }
+
+  async saveTagDecisions(decisions: readonly TagDecision[]): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      for (const decision of decisions) {
+        requireProblemKey(decision.problemKey);
+        const body = bodyOf(decision, TAG_DECISION_FIELDS);
+        const existing = this.find('SELECT body FROM tag_decisions WHERE decision_id = ?', [decision.decisionId]);
+        if (existing !== null) {
+          requireSameBody('tag decision', decision.decisionId, textColumn(existing, 'body'), body);
+          continue;
+        }
+        this.write(
+          `INSERT INTO tag_decisions (decision_id, problem_key, taxonomy_id, status, origin, analysis_id, decided_at, body)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            decision.decisionId,
+            decision.problemKey,
+            decision.taxonomyId,
+            decision.status,
+            decision.origin,
+            decision.analysisId,
+            decision.decidedAt,
+            body,
+          ],
+        );
+      }
+    });
+  }
+
+  async listManualDecisions(problemKeyValue: string): Promise<readonly ManualTagDecision[]> {
+    this.assertOpen();
+    return this.withRead(() =>
+      this.all('SELECT body FROM manual_decisions WHERE problem_key = ? ORDER BY decided_at ASC, decision_id ASC', [
+        requireProblemKey(problemKeyValue),
+      ]).map((row) => entityFromRow<ManualTagDecision>('manual_decisions.body', row)),
+    );
+  }
+
+  async saveManualDecision(decision: ManualTagDecision): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => this.writeManualDecision(decision));
+  }
+
+  async getManualRevision(problemKeyValue: string): Promise<number> {
+    this.assertOpen();
+    return this.withRead(() => this.readManualRevision(requireProblemKey(problemKeyValue)));
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Training
+  // -------------------------------------------------------------------------------------
+
+  async saveRetrospective(retrospective: Retrospective): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      requireProblemKey(retrospective.problemKey);
+      const body = bodyOf(retrospective, RETROSPECTIVE_FIELDS);
+      const existing = this.find('SELECT body FROM retrospectives WHERE retrospective_id = ?', [
+        retrospective.retrospectiveId,
+      ]);
+      if (existing !== null) {
+        requireSameBody(
+          'retrospective',
+          retrospective.retrospectiveId,
+          textColumn(existing, 'body'),
+          body,
+        );
+        return;
+      }
+      this.write(
+        `INSERT INTO retrospectives (retrospective_id, problem_key, account_id, mode, recorded_at, body)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          retrospective.retrospectiveId,
+          retrospective.problemKey,
+          retrospective.accountId,
+          retrospective.mode,
+          retrospective.recordedAt,
+          body,
+        ],
+      );
+    });
+  }
+
+  async listRetrospectives(accountId: string): Promise<readonly Retrospective[]> {
+    this.assertOpen();
+    return this.withRead(() =>
+      this.all('SELECT body FROM retrospectives WHERE account_id = ? ORDER BY recorded_at ASC, retrospective_id ASC', [
+        requireId('account id', accountId),
+      ]).map((row) => entityFromRow<Retrospective>('retrospectives.body', row)),
+    );
+  }
+
+  async savePlan(plan: TrainingPlan): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => this.writePlan(plan));
+  }
+
+  async getPlan(planId: string): Promise<TrainingPlan | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM plans WHERE plan_id = ?', [requireId('plan id', planId)]);
+      return row === null ? null : entityFromRow<TrainingPlan>('plans.body', row);
+    });
+  }
+
+  async listPlans(accountId: string | null): Promise<readonly TrainingPlan[]> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const rows =
+        accountId === null
+          ? this.all('SELECT body FROM plans ORDER BY created_at ASC, plan_id ASC')
+          : this.all('SELECT body FROM plans WHERE account_id = ? ORDER BY created_at ASC, plan_id ASC', [accountId]);
+      return rows.map((row) => entityFromRow<TrainingPlan>('plans.body', row));
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Write helpers (always called inside a serialized write scope)
+  // -------------------------------------------------------------------------------------
+
+  private writeProblem(problem: NormalizedProblem): void {
+    const derived = problemKey(problem.ref);
+    if (derived !== problem.key) {
+      throw new DomainError('invalid_input', 'problem key does not match its reference', {
+        declared: problem.key,
+        derived,
+      });
+    }
+    this.write(
+      `INSERT INTO problems (key, source_instance_id, domain, external_key, title, fetched_at, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET source_instance_id = excluded.source_instance_id,
+         domain = excluded.domain, external_key = excluded.external_key, title = excluded.title,
+         fetched_at = excluded.fetched_at, body = excluded.body`,
+      [
+        problem.key,
+        problem.ref.sourceInstanceId,
+        problem.ref.domain,
+        problem.ref.externalKey,
+        problem.title,
+        problem.fetchedAt,
+        bodyOf(problem, PROBLEM_FIELDS),
+      ],
+    );
+  }
+
+  private writeSubmission(submission: Submission): void {
+    const derived = problemKey(submission.ref);
+    if (derived !== submission.key) {
+      throw new DomainError('invalid_input', 'submission key does not match its reference', {
+        declared: submission.key,
+        derived,
+      });
+    }
+    requireId('submission account id', submission.accountId);
+    this.write(
+      `INSERT INTO submissions (id, account_id, problem_key, source_instance_id, domain, external_key, external_id, verdict, submitted_at, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET account_id = excluded.account_id, problem_key = excluded.problem_key,
+         source_instance_id = excluded.source_instance_id, domain = excluded.domain,
+         external_key = excluded.external_key, external_id = excluded.external_id,
+         verdict = excluded.verdict, submitted_at = excluded.submitted_at, body = excluded.body`,
+      [
+        submission.id,
+        submission.accountId,
+        submission.key,
+        submission.ref.sourceInstanceId,
+        submission.ref.domain,
+        submission.ref.externalKey,
+        submission.externalId,
+        submission.verdict,
+        submission.submittedAt,
+        bodyOf(submission, SUBMISSION_FIELDS),
+      ],
+    );
+  }
+
+  private writeSnapshot(snapshot: ProblemSnapshot): void {
+    const key = requireValidSnapshot(snapshot);
+    const existing = this.find('SELECT body FROM snapshots WHERE snapshot_id = ?', [snapshot.snapshotId]);
+    if (existing !== null) {
+      // Same content-addressed id: only observation timestamps may differ, and the first
+      // capture is kept. Any semantic difference means a body that does not match its id.
+      const stored = parseBody<ProblemSnapshot>('snapshots.body', textColumn(existing, 'body'));
+      if (canonicalJson(snapshotIdentity(stored)) !== canonicalJson(snapshotIdentity(snapshot))) {
+        throw new DomainError('immutable_violation', `snapshot ${snapshot.snapshotId} already exists with different content`, {
+          snapshotId: snapshot.snapshotId,
+        });
+      }
+      return;
+    }
+    const head = this.find('SELECT version FROM snapshot_heads WHERE problem_key = ?', [key]);
+    if (head !== null) {
+      const headVersion = intColumn(head, 'version');
+      if (snapshot.version < headVersion) {
+        throw new DomainError(
+          'invalid_transition',
+          `snapshot v${snapshot.version} cannot replace the current head v${headVersion}`,
+          { problemKey: key, snapshotId: snapshot.snapshotId, version: snapshot.version, headVersion },
+        );
+      }
+      if (snapshot.version === headVersion) {
+        throw new DomainError(
+          'duplicate_id',
+          `snapshot version v${headVersion} already exists with a different snapshot id`,
+          { problemKey: key, snapshotId: snapshot.snapshotId, version: snapshot.version },
+        );
+      }
+    }
+    this.write(
+      `INSERT INTO snapshots (snapshot_id, problem_key, content_hash, version, schema_version, captured_at, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        snapshot.snapshotId,
+        key,
+        snapshot.contentHash,
+        snapshot.version,
+        snapshot.schemaVersion,
+        snapshot.capturedAt,
+        bodyOf(snapshot, SNAPSHOT_FIELDS),
+      ],
+    );
+    this.write(
+      `INSERT INTO snapshot_heads (problem_key, snapshot_id, content_hash, version, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(problem_key) DO UPDATE SET snapshot_id = excluded.snapshot_id,
+         content_hash = excluded.content_hash, version = excluded.version, updated_at = excluded.updated_at`,
+      [key, snapshot.snapshotId, snapshot.contentHash, snapshot.version, this.clock()],
+    );
+  }
+
+  /**
+   * Upsert one job row.
+   *
+   * A job's identity — `problemKey`, `snapshotId`, `createdAt` — is fixed by its first save.
+   * Re-saving the same `jobId` under a different identity is rejected instead of silently
+   * repointing the job at another problem/snapshot or rewriting the record's creation time
+   * (the stored body would otherwise disagree with the identity columns). Counters stay
+   * monotonic as before. Status/lease transitions are *not* constrained here: the later
+   * pipeline reads the current row and checks the lease and status transactionally.
+   */
+  private writeJob(state: AnalysisJobState): void {
+    requireProblemKey(state.problemKey);
+    const existing = this.find(
+      'SELECT attempts, analysis_calls, reasoning_calls, retries, problem_key, snapshot_id, created_at FROM jobs WHERE job_id = ?',
+      [state.jobId],
+    );
+    if (existing !== null) {
+      const conflicts = (
+        [
+          ['problemKey', textColumn(existing, 'problem_key'), state.problemKey],
+          ['snapshotId', textColumn(existing, 'snapshot_id'), state.snapshotId],
+          ['createdAt', textColumn(existing, 'created_at'), state.createdAt],
+        ] as const
+      )
+        .filter(([, stored, incoming]) => stored !== incoming)
+        .map(([name]) => name);
+      if (conflicts.length > 0) {
+        throw new DomainError(
+          'immutable_violation',
+          `job ${state.jobId} already exists with a different ${conflicts.join(', ')}`,
+          {
+            jobId: state.jobId,
+            conflicts,
+            stored: {
+              problemKey: textColumn(existing, 'problem_key'),
+              snapshotId: textColumn(existing, 'snapshot_id'),
+              createdAt: textColumn(existing, 'created_at'),
+            },
+            incoming: {
+              problemKey: state.problemKey,
+              snapshotId: state.snapshotId,
+              createdAt: state.createdAt,
+            },
+          },
+        );
+      }
+      const previous = jobCounterRow(existing);
+      const next = jobCounters(state);
+      const regressions = (['attempts', 'analysisCalls', 'reasoningCalls', 'retries'] as const).filter(
+        (name) => next[name] < previous[name],
+      );
+      if (regressions.length > 0) {
+        throw new DomainError(
+          'invalid_transition',
+          `job ${state.jobId} would decrease ${regressions.join(', ')}`,
+          { jobId: state.jobId, regressions, previous, next },
+        );
+      }
+    }
+    this.write(
+      `INSERT INTO jobs (job_id, problem_key, snapshot_id, status, attempts, analysis_calls, reasoning_calls, retries,
+         created_at, updated_at, lease_owner, lease_expires_at, analysis_id, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(job_id) DO UPDATE SET problem_key = excluded.problem_key, snapshot_id = excluded.snapshot_id,
+         status = excluded.status, attempts = excluded.attempts, analysis_calls = excluded.analysis_calls,
+         reasoning_calls = excluded.reasoning_calls, retries = excluded.retries, updated_at = excluded.updated_at,
+         lease_owner = excluded.lease_owner, lease_expires_at = excluded.lease_expires_at,
+         analysis_id = excluded.analysis_id, body = excluded.body`,
+      [
+        state.jobId,
+        state.problemKey,
+        state.snapshotId,
+        state.status,
+        state.attempts,
+        state.counters.analysisCalls,
+        state.counters.reasoningCalls,
+        state.counters.retries,
+        state.createdAt,
+        state.updatedAt,
+        state.leaseOwner,
+        state.leaseExpiresAt,
+        state.analysisId,
+        bodyOf(state, JOB_FIELDS),
+      ],
+    );
+  }
+
+  private writeManualDecision(decision: ManualTagDecision): void {
+    requireProblemKey(decision.problemKey);
+    const body = bodyOf(decision, MANUAL_DECISION_FIELDS);
+    const existing = this.find('SELECT body FROM manual_decisions WHERE decision_id = ?', [decision.decisionId]);
+    if (existing !== null) {
+      requireSameBody('manual decision', decision.decisionId, textColumn(existing, 'body'), body);
+      return;
+    }
+    this.write(
+      `INSERT INTO manual_decisions (decision_id, problem_key, taxonomy_id, action, decided_at, body)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        decision.decisionId,
+        decision.problemKey,
+        decision.taxonomyId,
+        decision.action,
+        decision.decidedAt,
+        body,
+      ],
+    );
+    // Revision advances in the same transaction as the insert, only for a new decision id.
+    this.write(
+      `INSERT INTO manual_revisions (problem_key, revision, updated_at) VALUES (?, 1, ?)
+       ON CONFLICT(problem_key) DO UPDATE SET revision = revision + 1, updated_at = excluded.updated_at`,
+      [decision.problemKey, decision.decidedAt],
+    );
+  }
+
+  private writePlan(plan: TrainingPlan): void {
+    const existing = this.find('SELECT status, adopted_at FROM plans WHERE plan_id = ?', [plan.planId]);
+    if (existing !== null) {
+      const previousStatus = textColumn(existing, 'status');
+      if (previousStatus === 'adopted' && plan.status !== 'adopted') {
+        throw new DomainError('invalid_transition', `plan ${plan.planId} cannot return to ${plan.status} after adoption`, {
+          planId: plan.planId,
+          previousStatus,
+          status: plan.status,
+        });
+      }
+      const previousAdoptedAt = nullableTextColumn(existing, 'adopted_at');
+      if (previousAdoptedAt !== null && plan.adoptedAt === null) {
+        throw new DomainError('invalid_transition', `plan ${plan.planId} cannot clear its adoption time`, {
+          planId: plan.planId,
+        });
+      }
+    }
+    this.write(
+      `INSERT INTO plans (plan_id, account_id, status, created_at, adopted_at, body)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(plan_id) DO UPDATE SET account_id = excluded.account_id, status = excluded.status,
+         created_at = excluded.created_at, adopted_at = excluded.adopted_at, body = excluded.body`,
+      [plan.planId, plan.accountId, plan.status, plan.createdAt, plan.adoptedAt, bodyOf(plan, PLAN_FIELDS)],
+    );
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Read helpers
+  // -------------------------------------------------------------------------------------
+
+  private readJob(jobId: string): AnalysisJobState | null {
+    const row = this.find('SELECT body FROM jobs WHERE job_id = ?', [jobId]);
+    return row === null ? null : entityFromRow<AnalysisJobState>('jobs.body', row);
+  }
+
+  private readManualRevision(problemKeyValue: string): number {
+    const row = this.find('SELECT revision FROM manual_revisions WHERE problem_key = ?', [problemKeyValue]);
+    return row === null ? 0 : intColumn(row, 'revision');
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Connection plumbing
+  // -------------------------------------------------------------------------------------
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new StorageError('closed', 'store is closed', { path: this.path });
+    }
+  }
+
+  /**
+   * Run `work` with exclusive ownership of the connection.
+   *
+   * Inside an active transaction of this store the connection is already owned, so `work`
+   * runs directly (this is what keeps `transaction()` callbacks from deadlocking). A call
+   * that arrives after its owning transaction finished is rejected instead of silently
+   * writing outside it.
+   *
+   * The open/closed check is repeated *inside* the mutex: a call that queued behind another
+   * operation can reach the connection only after a `close()` that was queued in between, and
+   * it must then report `closed` rather than a raw `node:sqlite` error.
+   */
+  private runExclusive<T>(work: () => T | Promise<T>): Promise<T> {
+    const scope = this.scopes.current();
+    if (scope !== undefined && scope.store === this) {
+      if (!scope.active) {
+        throw new StorageError(
+          'transaction_scope_escaped',
+          'operation ran after its owning transaction finished',
+          { path: this.path },
+        );
+      }
+      return Promise.resolve(work());
+    }
+    return this.mutex.run(async () => {
+      this.assertOpen();
+      return work();
+    });
+  }
+
+  private withRead<T>(work: () => T): Promise<T> {
+    return this.runExclusive(work);
+  }
+
+  /** A write batch: one atomic transaction unless a transaction already owns the connection. */
+  private withWrite<T>(work: () => T): Promise<T> {
+    return this.runExclusive(() => {
+      if (this.scopes.isActiveOwner(this)) {
+        return work();
+      }
+      return this.atomic(work);
+    });
+  }
+
+  private atomic<T>(work: () => T): T {
+    this.connection.exec('BEGIN IMMEDIATE');
+    let value: T;
+    try {
+      value = work();
+    } catch (error) {
+      this.rollback(error);
+      throw error;
+    }
+    try {
+      this.connection.exec('COMMIT');
+    } catch (error) {
+      this.rollback(error);
+      throw error;
+    }
+    return value;
+  }
+
+  private statement(sql: string): StatementSync {
+    let prepared = this.statements.get(sql);
+    if (prepared === undefined) {
+      prepared = this.connection.prepare(sql);
+      this.statements.set(sql, prepared);
+    }
+    return prepared;
+  }
+
+  private all(sql: string, params: readonly SqlValue[] = []): Row[] {
+    return this.statement(sql).all(...params) as Row[];
+  }
+
+  private find(sql: string, params: readonly SqlValue[] = []): Row | null {
+    return (this.statement(sql).get(...params) as Row | undefined) ?? null;
+  }
+
+  private write(sql: string, params: readonly SqlValue[]): void {
+    this.statement(sql).run(...params);
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Schema & backups
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Classify, migrate and only then configure the connection.
+   *
+   * Ordering is load-bearing:
+   *
+   * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
+   *    switched into another journal mode or otherwise touched.
+   * 2. A supported v0 database is backed up **before** `configureConnection`, so the backup is
+   *    the database as it was found and switching the journal mode is not part of the
+   *    pre-migration state.
+   * 3. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
+   *    succeeded, so a failed migration leaves the original file — including its original
+   *    journal mode — untouched.
+   */
+  private openSchema(inMemory: boolean): void {
+    const state = detectSchemaState(this.connection);
+    if (state === 'legacy_v0') {
+      // A pre-store database that carries our marker: keep a consistent copy before migrating.
+      const target = this.uniquePath(backupFileName(this.path, SCHEMA_VERSION_EMPTY, this.clock()));
+      this.vacuumInto(target);
+      this.verifyBackup(target, SCHEMA_VERSION_EMPTY, false);
+    }
+    if (state !== 'current') {
+      try {
+        initializeSchemaV1(this.connection);
+      } catch (error) {
+        if (error instanceof StorageError) {
+          throw error;
+        }
+        throw new StorageError('migration_failed', `database could not be initialized to schema v1`, {
+          path: this.path,
+          cause: String(error),
+        });
+      }
+      if (detectSchemaState(this.connection) !== 'current') {
+        throw new StorageError('migration_failed', 'database did not reach schema v1', { path: this.path });
+      }
+    }
+    configureConnection(this.connection, inMemory);
+  }
+
+  private uniquePath(candidate: string): string {
+    if (!existsSync(candidate)) {
+      return candidate;
+    }
+    for (let index = 1; index <= 100; index += 1) {
+      const next = candidate.replace(/\.sqlite$/u, `-${index}.sqlite`);
+      if (!existsSync(next)) {
+        return next;
+      }
+    }
+    throw new StorageError('backup_exists', `no free backup name next to ${candidate}`, { candidate });
+  }
+
+  private vacuumInto(target: string): void {
+    try {
+      this.connection.prepare('VACUUM INTO ?').run(target);
+    } catch (error) {
+      throw new StorageError('backup_failed', `consistent backup could not be written: ${target}`, {
+        path: target,
+        cause: String(error),
+      });
+    }
+  }
+
+  private verifyBackup(path: string, expectedVersion: number, requireMarker: boolean): void {
+    let backup: DatabaseSync;
+    try {
+      backup = new DatabaseSync(path);
+    } catch (error) {
+      throw new StorageError('backup_failed', `backup could not be opened: ${path}`, {
+        path,
+        cause: String(error),
+      });
+    }
+    let integrity: unknown = null;
+    let version = -1;
+    let marker: string | null = null;
+    try {
+      const row = backup.prepare('PRAGMA integrity_check').get() as Row | undefined;
+      integrity = row?.['integrity_check'] ?? null;
+      version = readUserVersion(backup);
+      marker = requireMarker ? readMarker(backup) : null;
+    } finally {
+      backup.close();
+    }
+    if (integrity !== 'ok') {
+      throw new StorageError('backup_failed', `backup failed its integrity check: ${path}`, { path, integrity });
+    }
+    if (version !== expectedVersion) {
+      throw new StorageError('backup_failed', `backup has schema v${version}, expected v${expectedVersion}`, {
+        path,
+        version,
+        expectedVersion,
+      });
+    }
+    if (requireMarker && marker !== STORE_MARKER) {
+      throw new StorageError('backup_failed', `backup does not carry the store marker: ${path}`, { path, marker });
+    }
+  }
+
+  /** Delete an untrusted partial backup and rethrow the verification failure. */
+  private removeUnverifiedBackup(path: string, original: unknown): never {
+    try {
+      unlinkSync(path);
+    } catch (cleanupError) {
+      throw new StorageError('backup_failed', `unverified backup could not be removed: ${path}`, {
+        path,
+        cause: String(cleanupError),
+        original: String(original),
+      });
+    }
+    throw original;
+  }
+}
+
+function pageLimit(limit: number): number {
+  invariant(
+    Number.isInteger(limit) && limit >= STORAGE_PAGE_LIMITS.minPageSize && limit <= STORAGE_PAGE_LIMITS.maxPageSize,
+    'invalid_input',
+    `page limit must be an integer within ${STORAGE_PAGE_LIMITS.minPageSize}..${STORAGE_PAGE_LIMITS.maxPageSize}`,
+    { limit },
+  );
+  return limit;
+}
+
+function requireSyncResource(resource: SyncResource): SyncResource {
+  invariant(
+    SYNC_RESOURCE_VALUES.includes(resource),
+    'invalid_input',
+    `unknown sync resource ${String(resource)}`,
+    { resource },
+  );
+  return resource;
+}
