@@ -1,0 +1,296 @@
+{
+  "cohort": 37,
+  "ready": 30,
+  "coverage": [
+    {
+      "source": "codeforces",
+      "key": "20C",
+      "status": "unavailable",
+      "detail": "No verified usable editorial reference."
+    },
+    {
+      "source": "codeforces",
+      "key": "580C",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "chars": 271
+    },
+    {
+      "source": "codeforces",
+      "key": "455A",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/13336",
+      "chars": 353
+    },
+    {
+      "source": "codeforces",
+      "key": "279B",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/95148",
+      "chars": 712
+    },
+    {
+      "source": "codeforces",
+      "key": "466C",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/13758",
+      "chars": 1089
+    },
+    {
+      "source": "codeforces",
+      "key": "706B",
+      "status": "ready",
+      "preparation": "manual",
+      "editorialUrl": "https://codeforces.com/blog/entry/46510",
+      "chars": 315
+    },
+    {
+      "source": "codeforces",
+      "key": "520B",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/16736",
+      "chars": 1793
+    },
+    {
+      "source": "codeforces",
+      "key": "189A",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/4540",
+      "chars": 392
+    },
+    {
+      "source": "codeforces",
+      "key": "363B",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/9537",
+      "chars": 544
+    },
+    {
+      "source": "codeforces",
+      "key": "510C",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/16173",
+      "chars": 557
+    },
+    {
+      "source": "codeforces",
+      "key": "295B",
+      "status": "ready",
+      "preparation": "manual",
+      "editorialUrl": "https://codeforces.com/blog/entry/7329",
+      "chars": 492
+    },
+    {
+      "source": "codeforces",
+      "key": "547B",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/18126",
+      "chars": 1240
+    },
+    {
+      "source": "codeforces",
+      "key": "380C",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/10363",
+      "chars": 475
+    },
+    {
+      "source": "codeforces",
+      "key": "459D",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/13430",
+      "chars": 920
+    },
+    {
+      "source": "codeforces",
+      "key": "242E",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/5837",
+      "chars": 768
+    },
+    {
+      "source": "codeforces",
+      "key": "86D",
+      "status": "ready",
+      "preparation": "manual",
+      "editorialUrl": "https://codeforces.com/blog/entry/2028",
+      "chars": 2663
+    },
+    {
+      "source": "codeforces",
+      "key": "617E",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/22971",
+      "chars": 474
+    },
+    {
+      "source": "codeforces",
+      "key": "600E",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/21827",
+      "chars": 1297
+    },
+    {
+      "source": "codeforces",
+      "key": "191C",
+      "status": "unavailable",
+      "detail": "Referenced editorial API retrieval unavailable."
+    },
+    {
+      "source": "codeforces",
+      "key": "438D",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/12513",
+      "chars": 915
+    },
+    {
+      "source": "codeforces",
+      "key": "126B",
+      "status": "ready",
+      "preparation": "manual",
+      "editorialUrl": "https://codeforces.com/blog/entry/3140",
+      "chars": 1776
+    },
+    {
+      "source": "codeforces",
+      "key": "432D",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/12310",
+      "chars": 696
+    },
+    {
+      "source": "codeforces",
+      "key": "271D",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/6662",
+      "chars": 1076
+    },
+    {
+      "source": "codeforces",
+      "key": "5C",
+      "status": "unavailable",
+      "detail": "No verified usable editorial reference."
+    },
+    {
+      "source": "codeforces",
+      "key": "427C",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/12082",
+      "chars": 304
+    },
+    {
+      "source": "codeforces",
+      "key": "609E",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/22187",
+      "chars": 1378
+    },
+    {
+      "source": "luogu",
+      "key": "P3374",
+      "status": "auth_required",
+      "detail": "Anonymous editorial endpoint requires login; no model call."
+    },
+    {
+      "source": "luogu",
+      "key": "P3367",
+      "status": "auth_required",
+      "detail": "Anonymous editorial endpoint requires login; no model call."
+    },
+    {
+      "source": "luogu",
+      "key": "P3372",
+      "status": "auth_required",
+      "detail": "Anonymous editorial endpoint requires login; no model call."
+    },
+    {
+      "source": "luogu",
+      "key": "P3383",
+      "status": "auth_required",
+      "detail": "Anonymous editorial endpoint requires login; no model call."
+    },
+    {
+      "source": "codeforces",
+      "key": "580A",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "chars": 407
+    },
+    {
+      "source": "codeforces",
+      "key": "580B",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "chars": 234
+    },
+    {
+      "source": "codeforces",
+      "key": "580D",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "chars": 610
+    },
+    {
+      "source": "codeforces",
+      "key": "580E",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "chars": 786
+    },
+    {
+      "source": "codeforces",
+      "key": "456A",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/13336",
+      "chars": 603
+    },
+    {
+      "source": "codeforces",
+      "key": "456B",
+      "status": "ready",
+      "preparation": "automatic",
+      "editorialUrl": "https://codeforces.com/blog/entry/13336",
+      "chars": 1011
+    },
+    {
+      "source": "codeforces",
+      "key": "706A",
+      "status": "ready",
+      "preparation": "manual",
+      "editorialUrl": "https://codeforces.com/blog/entry/46510",
+      "chars": 155
+    }
+  ],
+  "status": "materials-prepared; paid model evaluation not run",
+  "reviewedBy": "Codex coordinator; not a human expert panel",
+  "limitations": [
+    "Accessible editorial cohort, not a random sample; multiple problems share contest editorials.",
+    "25 sections were extracted automatically and 5 used boundaries selected before model evaluation.",
+    "Seven inaccessible cases are retained in the denominator; auth/unavailable is never treated as proven absence.",
+    "Only source metadata and extraction counts are published; article bodies and model inputs remain local."
+  ]
+}
