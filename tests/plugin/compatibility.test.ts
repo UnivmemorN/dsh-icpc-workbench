@@ -458,7 +458,7 @@ void test('a configured data directory is canonicalized without being created', 
 
   const resolved = resolveDataDir({ dataDir: target }, { environment: environment({ platform: process.platform }) });
 
-  assert.equal(resolved, join(realpathSync(root), 'state', 'training'));
+  assert.equal(resolved, join(realpathSync.native(root), 'state', 'training'));
   assert.equal(existsSync(target), false);
   assert.deepEqual(readdirSync(root).sort(), before);
 });
@@ -478,7 +478,7 @@ void test('a symlinked ancestor is resolved before the remaining segments are ap
     { environment: environment({ platform: process.platform }) },
   );
 
-  assert.equal(resolved, join(realpathSync(real), 'state', 'training'));
+  assert.equal(resolved, join(realpathSync.native(real), 'state', 'training'));
   assert.equal(resolved.includes('link-tree'), false);
   assert.equal(existsSync(join(real, 'state')), false);
 });
@@ -500,13 +500,13 @@ void test('training data inside the dsh installation or dshHome is refused; sibl
   expectConfigError('data_dir_conflict', () => resolveDataDir({ dataDir: join(dshHome, 'data') }, context));
 
   const sibling = resolveDataDir({ dataDir: join(root, 'harness2', 'data') }, context);
-  assert.equal(sibling, join(realpathSync(root), 'harness2', 'data'));
+  assert.equal(sibling, join(realpathSync.native(root), 'harness2', 'data'));
 
   const acceptance = resolveDataDir(
     { dataDir: join(root, 'plugin', '.local', 'state', 'training') },
     context,
   );
-  assert.equal(acceptance, join(realpathSync(root), 'plugin', '.local', 'state', 'training'));
+  assert.equal(acceptance, join(realpathSync.native(root), 'plugin', '.local', 'state', 'training'));
 });
 
 void test('a child whose name starts with dots is still inside the guarded tree', (t) => {
@@ -532,7 +532,7 @@ void test('a child whose name starts with dots is still inside the guarded tree'
     { dataDir: join(root, 'state', '.hidden', 'training') },
     { environment: environment({ platform: process.platform }) },
   );
-  assert.equal(hidden, join(realpathSync(root), 'state', '.hidden', 'training'));
+  assert.equal(hidden, join(realpathSync.native(root), 'state', '.hidden', 'training'));
 });
 
 void test('an unreadable path is a typed refusal and never a silent walk past it', (t) => {
@@ -546,7 +546,7 @@ void test('an unreadable path is a typed refusal and never a silent walk past it
       }
       return path === root ? 'directory' : 'missing';
     },
-    realpath: () => realpathSync(root),
+    realpath: () => realpathSync.native(root),
   };
 
   const error = expectConfigError('invalid_data_dir', () =>
@@ -572,7 +572,7 @@ void test('an unreadable guard root is an unresolvable-data-dir refusal', (t) =>
       }
       return path === root ? 'directory' : 'missing';
     },
-    realpath: () => realpathSync(root),
+    realpath: () => realpathSync.native(root),
   };
 
   expectConfigError('unresolvable_data_dir', () =>
@@ -609,7 +609,7 @@ void test('an undisclosed dshHome or installation root leaves the location ungua
     { environment: environment({ platform: process.platform }), dshHome: null, installationRoot: null },
   );
 
-  assert.equal(resolved, join(realpathSync(root), 'data'));
+  assert.equal(resolved, join(realpathSync.native(root), 'data'));
 });
 
 void test('the nearest existing ancestor rule uses the injected probe', () => {
