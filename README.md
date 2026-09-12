@@ -4,6 +4,14 @@ ICPC personal-training plugin for DeepSeek Harness. Development is in progress; 
 
 Planned first release: Codeforces/Luogu/manual import, evidence-backed hierarchical tags, weakness analysis, training plans, and progressive hints in a dsh panel.
 
+## Current implementation
+
+The domain rules, SQLite storage and migrations, cancellable analysis batches, CF/Luogu/manual adapters, editorial imports, audited dsh model calls, strict tag verification, settings, and progressive coaching service are implemented and tested. The host API, browser workbench, packaged installation, and paid tag benchmark are still being built. This checkout is not yet a finished installable workbench.
+
+Platform access failures remain visible: anonymous Luogu editorial/history access can require login, and Codeforces HTML can return a challenge. Manual material import is supported; these failures never trigger the expensive missing-editorial fallback automatically. Hydro school-OJ integration remains future work.
+
+Use Node 22.19+ on major 22, or Node 24+. Run `npm ci` and `npm run check`; the package builds independently of a harness source checkout. Live model accuracy is a separate release check, not implied by passing local tests.
+
 ## Development
 
 The plugin has its own repository, dependencies, and data directory. DeepSeek Harness is an external host; never place this package inside its source tree.
