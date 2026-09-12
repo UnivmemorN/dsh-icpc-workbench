@@ -51,7 +51,9 @@ export interface CreateSuggestionVerificationInput {
 /** Build a validated, frozen verification record. */
 export function createSuggestionVerification(input: CreateSuggestionVerificationInput): SuggestionVerification {
   const checkedAt = assertIsoTimestamp('checkedAt', input.checkedAt);
+  const problem = problemKey(input.problemRef);
   const conflicting = [...new Set(input.conflictingSolutionIds ?? [])];
+  const note = input.note?.trim() || null;
   if (input.verdict === 'support') {
     invariant(conflicting.length === 0, 'invalid_input', 'a supporting verification cannot list conflicts', {
       suggestionId: input.suggestionId,
@@ -60,20 +62,28 @@ export function createSuggestionVerification(input: CreateSuggestionVerification
       suggestionId: input.suggestionId,
     });
   }
+  // The id covers the verdict's semantics (role, evidence check, conflicts and note), so two
+  // different second opinions recorded at the same instant stay distinct immutable records.
   return deepFreeze({
     verificationId: `verification|${contentHashOf({
+      problem,
+      snapshotId: input.snapshotId,
       suggestionId: input.suggestionId,
       verdict: input.verdict,
+      verifierRole: input.verifierRole,
+      evidenceOk: input.evidenceOk,
+      conflictingSolutionIds: conflicting,
+      note,
       checkedAt,
     }).slice(0, 32)}`,
     suggestionId: input.suggestionId,
-    problemKey: problemKey(input.problemRef),
+    problemKey: problem,
     snapshotId: input.snapshotId,
     verdict: input.verdict,
     verifierRole: input.verifierRole,
     evidenceOk: input.evidenceOk,
     conflictingSolutionIds: conflicting,
-    note: input.note?.trim() || null,
+    note,
     checkedAt,
   });
 }
@@ -105,13 +115,25 @@ export interface CreateReasoningDraftInput {
 export function createReasoningDraft(input: CreateReasoningDraftInput): ReasoningDraft {
   const createdAt = assertIsoTimestamp('createdAt', input.createdAt);
   const key = problemKey(input.problemRef);
+  const taxonomyIds = [...new Set(input.taxonomyIds)];
+  const rationale = input.rationale.trim();
+  const evidence = (input.evidence ?? []).map((entry) => createEvidenceRef(entry));
+  // The id covers the draft body (tags, rationale, evidence): two different drafts for the
+  // same snapshot in the same millisecond must not collide into one immutable record.
   return deepFreeze({
-    draftId: `reasoning|${contentHashOf({ key, snapshotId: input.snapshotId, createdAt }).slice(0, 32)}`,
+    draftId: `reasoning|${contentHashOf({
+      key,
+      snapshotId: input.snapshotId,
+      taxonomyIds,
+      rationale,
+      evidence,
+      createdAt,
+    }).slice(0, 32)}`,
     problemKey: key,
     snapshotId: input.snapshotId,
-    taxonomyIds: [...new Set(input.taxonomyIds)],
-    rationale: input.rationale.trim(),
-    evidence: (input.evidence ?? []).map((evidence) => createEvidenceRef(evidence)),
+    taxonomyIds,
+    rationale,
+    evidence,
     createdAt,
   });
 }
@@ -226,14 +248,22 @@ export function createAnalysisResult(input: CreateAnalysisResultInput): Analysis
       status: input.status,
     });
   }
+  // The id covers the whole semantic result (version, suggestions, verifications, drafts,
+  // usage and failure), not only the referenced ids and the timestamp: two different model
+  // answers recorded in the same millisecond must stay distinct immutable records, while an
+  // identical replay still produces the identical id.
   const analysisId = `analysis|${contentHashOf({
     key,
     snapshotId: input.snapshotId,
+    snapshotVersion: input.snapshotVersion,
     taxonomyVersion: input.taxonomyVersion,
     createdAt,
     status: input.status,
-    suggestions: suggestions.map((suggestion) => suggestion.suggestionId),
-    verifications: verifications.map((verification) => verification.verificationId),
+    suggestions,
+    verifications,
+    reasoningDrafts,
+    usage: input.usage ?? null,
+    failure: input.failure ?? null,
   }).slice(0, 32)}`;
   return deepFreeze({
     analysisId,

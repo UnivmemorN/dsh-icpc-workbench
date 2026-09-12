@@ -29,3 +29,6 @@ The SDK can reuse a session within a running process, but its server creates a f
 
 ## Acceptance status
 Node22/24 × Windows/Linux CI passed for b4fa471 after replacing --test-isolation=none with the compatible --experimental-test-isolation=none. Passing run: https://github.com/UnivmemorN/dsh-icpc-workbench/actions/runs/34672594195 . Later stages require new verification.
+
+## Verified auxiliary-call details
+GenerateOptions.purpose only accepts compaction or session-title at this baseline: ICPC calls must omit purpose, not invent a custom value. reasoningEffort uses the public ReasoningEffortId brand. The shipped llm-retry plugin listens to agent/request-error, so direct auxiliary ctx.llm.stream calls do not receive those agent-loop retries. SessionStore.flush returns boolean: false means no durability listener participated and must refuse paid dispatch/adoption. A resolved promise alone is insufficient.

@@ -216,10 +216,29 @@ export interface ModelGatewayError {
   readonly retryable: boolean;
 }
 
-/** Result of one model call. Usage is reported even on failure (a failed call still costs). */
+/**
+ * Result of one model call. Usage is reported even on failure (a failed call still costs).
+ *
+ * `attemptId` (request) and `callId`/`sessionId` (result) exist so the host can correlate a
+ * durable {@link ModelCallAttempt} with its own model log. The pipeline sets `attemptId` from
+ * the reservation it persisted *before* dispatch and stores `callId`/`sessionId` on the
+ * settled attempt; a gateway that cannot report a session leaves `sessionId` unset.
+ */
 export type ModelCallResult<T> =
-  | { readonly ok: true; readonly value: T; readonly usage: ModelUsage; readonly callId: string }
-  | { readonly ok: false; readonly error: ModelGatewayError; readonly usage: ModelUsage; readonly callId: string };
+  | {
+      readonly ok: true;
+      readonly value: T;
+      readonly usage: ModelUsage;
+      readonly callId: string;
+      readonly sessionId?: string | null;
+    }
+  | {
+      readonly ok: false;
+      readonly error: ModelGatewayError;
+      readonly usage: ModelUsage;
+      readonly callId: string;
+      readonly sessionId?: string | null;
+    };
 
 export interface AnalyzeRequest {
   readonly snapshot: ProblemSnapshot;
@@ -227,6 +246,16 @@ export interface AnalyzeRequest {
   readonly token: CancellationToken;
   readonly limits: ModelLimits;
   readonly roles: ModelRoleSettings;
+  /** Durable attempt this call was reserved as; echoed into the host's own logs. */
+  readonly attemptId?: string;
+  /**
+   * Prompt identity the caller recorded for this dispatch.
+   *
+   * Optional because a gateway may be driven directly, but the analysis pipeline always sets it
+   * to the same effective identity it persists on the durable attempt, so a provider-side cache
+   * keyed on the prompt stays aligned with the recorded provenance of the call.
+   */
+  readonly promptVersion?: string;
 }
 
 export interface VerifyRequest {
@@ -236,6 +265,9 @@ export interface VerifyRequest {
   readonly token: CancellationToken;
   readonly limits: ModelLimits;
   readonly roles: ModelRoleSettings;
+  readonly attemptId?: string;
+  /** Prompt identity shared with the persisted attempt; see {@link AnalyzeRequest.promptVersion}. */
+  readonly promptVersion?: string;
 }
 
 export interface ReasonRequest {
@@ -246,6 +278,9 @@ export interface ReasonRequest {
   readonly token: CancellationToken;
   readonly limits: ModelLimits;
   readonly roles: ModelRoleSettings;
+  readonly attemptId?: string;
+  /** Prompt identity shared with the persisted attempt; see {@link AnalyzeRequest.promptVersion}. */
+  readonly promptVersion?: string;
 }
 
 export interface AnalyzeOutcome {

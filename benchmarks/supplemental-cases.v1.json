@@ -1,0 +1,131 @@
+{
+  "schemaVersion": 1,
+  "taxonomyVersion": "2026.09.1",
+  "status": "reference-cases-prepared; model benchmark not run",
+  "reviewer": "Codex coordinator",
+  "methodology": "Seven additional real cases selected before any model evaluation because their public editorial API material is available. They supplement, never silently replace, inaccessible entries in tag-cases.v1.json. Report access coverage for the combined cohort. Cases overlap contests and are not a representative random sample. Expected methods and notes are evaluation-only, never model input.",
+  "cases": [
+    {
+      "source": "codeforces",
+      "externalKey": "580A",
+      "title": "Kefa and First Steps",
+      "url": "https://codeforces.com/problemset/problem/580/A",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "implementation.simulation"
+        ],
+        [
+          "dp"
+        ]
+      ],
+      "reviewNote": "Track the current nondecreasing run length, reset on a drop, and retain its maximum. This also admits a one-dimensional recurrence.",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "blogEntryId": 20468
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "580B",
+      "title": "Kefa and Company",
+      "url": "https://codeforces.com/problemset/problem/580/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "search.two-pointers",
+          "search.sliding-window"
+        ],
+        [
+          "search.binary",
+          "data-structure.prefix-sum"
+        ]
+      ],
+      "reviewNote": "Sort friends by money, keep a window whose endpoint difference is strictly below d, and maximize its friendship sum. A prefix-sum plus binary-search variant is valid. Sorting currently lacks a dedicated taxonomy node.",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "blogEntryId": 20468
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "580D",
+      "title": "Kefa and Dishes",
+      "url": "https://codeforces.com/problemset/problem/580/D",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "dp.bitmask"
+        ]
+      ],
+      "reviewNote": "Use a visited-dish mask and final dish as the DP state; append an unused dish with its base satisfaction and adjacency bonus. Only states with m selected dishes are answers.",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "blogEntryId": 20468
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "580E",
+      "title": "Kefa and Watch",
+      "url": "https://codeforces.com/problemset/problem/580/E",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "strings.hashing",
+          "data-structure.segment-tree-lazy"
+        ]
+      ],
+      "reviewNote": "A substring has period d when its prefix and suffix shifted by d agree. Maintain normalized polynomial hashes under range digit assignment using a lazy segment tree. Hash collision handling is an implementation concern.",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "blogEntryId": 20468
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "456A",
+      "title": "Laptops",
+      "url": "https://codeforces.com/problemset/problem/456/A",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "implementation.ad-hoc"
+        ]
+      ],
+      "reviewNote": "Both prices and qualities are permutations of 1..n. If all paired values agree no inversion exists; otherwise an inversion must occur. Sorting followed by an inversion check is another valid method; sorting lacks a dedicated node.",
+      "editorialUrl": "https://codeforces.com/blog/entry/13336",
+      "blogEntryId": 13336
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "456B",
+      "title": "Fedya and Maths",
+      "url": "https://codeforces.com/problemset/problem/456/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "math.number-theory"
+        ]
+      ],
+      "reviewNote": "The residue of the sum of the four powers depends on the decimal exponent modulo 4; stream the digits to compute that residue. Modular exponentiation by decimal digits is an alternative. A dedicated modular-exponentiation node is currently absent.",
+      "editorialUrl": "https://codeforces.com/blog/entry/13336",
+      "blogEntryId": 13336
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "706A",
+      "title": "Beru-taxi",
+      "url": "https://codeforces.com/problemset/problem/706/A",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "geometry",
+          "implementation.brute-force"
+        ]
+      ],
+      "reviewNote": "Compute Euclidean distance divided by speed for each available taxi, then take the minimum; no routing algorithm is needed.",
+      "editorialUrl": "https://codeforces.com/blog/entry/46510",
+      "blogEntryId": 46510
+    }
+  ]
+}

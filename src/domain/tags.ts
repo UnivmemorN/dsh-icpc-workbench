@@ -53,11 +53,18 @@ export function createAiTagSuggestion(input: CreateAiTagSuggestionInput): AiTagS
   invariant(taxonomyId.length > 0, 'invalid_input', 'suggestion taxonomyId must not be empty', { input });
   const problem = problemKey(input.problemRef);
   const createdAt = assertIsoTimestamp('createdAt', input.createdAt);
+  const rationale = input.rationale.trim();
+  const evidence = input.evidence.map((entry) => createEvidenceRef(entry));
+  // The id covers the semantic body, not only identity and time. Two different model answers
+  // for the same problem/tag/snapshot must never share an id, otherwise the second immutable
+  // save would look like an identical re-save of the first and its evidence would be lost.
   const suggestionId = `suggestion|${contentHashOf({
     problem,
     snapshotId: input.snapshotId,
     taxonomyId,
     role: input.role,
+    rationale,
+    evidence,
     createdAt,
   }).slice(0, 32)}`;
   return deepFreeze({
@@ -66,8 +73,8 @@ export function createAiTagSuggestion(input: CreateAiTagSuggestionInput): AiTagS
     snapshotId: input.snapshotId,
     taxonomyId,
     role: input.role,
-    rationale: input.rationale.trim(),
-    evidence: input.evidence.map((evidence) => createEvidenceRef(evidence)),
+    rationale,
+    evidence,
     createdAt,
   });
 }

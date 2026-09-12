@@ -1,0 +1,135 @@
+{
+  "checkedAt": "2026-09-12",
+  "status": "discovered-not-yet-benchmarked",
+  "discovery": "Coordinator verified CF problem-page Tutorial links or author editorial search; API retrieval and intended-problem section parsing require separate validation.",
+  "references": [
+    {
+      "problem": "580C",
+      "blogEntryId": 20468,
+      "url": "https://codeforces.com/blog/entry/20468"
+    },
+    {
+      "problem": "455A",
+      "blogEntryId": 13336,
+      "url": "https://codeforces.com/blog/entry/13336"
+    },
+    {
+      "problem": "279B",
+      "blogEntryId": 95148,
+      "url": "https://codeforces.com/blog/entry/95148"
+    },
+    {
+      "problem": "466C",
+      "blogEntryId": 13758,
+      "url": "https://codeforces.com/blog/entry/13758"
+    },
+    {
+      "problem": "706B",
+      "blogEntryId": 46510,
+      "url": "https://codeforces.com/blog/entry/46510"
+    },
+    {
+      "problem": "520B",
+      "blogEntryId": 16736,
+      "url": "https://codeforces.com/blog/entry/16736"
+    },
+    {
+      "problem": "189A",
+      "blogEntryId": 4540,
+      "url": "https://codeforces.com/blog/entry/4540"
+    },
+    {
+      "problem": "363B",
+      "blogEntryId": 9537,
+      "url": "https://codeforces.com/blog/entry/9537"
+    },
+    {
+      "problem": "510C",
+      "blogEntryId": 16173,
+      "url": "https://codeforces.com/blog/entry/16173"
+    },
+    {
+      "problem": "295B",
+      "blogEntryId": 7329,
+      "url": "https://codeforces.com/blog/entry/7329"
+    },
+    {
+      "problem": "547B",
+      "blogEntryId": 18126,
+      "url": "https://codeforces.com/blog/entry/18126"
+    },
+    {
+      "problem": "380C",
+      "blogEntryId": 10363,
+      "url": "https://codeforces.com/blog/entry/10363"
+    },
+    {
+      "problem": "459D",
+      "blogEntryId": 13430,
+      "url": "https://codeforces.com/blog/entry/13430"
+    },
+    {
+      "problem": "191C",
+      "blogEntryId": 4634,
+      "url": "https://codeforces.com/blog/entry/4634"
+    },
+    {
+      "problem": "600E",
+      "blogEntryId": 21827,
+      "url": "https://codeforces.com/blog/entry/21827"
+    },
+    {
+      "problem": "438D",
+      "blogEntryId": 12513,
+      "url": "https://codeforces.com/blog/entry/12513"
+    },
+    {
+      "problem": "432D",
+      "blogEntryId": 12310,
+      "url": "https://codeforces.com/blog/entry/12310"
+    },
+    {
+      "problem": "271D",
+      "blogEntryId": 6662,
+      "url": "https://codeforces.com/blog/entry/6662"
+    },
+    {
+      "problem": "427C",
+      "blogEntryId": 12082,
+      "url": "https://codeforces.com/blog/entry/12082"
+    },
+    {
+      "problem": "126B",
+      "blogEntryId": 3140,
+      "url": "https://codeforces.com/blog/entry/3140"
+    },
+    {
+      "problem": "242E",
+      "blogEntryId": 5837,
+      "url": "https://codeforces.com/blog/entry/5837"
+    },
+    {
+      "problem": "617E",
+      "blogEntryId": 22971,
+      "url": "https://codeforces.com/blog/entry/22971"
+    },
+    {
+      "problem": "86D",
+      "blogEntryId": 2028,
+      "url": "https://codeforces.com/blog/entry/2028"
+    },
+    {
+      "problem": "609E",
+      "blogEntryId": 22187,
+      "url": "https://codeforces.com/blog/entry/22187"
+    }
+  ],
+  "unresolved": [
+    "20C",
+    "5C",
+    "P3374",
+    "P3367",
+    "P3372",
+    "P3383"
+  ]
+}

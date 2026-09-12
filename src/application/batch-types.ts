@@ -106,6 +106,16 @@ export type AnalysisBatchStatus = 'pending' | 'running' | 'paused' | 'cancelled'
 export interface AnalysisBatchJob {
   readonly jobId: string;
   readonly snapshotId: string;
+  /**
+   * Manual-decision revision of the problem, captured when the batch was prepared.
+   *
+   * The pipeline re-reads `TrainingStore.getManualRevision` before it adopts a model result
+   * and refuses that adoption when the revision changed meanwhile, so a human accept/reject
+   * made while the model was running always wins. The field is optional only so records
+   * written before it existed can still be read: a batch whose jobs lack it must refuse to
+   * execute instead of assuming the current revision.
+   */
+  readonly manualRevision?: number;
 }
 
 /** Explicit call budget of one batch: analysis (analyze + verify) and reasoning are separate. */
@@ -176,7 +186,12 @@ export function createAnalysisBatch(input: CreateAnalysisBatchInput): AnalysisBa
   const maxJobs = input.maxJobs === undefined ? DEFAULT_ANALYSIS_BATCH_MAX_JOBS : input.maxJobs;
   const batch: AnalysisBatch = {
     batchId: input.batchId,
-    jobs: (input.jobs ?? []).map((job) => ({ jobId: job.jobId, snapshotId: job.snapshotId })),
+    jobs: (input.jobs ?? []).map((job) => {
+      validateJobManualRevision(job);
+      return job.manualRevision === undefined
+        ? { jobId: job.jobId, snapshotId: job.snapshotId }
+        : { jobId: job.jobId, snapshotId: job.snapshotId, manualRevision: job.manualRevision };
+    }),
     maxJobs,
     createdAt,
     status: input.status ?? 'pending',
@@ -638,4 +653,21 @@ function requireLimit(label: string, value: unknown): number {
     { label, value },
   );
   return value;
+}
+
+/**
+ * Validate the optional captured manual revision of one batch job.
+ *
+ * `undefined` is tolerated (legacy record); anything else must be a non-negative integer, so
+ * a malformed value can never be stored as if it were a real captured revision.
+ */
+function validateJobManualRevision(job: AnalysisBatchJob): void {
+  const manualRevision = job?.manualRevision;
+  invariant(
+    manualRevision === undefined ||
+      (typeof manualRevision === 'number' && Number.isInteger(manualRevision) && manualRevision >= 0),
+    'invalid_input',
+    `batch job ${String(job?.jobId)} manualRevision must be a non-negative integer when present`,
+    { jobId: job?.jobId, manualRevision },
+  );
 }
