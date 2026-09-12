@@ -1,4 +1,4 @@
-/** dsh host adapters; Stage 4a1 exports the audited auxiliary model client only. */
+/** dsh host adapters: the audited auxiliary model client and the tag-model gateway. */
 export {
   AUDITED_MODEL_ROLES,
   AUDIT_CONTEXT_FRAMING_MARGIN_TOKENS,
@@ -19,3 +19,29 @@ export type {
   IcpcModelCallAudit,
   IcpcModelCallResultAudit,
 } from './audited-client.js';
+
+export {
+  ANALYZE_SYSTEM_PROMPT,
+  DshModelGateway,
+  MODEL_GATEWAY_MAX_CONCURRENCY,
+  REASON_SYSTEM_PROMPT,
+  VERIFY_SYSTEM_PROMPT,
+} from './model-gateway.js';
+export type { DshModelGatewayClient, DshModelGatewayOptions } from './model-gateway.js';
+
+export {
+  MAX_ANALYSIS_SUGGESTIONS,
+  MAX_CONFLICTING_SOLUTIONS,
+  MAX_EVIDENCE_PER_SUGGESTION,
+  MAX_EXCERPT_CHARS,
+  MAX_NOTE_CHARS,
+  MAX_RATIONALE_CHARS,
+  MAX_REASON_DRAFTS,
+  MAX_TAXONOMY_IDS_PER_DRAFT,
+  ModelOutputError,
+  parseAnalyzeOutput,
+  parseReasoningOutput,
+  parseVerificationOutput,
+  shownSolution,
+} from './model-output.js';
+export type { AnalyzeOutputContext, ReasonOutputContext, VerifyOutputContext } from './model-output.js';
