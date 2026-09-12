@@ -357,6 +357,19 @@ export interface ProblemQuery {
   readonly accountId?: string | null;
   readonly limit: number;
   readonly cursor: string | null;
+  /**
+   * Optional literal, case-insensitive substring filter (1..200 characters) over the whole bank:
+   * a problem matches when the term occurs in its title or in its platform external key.
+   * Matching is literal, so `%` and `_` are ordinary characters and quoting is unnecessary.
+   */
+  readonly query?: string | null;
+  /**
+   * Optional review-queue filter: keep only problems that still hold an unresolved item at their
+   * current snapshot head (a current AI `needs_review` decision, or a taxonomy id of a current
+   * analysis' reasoning draft without a manual decision). An implementation applies it before
+   * pagination, so a page never has to be filtered by the caller.
+   */
+  readonly needsReviewOnly?: boolean | null;
 }
 
 /**

@@ -569,6 +569,16 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
         );
         params.push(query.accountId);
       }
+      const search = problemSearchTerm(query.query);
+      if (search !== null) {
+        // Literal substring match (`instr`, never `LIKE`), so `%`, `_` and quotes are ordinary
+        // characters; both the title and the platform external key are searched in SQL.
+        filters.push('(instr(lower(title), lower(?)) > 0 OR instr(lower(external_key), lower(?)) > 0)');
+        params.push(search, search);
+      }
+      if (reviewOnlyFlag(query.needsReviewOnly)) {
+        filters.push(PENDING_REVIEW_PREDICATE);
+      }
       if (cursor !== null) {
         filters.push('key > ?');
         params.push(cursor);
@@ -1894,6 +1904,101 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
     }
     throw original;
   }
+}
+
+/** Maximum accepted whole-bank search term; longer input is rejected, never truncated. */
+const MAX_PROBLEM_SEARCH_CHARS = 200;
+
+/**
+ * Review-queue predicate: this problem still holds at least one unresolved item at its head.
+ *
+ * (a) an AI `needs_review` decision that is still the current decision of its (problem, tag) and has
+ *     no manual accept/reject, targeting exactly the stored head id and version. A decision only
+ *     supersedes it when it is a manual/rule decision (always in scope) or an AI decision targeting
+ *     the SAME current head, mirroring the effective view: a later-dated AI decision written for
+ *     another snapshot must not silently resolve a current item. Ties are broken by `decision_id`,
+ *     the same `decided_at ASC, decision_id ASC` order the store returns decisions in; or
+ * (b) a taxonomy id of a reasoning draft inside an analysis that targets the stored head and has no
+ *     manual decision (reasoning drafts never become automatic decisions).
+ *
+ * Only indexed columns and the canonical JSON bodies are read (`json_extract`/`json_each` with
+ * `json_valid` guards), the filter runs before `LIMIT`, and no caller input is interpolated.
+ */
+const PENDING_REVIEW_PREDICATE = `(
+  EXISTS (
+    SELECT 1
+      FROM tag_decisions d
+      JOIN snapshot_heads h
+        ON h.problem_key = d.problem_key
+       AND h.snapshot_id = json_extract(d.body, '$.snapshotId')
+       AND h.version = json_extract(d.body, '$.snapshotVersion')
+     WHERE d.problem_key = problems.key
+       AND d.status = 'needs_review'
+       AND d.origin = 'ai'
+       AND json_valid(d.body)
+       AND NOT EXISTS (
+         SELECT 1 FROM manual_decisions m
+          WHERE m.problem_key = d.problem_key AND m.taxonomy_id = d.taxonomy_id
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM tag_decisions newer
+          WHERE newer.problem_key = d.problem_key
+            AND newer.taxonomy_id = d.taxonomy_id
+            AND (newer.decided_at > d.decided_at
+                 OR (newer.decided_at = d.decided_at AND newer.decision_id > d.decision_id))
+            AND (
+              newer.origin IN ('manual', 'rule')
+              OR (
+                newer.origin = 'ai'
+                AND json_valid(newer.body)
+                AND json_extract(newer.body, '$.snapshotId') = h.snapshot_id
+                AND json_extract(newer.body, '$.snapshotVersion') = h.version
+              )
+            )
+       )
+  )
+  OR EXISTS (
+    SELECT 1
+      FROM analyses a
+      JOIN snapshot_heads h2
+        ON h2.problem_key = a.problem_key
+       AND h2.snapshot_id = a.snapshot_id
+       AND h2.version = a.snapshot_version
+      JOIN json_each(a.body, '$.reasoningDrafts') AS draft
+      JOIN json_each(draft.value, '$.taxonomyIds') AS tag
+     WHERE a.problem_key = problems.key
+       AND json_valid(a.body)
+       AND NOT EXISTS (
+         SELECT 1 FROM manual_decisions m2
+          WHERE m2.problem_key = a.problem_key
+            AND m2.taxonomy_id = CAST(tag.value AS TEXT)
+       )
+  )
+)`;
+
+/** Validate the optional literal search term of {@link ProblemQuery.query}. */
+function problemSearchTerm(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  invariant(typeof value === 'string', 'invalid_input', 'problem query must be a string', { value });
+  const trimmed = value.trim();
+  invariant(
+    trimmed.length > 0 && trimmed.length <= MAX_PROBLEM_SEARCH_CHARS,
+    'invalid_input',
+    `problem query must be 1..${MAX_PROBLEM_SEARCH_CHARS} characters`,
+    { length: trimmed.length },
+  );
+  return trimmed;
+}
+
+/** Validate the optional review-queue flag of {@link ProblemQuery.needsReviewOnly}. */
+function reviewOnlyFlag(value: boolean | null | undefined): boolean {
+  if (value === undefined || value === null) {
+    return false;
+  }
+  invariant(typeof value === 'boolean', 'invalid_input', 'needsReviewOnly must be a boolean when present', { value });
+  return value;
 }
 
 function pageLimit(limit: number): number {
