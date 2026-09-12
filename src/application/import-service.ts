@@ -26,26 +26,37 @@
  *   fetches inside a transaction, and compares the snapshot head captured *before* the
  *   network call with the head inside the commit transaction: material fetched against a
  *   superseded head is rejected instead of overwriting a newer manual import.
+ * - **`supplementMaterial`** adds a manually supplied statement and/or material declaration to
+ *   an already stored problem in one transaction, rebuilding the problem from the *stored*
+ *   ref, title, url, ratings and raw tags. A client that never saw the hidden metadata cannot
+ *   erase it, the caller's `expectedSnapshotId` gates the write before anything is written,
+ *   and a supplement whose semantic content is unchanged reuses the exact previous snapshot.
+ *   No platform or model is called, so an explicit `absent` declaration stays a recorded
+ *   decision instead of being turned into a reasoning request.
  *
  * ## Material merge rules
  *
  * The editorial state of a problem is a *set of sources plus their solutions*, not a single
  * blob. A `found` answer replaces exactly the sources it names (by stable source id) and only
- * those sources' solutions, so separately imported articles survive. A non-`found` answer
- * records the check outcome under a target-derived id, but never discards cached successful
- * material: the caller gets the fresh status *and* the cached availability separately.
- * An empty array is never read as "no editorial exists".
+ * those sources' solutions, so separately imported articles survive; a successful source the
+ * answer does not name is kept, and only a non-`found` placeholder of the checked target is
+ * removed. A non-`found` answer records the check outcome under a target-derived id, but never
+ * discards cached successful material: the caller gets the fresh status *and* the cached
+ * availability separately. An empty array is never read as "no editorial exists".
  */
 import {
   DomainError,
   accountIdOf,
   assertHttpUrl,
+  assertIdPart,
   assertIsoTimestamp,
+  createEditorialSolution,
   createEditorialSource,
   createNormalizedProblem,
   createProblemSnapshot,
   encodeIdPart,
   invariant,
+  parseProblemKey,
   problemKey,
   sourceInstanceIdOf,
   submissionKey,
@@ -67,6 +78,7 @@ import type { EditorialFetchResult, Page, PlatformAdapter, TrainingStore } from 
 import type { SyncCheckpoint, SyncCheckpointRef } from './storage-types.js';
 import {
   IMPORT_PAGE_LIMITS,
+  MAX_SUPPLEMENT_STATEMENT_CHARS,
   MISSING_PROBLEM_KEY_LIMIT,
   editorialSourceIdOf,
   type EditorialRefreshOutcome,
@@ -81,6 +93,8 @@ import {
   type SnapshotWrite,
   type StatementRefreshOutcome,
   type SubmissionPageCounts,
+  type SupplementMaterialReport,
+  type SupplementMaterialRequest,
   type SyncPageCounts,
   type SyncPageReport,
   type SyncPageRequest,
@@ -199,6 +213,112 @@ export class ImportService {
         snapshots,
         changedSnapshots: snapshots.filter((snapshot) => snapshot.changed).length,
       } satisfies ManualImportReport;
+    });
+  }
+
+  /**
+   * Supplement one **stored** problem with a manually supplied statement and/or material
+   * declaration, without touching anything the request does not name.
+   *
+   * This is the write path of the workbench's unsolved-problem form. That form never sees raw
+   * platform tags, ratings or cached editorial, so it must not be asked to re-import a whole
+   * problem: a partial client-side copy would erase the metadata the form deliberately hides.
+   * The problem is therefore rebuilt from the **stored** reference, title, url, ratings and raw
+   * tags, and only the supplied statement and the observation time are replaced.
+   *
+   * The problem row and the resulting snapshot are written in **one** transaction: a
+   * cancellation observed after any write await rolls the whole call back. The caller's
+   * `expectedSnapshotId` is compared with the stored head *before* the first write, so a
+   * supplement built on a superseded snapshot is refused instead of overwriting newer work.
+   * Material follows the shared merge rules — declared source ids are replaced and everything
+   * else is preserved — and no platform or model call is made here: an explicit `absent`
+   * declaration stays a recorded decision rather than becoming a reasoning request.
+   */
+  async supplementMaterial(
+    request: SupplementMaterialRequest,
+    token: CancellationToken,
+  ): Promise<SupplementMaterialReport> {
+    throwIfCancelled(token);
+    const validated = validateSupplementRequest(request);
+    const key = validated.problemKey;
+    const observedAt = assertIsoTimestamp('observedAt', this.now());
+
+    return this.store.transaction(async () => {
+      throwIfCancelled(token);
+      const stored = await this.store.getProblem(key);
+      throwIfCancelled(token);
+      if (stored === null) {
+        throw new DomainError('missing_reference', `problem ${key} is not stored`, { problemKey: key });
+      }
+      invariant(
+        stored.key === key && problemKey(stored.ref) === key,
+        'invalid_input',
+        `stored problem ${stored.key} does not match the requested reference`,
+        { requested: key, stored: stored.key, derived: problemKey(stored.ref) },
+      );
+      // The source instance owns the problem; a problem whose instance is gone is a dangling
+      // reference and must not gain new snapshots.
+      const source = await this.store.getSourceInstance(stored.ref.sourceInstanceId);
+      throwIfCancelled(token);
+      invariant(
+        source !== null,
+        'missing_reference',
+        `source instance ${stored.ref.sourceInstanceId} is not stored`,
+        { problemKey: key },
+      );
+
+      const previous = await this.readCurrentSnapshot(stored.ref, token);
+      const currentSnapshotId = previous === null ? null : previous.snapshotId;
+      if (currentSnapshotId !== validated.expectedSnapshotId) {
+        throw new DomainError(
+          'invalid_transition',
+          'supplement is stale: the snapshot head changed since it was read',
+          { expected: validated.expectedSnapshotId, current: currentSnapshotId },
+        );
+      }
+
+      const merged = createNormalizedProblem({
+        ref: stored.ref,
+        title: stored.title,
+        url: stored.url,
+        statement: validated.statement ?? stored.statement,
+        fetchedAt: observedAt,
+        ratings: stored.ratings.map((rating) => ({
+          dimension: rating.dimension,
+          value: rating.value,
+          scale: rating.scale === null ? null : { min: rating.scale.min, max: rating.scale.max },
+          raw: rating.raw,
+        })),
+        rawTags: stored.rawTags.map((tag) => tag.raw),
+      });
+      await this.store.upsertProblems([merged]);
+      throwIfCancelled(token);
+
+      const declaration = validated.material;
+      const editorial = mergeEditorialMaterial({
+        problem: merged,
+        previous,
+        result: declaration === null ? null : declaredMaterialResult(declaration),
+        attribution: declaration,
+        target:
+          declaration === null || declaration.url === null
+            ? null
+            : assertHttpUrl('material url', declaration.url),
+        retrievedAt: observedAt,
+      });
+      const snapshot = await this.persistSnapshot({
+        problem: merged,
+        sources: editorial.sources,
+        solutions: editorial.solutions,
+        previous,
+        token,
+      });
+      throwIfCancelled(token);
+      return {
+        problemKey: key,
+        snapshot,
+        material: declaration === null ? null : editorial.report,
+      } satisfies SupplementMaterialReport;
     });
   }
 
@@ -826,6 +946,251 @@ function declaredMaterialResult(material: ManualMaterialInput): EditorialFetchRe
 }
 
 // ---------------------------------------------------------------------------------------
+// Supplement request validation
+// ---------------------------------------------------------------------------------------
+
+interface ValidatedSupplementRequest {
+  readonly problemKey: string;
+  readonly expectedSnapshotId: string | null;
+  /** Supplied statement, exactly as the caller wrote it; `null` means "do not touch". */
+  readonly statement: string | null;
+  readonly material: ManualMaterialInput | null;
+}
+
+/** The only fields a supplement request may carry; the contract is closed, not best-effort. */
+const SUPPLEMENT_REQUEST_FIELDS: ReadonlySet<string> = new Set([
+  'problemKey',
+  'expectedSnapshotId',
+  'statement',
+  'material',
+]);
+
+/**
+ * Recheck a supplementation request before any read or write.
+ *
+ * The workbench's form owns the shapes; this pass keeps a malformed or ambiguous request from
+ * being reported as a successful supplement — anything that is not a plain request object,
+ * an unknown field, a missing key, an `expectedSnapshotId` that cannot be this problem's head,
+ * a blank or oversized statement, a `null` field that would read as deletion, a declaration
+ * for another problem, or a declaration that carries no deliverable material.
+ */
+function validateSupplementRequest(request: SupplementMaterialRequest): ValidatedSupplementRequest {
+  invariant(
+    request !== null && typeof request === 'object' && !Array.isArray(request),
+    'invalid_input',
+    'supplement request must be an object',
+  );
+  // The request is a closed contract. An unsupported field (a smuggled-in title, raw tags or
+  // whole problem copy) is a caller error, not something to ignore: silently dropping it would
+  // let the caller believe a hidden field had been applied.
+  const unknownFields = Object.keys(request).filter((field) => !SUPPLEMENT_REQUEST_FIELDS.has(field));
+  invariant(
+    unknownFields.length === 0,
+    'invalid_input',
+    `supplement request carries unknown field(s): ${unknownFields.join(', ')}`,
+    { fields: unknownFields },
+  );
+  const declaredKey = request.problemKey;
+  invariant(
+    typeof declaredKey === 'string' && declaredKey.length > 0,
+    'invalid_input',
+    'supplement request requires a problem key',
+  );
+  // Strict canonical shape: a key that is not exactly `instance|domain|externalKey` is a
+  // caller error, not a lookup that legitimately finds nothing.
+  const key = problemKey(parseProblemKey(declaredKey));
+
+  const expected = request.expectedSnapshotId;
+  invariant(
+    expected === null || (typeof expected === 'string' && expected.length > 0),
+    'invalid_input',
+    'expectedSnapshotId must be a snapshot id or null',
+    { problemKey: key },
+  );
+  invariant(
+    expected === null || expected.startsWith(`${key}@`),
+    'invalid_input',
+    'expectedSnapshotId does not belong to the requested problem',
+    { problemKey: key, expectedSnapshotId: expected },
+  );
+
+  const supplied = request.statement;
+  invariant(
+    supplied === undefined || typeof supplied === 'string',
+    'invalid_input',
+    'statement must be a string when supplied; this operation never deletes a stored statement',
+    { problemKey: key },
+  );
+  let statement: string | null = null;
+  if (supplied !== undefined) {
+    invariant(supplied.trim().length > 0, 'invalid_input', 'supplemented statement must not be blank', {
+      problemKey: key,
+    });
+    invariant(
+      supplied.length <= MAX_SUPPLEMENT_STATEMENT_CHARS,
+      'invalid_input',
+      `supplemented statement exceeds ${MAX_SUPPLEMENT_STATEMENT_CHARS} characters`,
+      { problemKey: key, length: supplied.length },
+    );
+    statement = supplied;
+  }
+
+  const declared = request.material;
+  invariant(
+    declared === undefined || (declared !== null && typeof declared === 'object' && !Array.isArray(declared)),
+    'invalid_input',
+    'material must be a declaration when supplied; this operation never clears stored material',
+    { problemKey: key },
+  );
+  const material = declared === undefined ? null : validateSupplementMaterial(key, declared);
+
+  invariant(
+    statement !== null || material !== null,
+    'invalid_input',
+    'supplement requires a statement, a material declaration or both',
+    { problemKey: key },
+  );
+  return { problemKey: key, expectedSnapshotId: expected, statement, material };
+}
+
+/**
+ * Validate one material declaration of a supplement.
+ *
+ * Only `found` and `absent` are declarations. An operational status (`auth_required`,
+ * `rate_limited`, …) or the parser's `unavailable` placeholder means "nothing was declared" and
+ * is rejected here, so a supplement can neither report a check it did not make nor claim that
+ * no editorial exists on the strength of a failed request.
+ */
+function validateSupplementMaterial(problemKeyValue: string, material: ManualMaterialInput): ManualMaterialInput {
+  invariant(
+    material !== null && typeof material === 'object' && !Array.isArray(material),
+    'invalid_input',
+    'material must be an object',
+  );
+  invariant(
+    material.problemKey === problemKeyValue,
+    'invalid_input',
+    `material declaration refers to ${material.problemKey}, not ${problemKeyValue}`,
+    { declared: material.problemKey, expected: problemKeyValue },
+  );
+  const result = material.result;
+  invariant(
+    result !== null && typeof result === 'object' && !Array.isArray(result),
+    'invalid_input',
+    'material declaration requires an editorial result',
+    { problemKey: problemKeyValue },
+  );
+  const declaration = declaredMaterialResult(material);
+  if (declaration === null) {
+    throw new DomainError('invalid_input', 'a supplement declares found or absent material, not nothing', {
+      problemKey: problemKeyValue,
+    });
+  }
+
+  if (declaration.status === 'found') {
+    const sources = declaration.sources;
+    const solutions = declaration.solutions;
+    invariant(sources.length > 0, 'invalid_input', 'a found declaration must name at least one source', {
+      problemKey: problemKeyValue,
+    });
+    invariant(solutions.length > 0, 'invalid_input', 'a found declaration must carry at least one solution', {
+      problemKey: problemKeyValue,
+    });
+    const sourceIds = new Set<string>();
+    for (const source of sources) {
+      validateSupplementSource(source);
+      invariant(!sourceIds.has(source.id), 'duplicate_id', `duplicate editorial source ${source.id}`);
+      sourceIds.add(source.id);
+    }
+    const solutionIds = new Set<string>();
+    for (const solution of solutions) {
+      // The domain factory revalidates the stable ids, the ordinal and the literal body: a
+      // record that cannot be rebuilt as a real solution is not evidence of anything.
+      createEditorialSolution({
+        solutionId: solution.solutionId,
+        sourceId: solution.sourceId,
+        ordinal: solution.ordinal,
+        title: solution.title,
+        text: solution.text,
+        language: solution.language,
+      });
+      invariant(
+        !solutionIds.has(solution.solutionId),
+        'duplicate_id',
+        `duplicate editorial solution ${solution.solutionId}`,
+      );
+      solutionIds.add(solution.solutionId);
+      invariant(
+        sourceIds.has(solution.sourceId),
+        'missing_reference',
+        `solution ${solution.solutionId} references unknown source ${solution.sourceId}`,
+        { problemKey: problemKeyValue },
+      );
+    }
+    return material;
+  }
+
+  // An explicit absence is only meaningful with the attribution of the page it refers to;
+  // without it the record would not say what was checked.
+  if (typeof material.url !== 'string' || material.url.length === 0) {
+    throw new DomainError('invalid_input', 'an absent declaration requires the url of the page it refers to', {
+      problemKey: problemKeyValue,
+    });
+  }
+  assertHttpUrl('material url', material.url);
+  invariant(
+    typeof material.title === 'string' && material.title.trim().length > 0,
+    'invalid_input',
+    'an absent declaration requires the title of the page it refers to',
+    { problemKey: problemKeyValue },
+  );
+  invariant(
+    typeof material.note === 'string' && material.note.trim().length > 0,
+    'invalid_input',
+    'an absent declaration requires a note explaining the decision',
+    { problemKey: problemKeyValue },
+  );
+  return material;
+}
+
+/**
+ * Revalidate one editorial source of a manual `found` declaration.
+ *
+ * The adapter or parser owns turning a page into domain records, and a declaration is built
+ * through the domain factories. This pass keeps a hand-built declaration from persisting an id,
+ * URL, availability or content hash the domain would never produce; the snapshot itself refuses
+ * a `found` source without a body hash, so the check fails here instead of halfway through a
+ * write.
+ */
+function validateSupplementSource(source: EditorialSource): void {
+  invariant(source !== null && typeof source === 'object', 'invalid_input', 'editorial source must be an object');
+  assertIdPart('editorial source id', source.id);
+  assertHttpUrl('editorial source url', source.url);
+  invariant(
+    typeof source.title === 'string' && source.title.trim().length > 0,
+    'invalid_input',
+    'editorial source title must not be empty',
+    { id: source.id },
+  );
+  assertIsoTimestamp('editorial source retrievedAt', source.retrievedAt);
+  if (source.publishedAt !== null) {
+    assertIsoTimestamp('publishedAt', source.publishedAt);
+  }
+  invariant(
+    source.availability === 'found',
+    'invalid_input',
+    `a found declaration cannot carry a source with availability ${String(source.availability)}`,
+    { id: source.id },
+  );
+  invariant(
+    typeof source.contentHash === 'string' && /^[0-9a-f]{64}$/u.test(source.contentHash),
+    'invalid_input',
+    'a found editorial source must carry a sha256 content hash',
+    { id: source.id },
+  );
+}
+
+// ---------------------------------------------------------------------------------------
 // Metadata merge
 // ---------------------------------------------------------------------------------------
 
@@ -926,7 +1291,9 @@ interface EditorialMergeResult {
  *
  * Sources are addressed by their stable id, so:
  * - a `found` answer replaces exactly the sources it names — and only those sources'
- *   solutions — while separately imported articles and their solutions survive;
+ *   solutions — while separately imported articles and their solutions survive; a successful
+ *   source the answer does not name is kept, and only a non-`found` placeholder of the
+ *   checked target is removed;
  * - a non-`found` answer records the check under the target-derived "material check" id but
  *   never replaces a source of that id that already holds successful material;
  * - an empty source array never means "no editorial exists", it only means this answer
@@ -961,8 +1328,17 @@ function mergeEditorialMaterial(args: EditorialMergeArgs): EditorialMergeResult 
       { problemKey: key },
     );
     const incomingIds = new Set(result.sources.map((source) => source.id));
-    const keptSources = previousSources.filter((source) => !incomingIds.has(source.id) && source.id !== checkId);
-    const keptSolutions = previousSolutions.filter((solution) => !incomingIds.has(solution.sourceId));
+    // A previous source survives unless this answer names it, or unless it is the *placeholder*
+    // check record of the target being replaced. A successful source is never dropped merely
+    // because the answer did not name it: the target-derived id can coincide with the problem
+    // URL, and removing such a source would orphan the solutions that stay cached.
+    const keptSources = previousSources.filter(
+      (source) => !incomingIds.has(source.id) && !(source.id === checkId && source.availability !== 'found'),
+    );
+    const keptSourceIds = new Set(keptSources.map((source) => source.id));
+    // Solutions follow their source, so the merged snapshot can never carry a solution whose
+    // source was replaced or removed.
+    const keptSolutions = previousSolutions.filter((solution) => keptSourceIds.has(solution.sourceId));
     const sources = sortSources([...keptSources, ...result.sources]);
     const solutions = sortSolutions([...keptSolutions, ...result.solutions]);
     return {

@@ -166,6 +166,61 @@ export interface ManualImportReport {
 }
 
 // ---------------------------------------------------------------------------------------
+// Manual supplementation
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Hard upper bound on a manually supplied statement, in characters.
+ *
+ * A bounded input keeps one paste from becoming an unbounded write, and the bound is far
+ * above any real statement a user would type or paste.
+ */
+export const MAX_SUPPLEMENT_STATEMENT_CHARS = 200_000;
+
+/**
+ * Supplement one **stored** problem with a manually supplied statement and/or material
+ * declaration.
+ *
+ * This is the operation behind the workbench's unsolved-problem form. That form's DTO
+ * deliberately hides raw platform tags, ratings and cached editorial, so having it re-import a
+ * whole problem would let a partial client-side copy erase the metadata it is not allowed to
+ * see. The service therefore never accepts a problem body: it reads the stored problem and
+ * replaces only what this request names.
+ *
+ * Rules:
+ * - at least one of `statement`/`material` must be supplied; a request that would write nothing
+ *   is rejected instead of being reported as a successful supplement;
+ * - `statement` keeps the caller's text but must be non-blank after trimming and at most
+ *   {@link MAX_SUPPLEMENT_STATEMENT_CHARS} characters; an explicit `null` is rejected because
+ *   this operation never deletes a stored statement;
+ * - `material` is one already-normalised declaration for the *same* problem: `found` with a
+ *   non-empty, rebuildable source/solution set, or an explicit `absent` with the URL, title and
+ *   note it refers to;
+ * - `expectedSnapshotId` is the snapshot the caller saw (`null` when it saw none); the write is
+ *   refused when the stored head has moved on.
+ */
+export interface SupplementMaterialRequest {
+  readonly problemKey: string;
+  readonly expectedSnapshotId: string | null;
+  readonly statement?: string;
+  readonly material?: ManualMaterialInput;
+}
+
+/**
+ * Result of one supplementation.
+ *
+ * Deliberately narrow: identity, the committed snapshot descriptor and the material outcome.
+ * No problem body, raw tag or editorial text is echoed, so this operation cannot become a way
+ * to read the hidden metadata it exists to protect.
+ */
+export interface SupplementMaterialReport {
+  readonly problemKey: string;
+  readonly snapshot: SnapshotWrite;
+  /** Outcome of the supplied declaration; `null` when the request carried none. */
+  readonly material: MaterialReport | null;
+}
+
+// ---------------------------------------------------------------------------------------
 // Paged sync
 // ---------------------------------------------------------------------------------------
 
