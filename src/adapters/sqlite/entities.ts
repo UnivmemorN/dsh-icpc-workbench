@@ -192,6 +192,29 @@ export const MODEL_CALL_ATTEMPT_FIELDS: readonly string[] = [
   'error',
   'outcome',
 ];
+/**
+ * Declared fields of one coaching attempt. `expiresAt` has its own indexed column and the
+ * canonical body stays the source of truth for reads.
+ */
+export const COACHING_ATTEMPT_FIELDS: readonly string[] = [
+  'id',
+  'accountId',
+  'problemKey',
+  'snapshotId',
+  'level',
+  'requestedAt',
+  'expiresAt',
+  'finishedAt',
+  'status',
+  'provider',
+  'model',
+  'promptVersion',
+  'hostSessionId',
+  'hostCallId',
+  'usage',
+  'responseText',
+  'error',
+];
 
 /** Fields that take part in a snapshot's *identity* (observation timestamps excluded). */
 const PROBLEM_IDENTITY_FIELDS: readonly string[] = ['ref', 'key', 'title', 'url', 'statement', 'ratings', 'rawTags'];
@@ -423,7 +446,7 @@ export function jobCounters(state: Pick<AnalysisJobState, 'attempts' | 'counters
 // Cursor codec
 // ---------------------------------------------------------------------------------------
 
-export type CursorKind = 'problem' | 'submission';
+export type CursorKind = 'problem' | 'submission' | 'coaching';
 
 const CURSOR_PAYLOAD = /^[A-Za-z0-9_-]+$/u;
 

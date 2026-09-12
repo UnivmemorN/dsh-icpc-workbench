@@ -20,5 +20,5 @@ export function taskContext(task,root){
     if(bytes>MAX_WORKER_CONTEXT_BYTES)throw new Error('Worker context exceeds the 750000-byte cap');
     seen.add(file);sections.push(section);
   }
-  return sections.length?'\n\nThe coordinator provides the following current repository snapshots so you can implement without repeated discovery calls. These files are context, not extra assignments. Read their contents here; do not reread unchanged files. Use targeted reads only when an edit or concrete missing definition requires it.'+sections.join(''):'';
+  return sections.length?'\n\nThe coordinator provides the following current repository snapshots so you can implement without repeated discovery calls. These files are context, not extra assignments. Read their contents here. Attached context does not establish the host file-observation precondition: before the first edit of each existing target, always issue one actual read call for that target in the current session. Batch those exact reads together, then edit. Avoid repeated discovery and full rereads of reference-only files; never bypass the host observation policy.'+sections.join(''):'';
 }

@@ -19,6 +19,11 @@
  *   a stale `expectedRevision` before writing anything and never lets counters or a terminal
  *   state go backwards. A model-call attempt is inserted `reserved` before dispatch and only
  *   moves forward (`reserved → uncertain | settled`); a settled row can never be rewritten.
+ * - **Coaching attempts are append-only audits of their own.** A reservation records the
+ *   `expiresAt` recovery compares, moves only forward, keeps a host correlation once known, and
+ *   a settled row is immutable; its quota count is global (never per account). Reads re-validate
+ *   every stored body (valid JSON that is not a valid attempt is `corrupt_row`), and the account
+ *   filter is three-valued: omitted = all accounts, explicit `null` = anonymous only.
  * - **Settings are one CAS-guarded singleton row.** The value is validated and detached on the
  *   way in and re-validated on the way out; a save only advances the stored revision when its
  *   `expectedRevision` matches, so a stale caller rejects before any write.
@@ -38,6 +43,7 @@ import {
   DomainError,
   assertIsoTimestamp,
   canonicalJson,
+  contentHashOf,
   invariant,
   isLeaseExpired,
   problemKey,
@@ -78,6 +84,16 @@ import {
   type ModelCallAttemptQuery,
 } from '../../application/batch-types.js';
 import {
+  COACHING_STATUSES,
+  validateCoachingAttempt,
+  validateCoachingAttemptTransition,
+  type CoachingAttempt,
+  type CoachingAttemptCountQuery,
+  type CoachingAttemptQuery,
+  type CoachingStatus,
+  type CoachingStore,
+} from '../../application/coaching-types.js';
+import {
   STORAGE_PAGE_LIMITS,
   SYNC_RESOURCES,
   syncCheckpointKey,
@@ -92,6 +108,7 @@ import {
   ACCOUNT_FIELDS,
   ANALYSIS_FIELDS,
   BATCH_FIELDS,
+  COACHING_ATTEMPT_FIELDS,
   JOB_FIELDS,
   MANUAL_DECISION_FIELDS,
   MODEL_CALL_ATTEMPT_FIELDS,
@@ -166,7 +183,7 @@ function requireId(label: string, value: string): string {
   return value;
 }
 
-export class SqliteTrainingStore implements TrainingStore, SettingsStore {
+export class SqliteTrainingStore implements TrainingStore, SettingsStore, CoachingStore {
   readonly path: string;
 
   private readonly connection: DatabaseSync;
@@ -243,7 +260,8 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore {
         'Databases from a newer schema are rejected before any write; v0, v1 and v2 databases are migrated after a verified consistent backup',
         'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
         'Batches are revision-guarded with monotonic counters; model-call attempts move reserved -> uncertain|settled and settled rows are immutable',
-        'Workbench settings are a singleton row saved under revision CAS; the v3 coaching_attempts table exists empty and has no access methods yet',
+        'Workbench settings are a singleton row saved under revision CAS',
+        'Coaching attempts are indexed audits: reserved -> uncertain|settled, settled rows immutable, bodies re-validated on read, bounded cursor pages over a three-valued account scope, global count',
       ],
     };
   }
@@ -1021,6 +1039,118 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore {
   }
 
   // -------------------------------------------------------------------------------------
+  // Coaching attempts (CoachingStore)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * One attempt by id, or `null`.
+   *
+   * The stored canonical body is the record and is re-validated on read, so a hand-edited or
+   * otherwise malformed body is reported as `corrupt_row` instead of being cast to an attempt.
+   */
+  async getCoachingAttempt(id: string): Promise<CoachingAttempt | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM coaching_attempts WHERE id = ?', [
+        requireId('coaching attempt id', id),
+      ]);
+      return row === null ? null : this.readCoachingAttempt(row);
+    });
+  }
+
+  /** Insert a reservation or advance it; see {@link CoachingStore.saveCoachingAttempt}. */
+  async saveCoachingAttempt(attempt: CoachingAttempt): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => this.writeCoachingAttempt(attempt));
+  }
+
+  /**
+   * One page of attempts in deterministic `requestedAt, id` order.
+   *
+   * The cursor is opaque and bound to the effective filter set — including the three-valued
+   * account scope (`undefined` = all accounts, `null` = anonymous only): a cursor produced by
+   * another query is rejected (`reason: 'cursor_filter_mismatch'`) instead of silently paging a
+   * different history, and continuation is keyset-based, never `OFFSET`. Every returned body is
+   * re-validated like {@link getCoachingAttempt}.
+   */
+  async listCoachingAttempts(query: CoachingAttemptQuery): Promise<Page<CoachingAttempt>> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const limit = pageLimit(query.limit);
+      const filters = coachingFilters(query);
+      const fingerprint = coachingFingerprint(filters);
+      const cursor = query.cursor === null ? null : decodeCoachingCursor(query.cursor, fingerprint);
+      const clauses: string[] = [];
+      const params: SqlValue[] = [];
+      // Omitted means every account; an explicit `null` is the anonymous-only scope.
+      if (filters.accountId === null) {
+        clauses.push('account_id IS NULL');
+      } else if (filters.accountId !== undefined) {
+        clauses.push('account_id = ?');
+        params.push(filters.accountId);
+      }
+      if (filters.problemKey !== null) {
+        clauses.push('problem_key = ?');
+        params.push(filters.problemKey);
+      }
+      if (filters.since !== null) {
+        clauses.push('requested_at >= ?');
+        params.push(filters.since);
+      }
+      if (filters.status !== null) {
+        clauses.push('status = ?');
+        params.push(filters.status);
+      }
+      if (cursor !== null) {
+        // Keyset continuation on the stable order: later instants, then later ids at the same instant.
+        clauses.push('(requested_at > ? OR (requested_at = ? AND id > ?))');
+        params.push(cursor.requestedAt, cursor.requestedAt, cursor.id);
+      }
+      const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+      const rows = this.all(
+        `SELECT body FROM coaching_attempts${where} ORDER BY requested_at ASC, id ASC LIMIT ?`,
+        [...params, limit + 1],
+      );
+      const items = rows.slice(0, limit).map((row) => this.readCoachingAttempt(row));
+      const last = items.at(-1);
+      return {
+        items,
+        nextCursor:
+          rows.length > limit && last !== undefined
+            ? encodeCursor('coaching', JSON.stringify({ f: fingerprint, t: last.requestedAt, i: last.id }))
+            : null,
+        fetchedAt: this.clock(),
+      };
+    });
+  }
+
+  /**
+   * Count attempts for the global coaching quota.
+   *
+   * A single `COUNT(*)` resolves through the v3 indexes (status and `requestedAt`), so the
+   * total never loads attempt bodies and never becomes a per-account loophole: there is no
+   * account scope here on purpose.
+   */
+  async countCoachingAttempts(query: CoachingAttemptCountQuery): Promise<number> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const clauses: string[] = [];
+      const params: SqlValue[] = [];
+      if (query.since !== undefined && query.since !== null) {
+        clauses.push('requested_at >= ?');
+        params.push(assertIsoTimestamp('coaching since', query.since));
+      }
+      if (query.status !== undefined && query.status !== null) {
+        clauses.push('status = ?');
+        params.push(requireCoachingStatus(query.status));
+      }
+      const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+      const row = this.find(`SELECT COUNT(*) AS total FROM coaching_attempts${where}`, params);
+      return row === null ? 0 : intColumn(row, 'total');
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
   // Write helpers (always called inside a serialized write scope)
   // -------------------------------------------------------------------------------------
 
@@ -1456,9 +1586,77 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore {
     return next;
   }
 
+  /**
+   * Insert one reserved coaching attempt, or advance an existing one.
+   *
+   * A new attempt must be `reserved`: the reservation is what puts the call on the quota books
+   * before it is dispatched, so a finished call can never be recorded first (and a duplicate id
+   * cannot overwrite a charged attempt). An identical re-save is a no-op so recovery may replay
+   * a record. Identity columns are written once; later saves only move `status` and the body,
+   * and the application validator refuses a changed `expiresAt`, a rewritten settled row or a
+   * cleared/reassigned host correlation.
+   */
+  private writeCoachingAttempt(value: CoachingAttempt): void {
+    const attempt = validateCoachingAttempt(value);
+    const body = bodyOf(attempt, COACHING_ATTEMPT_FIELDS);
+    const existing = this.find('SELECT body FROM coaching_attempts WHERE id = ?', [attempt.id]);
+    if (existing === null) {
+      invariant(
+        attempt.status === 'reserved',
+        'invalid_transition',
+        `coaching attempt ${attempt.id} must be inserted as reserved before dispatch`,
+        { id: attempt.id, status: attempt.status },
+      );
+      this.write(
+        `INSERT INTO coaching_attempts (id, account_id, problem_key, snapshot_id, requested_at, expires_at, status, body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          attempt.id,
+          attempt.accountId,
+          attempt.problemKey,
+          attempt.snapshotId,
+          attempt.requestedAt,
+          attempt.expiresAt,
+          attempt.status,
+          body,
+        ],
+      );
+      return;
+    }
+    if (textColumn(existing, 'body') === body) {
+      return;
+    }
+    const stored = this.readCoachingAttempt(existing);
+    validateCoachingAttemptTransition(stored, attempt);
+    this.write('UPDATE coaching_attempts SET status = ?, body = ? WHERE id = ?', [
+      attempt.status,
+      body,
+      attempt.id,
+    ]);
+  }
+
   // -------------------------------------------------------------------------------------
   // Read helpers
   // -------------------------------------------------------------------------------------
+
+  /**
+   * Decode one coaching attempt from its stored canonical body.
+   *
+   * Coaching rows are the only entities re-validated on read: a body that parses as JSON but
+   * is not a well-formed attempt (hand-edited, or written by a buggy build) is reported as
+   * `corrupt_row` instead of being cast into the domain. Narrow by design — every other entity
+   * keeps its existing structural-only row decoding.
+   */
+  private readCoachingAttempt(row: Row): CoachingAttempt {
+    const parsed = parseBody<unknown>('coaching_attempts.body', textColumn(row, 'body'));
+    try {
+      return validateCoachingAttempt(parsed);
+    } catch (error) {
+      throw new StorageError('corrupt_row', 'stored coaching attempt is not a valid attempt', {
+        cause: String(error),
+      });
+    }
+  }
 
   private readJob(jobId: string): AnalysisJobState | null {
     const row = this.find('SELECT body FROM jobs WHERE job_id = ?', [jobId]);
@@ -1716,4 +1914,129 @@ function requireSyncResource(resource: SyncResource): SyncResource {
     { resource },
   );
   return resource;
+}
+
+// ---------------------------------------------------------------------------------------
+// Coaching query helpers
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Normalized coaching filter set.
+ *
+ * `accountId` stays three-valued on purpose: `undefined` = every account, `null` = anonymous
+ * attempts only, a string = that account. The other members use `null` as "no restriction".
+ */
+interface CoachingFilters {
+  readonly accountId: string | null | undefined;
+  readonly problemKey: string | null;
+  readonly since: string | null;
+  readonly status: CoachingStatus | null;
+}
+
+function coachingFilters(query: CoachingAttemptQuery): CoachingFilters {
+  return {
+    accountId: coachingAccountScope(query.accountId),
+    problemKey:
+      query.problemKey === undefined || query.problemKey === null ? null : requireProblemKey(query.problemKey),
+    since: query.since === undefined || query.since === null ? null : assertIsoTimestamp('coaching since', query.since),
+    status: query.status === undefined || query.status === null ? null : requireCoachingStatus(query.status),
+  };
+}
+
+/**
+ * Normalize the account scope without collapsing its three cases: an omitted member means
+ * "every account" and an explicit `null` means "anonymous only", while a string must be a
+ * non-empty account id. Collapsing the first two is exactly what would mix anonymous history
+ * into an account history.
+ */
+function coachingAccountScope(value: string | null | undefined): string | null | undefined {
+  return value === undefined || value === null ? value : requireId('account id', value);
+}
+
+function requireCoachingStatus(status: CoachingStatus): CoachingStatus {
+  invariant(
+    COACHING_STATUSES.includes(status),
+    'invalid_input',
+    `unknown coaching status ${String(status)}`,
+    { status },
+  );
+  return status;
+}
+
+/**
+ * Fingerprint binding a cursor to the filter set that produced it.
+ *
+ * The account scope is encoded as an explicit object so "every account" and "anonymous only"
+ * cannot hash alike (`undefined` members are simply dropped from canonical JSON).
+ */
+function coachingFingerprint(filters: CoachingFilters): string {
+  const accountId =
+    filters.accountId === undefined
+      ? { scope: 'all' }
+      : filters.accountId === null
+        ? { scope: 'anonymous' }
+        : { scope: 'account', id: filters.accountId };
+  return contentHashOf({
+    accountId,
+    problemKey: filters.problemKey,
+    since: filters.since,
+    status: filters.status,
+  }).slice(0, 32);
+}
+
+const COACHING_CURSOR_KEYS: readonly string[] = ['f', 't', 'i'];
+
+/**
+ * Decode a coaching cursor and refuse one produced under different filters.
+ *
+ * The payload is the filter fingerprint plus the last returned `(requestedAt, id)`. Both are
+ * checked before the keyset condition runs, so a tampered or re-used cursor cannot skip,
+ * duplicate or reorder rows.
+ */
+function decodeCoachingCursor(cursor: string, fingerprint: string): { requestedAt: string; id: string } {
+  const payload = decodeCursor('coaching', cursor);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch (cause) {
+    throw new DomainError('invalid_input', 'coaching cursor payload is not valid JSON', {
+      cursor,
+      cause: String(cause),
+    });
+  }
+  invariant(
+    parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed),
+    'invalid_input',
+    'coaching cursor payload must be an object',
+    { cursor },
+  );
+  const record = parsed as Record<string, unknown>;
+  const keys = Object.keys(record);
+  invariant(
+    keys.length === COACHING_CURSOR_KEYS.length && keys.every((key) => COACHING_CURSOR_KEYS.includes(key)),
+    'invalid_input',
+    'coaching cursor payload has an unexpected shape',
+    { cursor, keys },
+  );
+  const filterKey = record['f'];
+  const requestedAt = record['t'];
+  const id = record['i'];
+  invariant(
+    typeof filterKey === 'string' && typeof requestedAt === 'string' && typeof id === 'string' && id.length > 0,
+    'invalid_input',
+    'coaching cursor payload fields must be strings',
+    { cursor },
+  );
+  invariant(
+    filterKey === fingerprint,
+    'invalid_input',
+    'coaching cursor belongs to a different filter set; re-read the first page',
+    { cursor, reason: 'cursor_filter_mismatch' },
+  );
+  const instant = Date.parse(requestedAt);
+  invariant(Number.isFinite(instant), 'invalid_input', 'coaching cursor timestamp is not parseable', {
+    cursor,
+    reason: 'cursor_time',
+  });
+  return { requestedAt: new Date(instant).toISOString(), id };
 }
