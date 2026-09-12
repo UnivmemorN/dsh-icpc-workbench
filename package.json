@@ -34,7 +34,12 @@
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "licenses",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "docs/manual-import.md",
+    "docs/reports/stage-05-acceptance.md",
+    "docs/architecture.md",
+    "docs/handoffs/v1.md",
+    "benchmarks/*.json"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

@@ -1,0 +1,450 @@
+{
+  "schemaVersion": 1,
+  "taxonomyVersion": "2026.09.2",
+  "reviewer": "Codex coordinator (not an independent human expert panel)",
+  "evaluatedProblems": 30,
+  "accessCohortProblems": 37,
+  "autoAdoptedPairs": 51,
+  "exactReferenceHits": 39,
+  "referencePairs": 62,
+  "exactReferencePrecision": 0.7647058823529411,
+  "exactReferenceRecall": 0.6290322580645161,
+  "adjudicatedPrecision": 0.9215686274509803,
+  "adoptionCoverage": 0.9,
+  "needsReviewPairs": 0,
+  "duplicateAdoptions": 0,
+  "pendingAdjudications": 0,
+  "redundantAdoptions": 2,
+  "gatePassed": true,
+  "methodology": "Use the complete 37-case access cohort; score the 30 cases with usable real editorials. Expected methods/notes are evaluation-only and must never be supplied to the model. Not random: some contests overlap. Report access, adoption, needs-review, exact reference recall and adjudicated semantic precision separately. Count unique problem/tag pairs; duplicates never improve scores. Reference recall uses the union of all preregistered valid methods, including alternatives that may not appear in a particular fetched editorial, and is therefore not a claim of complete editorial-method recall. Additional legitimate tags require recorded coordinator evidence-based adjudication; preserve exact-reference and adjudicated metrics side by side. Generic/redundant ancestor suggestions are reported separately. Empty adoption cannot pass the >=90% precision gate.",
+  "cases": [
+    {
+      "key": "580C",
+      "status": "completed",
+      "autoAdopted": [
+        "graph.tree",
+        "search.traversal"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "455A",
+      "status": "completed",
+      "autoAdopted": [
+        "dp"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "279B",
+      "status": "completed",
+      "autoAdopted": [
+        "search.sliding-window"
+      ],
+      "missedReference": [
+        "search.two-pointers",
+        "data-structure.prefix-sum",
+        "search.binary"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "466C",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.prefix-sum"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "706B",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.prefix-sum"
+      ],
+      "missedReference": [
+        "search.binary",
+        "implementation.sorting"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "520B",
+      "status": "completed",
+      "autoAdopted": [
+        "graph.shortest-path",
+        "greedy.exchange-argument",
+        "search.traversal"
+      ],
+      "missedReference": [
+        "greedy"
+      ],
+      "extraTags": [
+        {
+          "taxonomyId": "graph.shortest-path",
+          "verdict": "valid",
+          "basis": "The editorial models each integer as a vertex and uses BFS to minimize operation count."
+        },
+        {
+          "taxonomyId": "greedy.exchange-argument",
+          "verdict": "valid",
+          "basis": "The alternative proof exchanges increments with a division to reduce the number of operations."
+        }
+      ]
+    },
+    {
+      "key": "189A",
+      "status": "completed",
+      "autoAdopted": [
+        "dp.knapsack",
+        "implementation.brute-force"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "363B",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.prefix-sum",
+        "search.sliding-window"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "510C",
+      "status": "failed",
+      "autoAdopted": [],
+      "missedReference": [
+        "graph.topological-sort"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "295B",
+      "status": "completed",
+      "autoAdopted": [
+        "graph.shortest-path",
+        "offline"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "547B",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.monotonic-stack",
+        "data-structure.prefix-sum"
+      ],
+      "missedReference": [],
+      "extraTags": [
+        {
+          "taxonomyId": "data-structure.prefix-sum",
+          "verdict": "valid",
+          "basis": "The frozen taxonomy description includes cumulative aggregates; this editorial uses a cumulative maximum. This is broader than the displayed name Prefix sums; counted incorrect in the strict-name sensitivity score."
+        }
+      ]
+    },
+    {
+      "key": "380C",
+      "status": "failed",
+      "autoAdopted": [],
+      "missedReference": [
+        "data-structure.segment-tree"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "459D",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.bit",
+        "tricks.discretization"
+      ],
+      "missedReference": [
+        "data-structure.segment-tree"
+      ],
+      "extraTags": [
+        {
+          "taxonomyId": "tricks.discretization",
+          "verdict": "valid",
+          "basis": "The editorial explicitly maps input values to dense indices before frequency processing."
+        }
+      ]
+    },
+    {
+      "key": "242E",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.segment-tree",
+        "data-structure.segment-tree-lazy",
+        "tricks.bitwise"
+      ],
+      "missedReference": [],
+      "extraTags": [
+        {
+          "taxonomyId": "data-structure.segment-tree",
+          "verdict": "redundant",
+          "basis": "Although preregistered, this parent is redundant with the adopted lazy segment-tree child for the same per-bit implementation. Exact reference hits and semantic correctness are reported separately."
+        }
+      ]
+    },
+    {
+      "key": "86D",
+      "status": "completed",
+      "autoAdopted": [
+        "offline.mo"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "617E",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.prefix-sum",
+        "data-structure.sqrt-decomposition",
+        "offline.mo",
+        "tricks.bitwise"
+      ],
+      "missedReference": [],
+      "extraTags": [
+        {
+          "taxonomyId": "data-structure.prefix-sum",
+          "verdict": "valid",
+          "basis": "The frozen description includes cumulative aggregates; the editorial uses prefix XOR. This is broader than the displayed name Prefix sums; counted incorrect in the strict-name sensitivity score."
+        },
+        {
+          "taxonomyId": "data-structure.sqrt-decomposition",
+          "verdict": "valid",
+          "basis": "The editorial explicitly describes block decomposition for offline Mo ordering. In the frozen tree this is a cross-category technique, not an ancestor of offline.mo."
+        }
+      ]
+    },
+    {
+      "key": "600E",
+      "status": "completed",
+      "autoAdopted": [
+        "tricks.small-to-large"
+      ],
+      "missedReference": [
+        "graph.tree"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "438D",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.segment-tree"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "126B",
+      "status": "completed",
+      "autoAdopted": [
+        "search.binary",
+        "strings.hashing",
+        "strings.kmp",
+        "strings.z-algorithm"
+      ],
+      "missedReference": [],
+      "extraTags": [
+        {
+          "taxonomyId": "search.binary",
+          "verdict": "valid",
+          "basis": "An editorial alternative searches an ordered sequence of candidate border lengths with a monotone predicate."
+        },
+        {
+          "taxonomyId": "strings.hashing",
+          "verdict": "valid",
+          "basis": "The editorial includes a rolling-hash alternative for substring equality."
+        }
+      ]
+    },
+    {
+      "key": "432D",
+      "status": "completed",
+      "autoAdopted": [
+        "graph.tree",
+        "strings.kmp"
+      ],
+      "missedReference": [
+        "strings.z-algorithm"
+      ],
+      "extraTags": [
+        {
+          "taxonomyId": "graph.tree",
+          "verdict": "valid",
+          "basis": "The editorial constructs a prefix-function failure tree and aggregates counts in subtrees."
+        }
+      ]
+    },
+    {
+      "key": "271D",
+      "status": "completed",
+      "autoAdopted": [
+        "strings.hashing",
+        "strings.trie"
+      ],
+      "missedReference": [
+        "implementation.brute-force"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "427C",
+      "status": "completed",
+      "autoAdopted": [
+        "graph.scc"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    },
+    {
+      "key": "609E",
+      "status": "completed",
+      "autoAdopted": [
+        "graph.lca",
+        "graph.minimum-spanning-tree"
+      ],
+      "missedReference": [
+        "data-structure.dsu",
+        "graph.tree",
+        "implementation.sorting"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "580A",
+      "status": "completed",
+      "autoAdopted": [
+        "search.sliding-window"
+      ],
+      "missedReference": [
+        "implementation.simulation",
+        "dp"
+      ],
+      "extraTags": [
+        {
+          "taxonomyId": "search.sliding-window",
+          "verdict": "invalid",
+          "basis": "The editorial maintains a consecutive-run counter with reset. Calling this a sliding window overstates the method; a matching quote does not prove the tag."
+        }
+      ]
+    },
+    {
+      "key": "580B",
+      "status": "completed",
+      "autoAdopted": [
+        "implementation.sorting",
+        "search.two-pointers"
+      ],
+      "missedReference": [
+        "search.sliding-window",
+        "search.binary",
+        "data-structure.prefix-sum"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "580D",
+      "status": "failed",
+      "autoAdopted": [],
+      "missedReference": [
+        "dp.bitmask"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "580E",
+      "status": "completed",
+      "autoAdopted": [
+        "data-structure.segment-tree",
+        "data-structure.segment-tree-lazy",
+        "strings.hashing"
+      ],
+      "missedReference": [],
+      "extraTags": [
+        {
+          "taxonomyId": "data-structure.segment-tree",
+          "verdict": "redundant",
+          "basis": "The same solution already adopts its lazy segment-tree child. The redundant parent remains in the precision denominator and gets no correctness credit."
+        }
+      ]
+    },
+    {
+      "key": "456A",
+      "status": "completed",
+      "autoAdopted": [
+        "implementation.ad-hoc"
+      ],
+      "missedReference": [
+        "implementation.sorting"
+      ],
+      "extraTags": []
+    },
+    {
+      "key": "456B",
+      "status": "completed",
+      "autoAdopted": [
+        "math.number-theory.modular-exponentiation",
+        "math.number-theory.modular-inverse"
+      ],
+      "missedReference": [
+        "math.number-theory"
+      ],
+      "extraTags": [
+        {
+          "taxonomyId": "math.number-theory.modular-inverse",
+          "verdict": "invalid",
+          "basis": "The editorial uses Fermat periodicity, not division or a modular inverse. A misleading taxonomy alias explains the error but does not make the displayed tag correct."
+        }
+      ]
+    },
+    {
+      "key": "706A",
+      "status": "completed",
+      "autoAdopted": [
+        "geometry",
+        "implementation.brute-force"
+      ],
+      "missedReference": [],
+      "extraTags": []
+    }
+  ],
+  "strictDisplayedNamePrecision": 0.8823529411764706,
+  "limitations": [
+    "Coordinator adjudication, not an independent human expert panel.",
+    "Small nonrandom 30-case cohort with shared contests; not an estimate for all ICPC problems.",
+    "Frozen taxonomy 2026.09.2 has two broad prefix-aggregate mappings; a strict displayed-name score is lower.",
+    "Three structured-output failures remain and count against coverage.",
+    "Six early successes used analysis-v1; the remaining evaluated jobs used analysis-v2 after live schema failures."
+  ],
+  "failures": [
+    {
+      "key": "510C",
+      "attempts": 2,
+      "errorCode": "invalid_output"
+    },
+    {
+      "key": "380C",
+      "attempts": 2,
+      "errorCode": "invalid_output"
+    },
+    {
+      "key": "580D",
+      "attempts": 2,
+      "errorCode": "invalid_output"
+    }
+  ],
+  "evaluatedAt": "2026-09-12T16:06:41.757Z",
+  "codeCommit": "152d8ea"
+}

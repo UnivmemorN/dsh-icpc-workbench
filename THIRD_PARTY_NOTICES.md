@@ -8,7 +8,7 @@
 
 ## npm dependencies
 
-The exact dependency tree is recorded in package-lock.json. Installed dependencies retain their own package licenses and notices. Host and React dependencies are shared with dsh; their implementation is not vendored into this repository. The release build must preserve notices for any dependency code it bundles.
+The exact dependency tree is recorded in package-lock.json. Installed dependencies retain their own package licenses and notices. Host and React dependencies are shared with dsh; their implementation is not vendored into this repository. The browser factory bundles pure @noble/hashes code; its full MIT notice is retained in the factory header and [licenses/noble-hashes-MIT.txt](licenses/noble-hashes-MIT.txt). Other dependencies remain external.
 
 | Package | Version | Declared license |
 | --- | --- | --- |
@@ -20,6 +20,7 @@ The exact dependency tree is recorded in package-lock.json. Installed dependenci
 | @deepseek-ai/cordis | 4.0.2 | MIT |
 | @deepseek-ai/dsh-llm | 0.1.5-rc.2 | MIT |
 | @deepseek-ai/dsh-session | 0.1.5-rc.2 | MIT |
+| @deepseek-ai/dsh-session-persistence | 0.1.5-rc.2 | MIT |
 | @deepseek-ai/dsh-client-connection | 0.1.5-rc.2 | MIT |
 | @deepseek-ai/dsh-client-ui-slots | 0.1.5-rc.2 | MIT |
 | @deepseek-ai/dsh-client-ui-layout | 0.1.5-rc.2 | MIT |

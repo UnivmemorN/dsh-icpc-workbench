@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件。独立工作区、独立 SQLite 数据库；基于题解证据补全标签，保留原始标签、人工决定和分析版本。
 
-当前已实现领域规则、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱点统计、规则训练计划及 Cordis 宿主/API。浏览器工作台和真实模型评测仍在施工；尚未发布正式版本。
+**0.1.0 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与规则训练计划。已完成隔离宿主和浏览器流程验收；模型效果及已知限制见 [验收报告](docs/reports/stage-05-acceptance.md)。
 
 ## 构建和隔离安装
 
@@ -13,8 +13,8 @@ npm ci
 npm run check
 npm pack
 # 首次创建隔离的 Web 配置，保持日常配置独立
- dsh --profile icpc-acceptance --from-default-profile web --help
- dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.0.tgz
+dsh --profile icpc-acceptance --from-default-profile web --help
+dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.0.tgz
 ```
 
 插件不需要位于 harness 源码树中，构建也不依赖相邻的 harness checkout。默认数据目录为系统应用数据目录中的 `dsh-icpc-workbench`。如需自定义，在宿主的配置覆盖文件中设置绝对路径：
@@ -24,6 +24,14 @@ npm pack
   config:
     dataDir: 'D:/ICPC-Training'
 ```
+
+将上面的 YAML 保存为 `icpc.patch.yml` 后启动：
+
+```powershell
+dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
+```
+
+在 dsh 侧栏点击 **ICPC 训练** 进入工作台，点击 **返回对话** 退出。依次在题库导入材料、选择题目并准备分析；核对调用上限后再启动。个人训练记录可按 [JSON/CSV 格式](docs/manual-import.md) 导入。
 
 数据目录不能位于 dsh 安装目录或 dsh home 内。数据库升级前会备份；卸载插件保留训练数据。备份 API 只写插件自己的 `backups` 目录，返回本地路径。模型审计会话由 dsh 保存，训练数据由插件保存。
 
@@ -44,7 +52,9 @@ npm pack
 - 手工 JSON/CSV 导入与题面/题解补充：预览后按内容哈希应用，失败不会被当作“没有题解”。
 - HydroOJ 校内 OJ 与学生记录导入为未来计划，当前尚未实现。
 
-本地测试与真实平台、模型准确率及浏览器验收分开记录；通过单元测试不代表通过模型效果评测。开发架构见 [architecture](docs/architecture.md)，交付标准见 [v1 contract](docs/handoffs/v1.md)。
+30 道真实 CF 题解评测：27 道产生可采纳结果；按冻结标签定义复核的精确率 92.2%，参考方法召回率 62.9%。若严格按显示名称解释两处“前缀和”映射，精确率为 88.2%；因此当前按实验版提供，仍需人工检查关键标签。详见报告中的逐项裁定、冗余扣分和失败记录。P1001 三层提示及完整讲解已实测；两份原始生成 C++17 代码各通过 107 组本地用例，没有代用户提交 OJ。
+
+本地测试与真实平台、模型效果及浏览器验收分别记录；模型复核不是独立专家审核。开发架构见 [architecture](docs/architecture.md)，交付标准见 [v1 contract](docs/handoffs/v1.md)。
 
 ## 许可证与引用
 

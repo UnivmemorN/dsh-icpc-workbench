@@ -1,0 +1,80 @@
+[
+  {
+    "key": "520B",
+    "taxonomyId": "graph.shortest-path",
+    "verdict": "valid",
+    "basis": "The editorial models each integer as a vertex and uses BFS to minimize operation count."
+  },
+  {
+    "key": "520B",
+    "taxonomyId": "greedy.exchange-argument",
+    "verdict": "valid",
+    "basis": "The alternative proof exchanges increments with a division to reduce the number of operations."
+  },
+  {
+    "key": "547B",
+    "taxonomyId": "data-structure.prefix-sum",
+    "verdict": "valid",
+    "basis": "The frozen taxonomy description includes cumulative aggregates; this editorial uses a cumulative maximum. This is broader than the displayed name Prefix sums; counted incorrect in the strict-name sensitivity score."
+  },
+  {
+    "key": "459D",
+    "taxonomyId": "tricks.discretization",
+    "verdict": "valid",
+    "basis": "The editorial explicitly maps input values to dense indices before frequency processing."
+  },
+  {
+    "key": "617E",
+    "taxonomyId": "data-structure.prefix-sum",
+    "verdict": "valid",
+    "basis": "The frozen description includes cumulative aggregates; the editorial uses prefix XOR. This is broader than the displayed name Prefix sums; counted incorrect in the strict-name sensitivity score."
+  },
+  {
+    "key": "617E",
+    "taxonomyId": "data-structure.sqrt-decomposition",
+    "verdict": "valid",
+    "basis": "The editorial explicitly describes block decomposition for offline Mo ordering. In the frozen tree this is a cross-category technique, not an ancestor of offline.mo."
+  },
+  {
+    "key": "126B",
+    "taxonomyId": "search.binary",
+    "verdict": "valid",
+    "basis": "An editorial alternative searches an ordered sequence of candidate border lengths with a monotone predicate."
+  },
+  {
+    "key": "126B",
+    "taxonomyId": "strings.hashing",
+    "verdict": "valid",
+    "basis": "The editorial includes a rolling-hash alternative for substring equality."
+  },
+  {
+    "key": "432D",
+    "taxonomyId": "graph.tree",
+    "verdict": "valid",
+    "basis": "The editorial constructs a prefix-function failure tree and aggregates counts in subtrees."
+  },
+  {
+    "key": "580A",
+    "taxonomyId": "search.sliding-window",
+    "verdict": "invalid",
+    "basis": "The editorial maintains a consecutive-run counter with reset. Calling this a sliding window overstates the method; a matching quote does not prove the tag."
+  },
+  {
+    "key": "580E",
+    "taxonomyId": "data-structure.segment-tree",
+    "verdict": "redundant",
+    "basis": "The same solution already adopts its lazy segment-tree child. The redundant parent remains in the precision denominator and gets no correctness credit."
+  },
+  {
+    "key": "242E",
+    "taxonomyId": "data-structure.segment-tree",
+    "verdict": "redundant",
+    "basis": "Although preregistered, this parent is redundant with the adopted lazy segment-tree child for the same per-bit implementation. Exact reference hits and semantic correctness are reported separately."
+  },
+  {
+    "key": "456B",
+    "taxonomyId": "math.number-theory.modular-inverse",
+    "verdict": "invalid",
+    "basis": "The editorial uses Fermat periodicity, not division or a modular inverse. A misleading taxonomy alias explains the error but does not make the displayed tag correct."
+  }
+]

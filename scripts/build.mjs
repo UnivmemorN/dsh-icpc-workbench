@@ -1,7 +1,7 @@
 /** Build declarations and ESM using the installed TypeScript API, without a sibling dsh checkout. */
 import ts from 'typescript';
 import {resolve,relative,sep} from 'node:path';
-import {mkdirSync,rmSync,realpathSync,existsSync} from 'node:fs';
+import {mkdirSync,rmSync,realpathSync,existsSync,readFileSync} from 'node:fs';
 const root=realpathSync(resolve(import.meta.dirname,'..'));
 const out=resolve(root,'dist');
 const rel=relative(root,out);
@@ -34,7 +34,7 @@ if (!diagnostics.length) {
     const {output}=await bundle.generate({format:'cjs',exports:'named'});
     const code=output.find(item=>item.type==='chunk')?.code;
     if(!code)throw Error('Client bundle missing');
-    writeFileSync(resolve(out,'client.js'),`/* dsh-icpc-workbench — MIT */\nwindow.__ModuleLoader__.load({id:'dsh-icpc-workbench',factory:(require)=>{const module={exports:{}};const exports=module.exports;\n${code}\nreturn module.exports;}});\n`);
+    writeFileSync(resolve(out,'client.js'),`/* dsh-icpc-workbench — MIT\n * Includes @noble/hashes (MIT):\n${readFileSync(resolve(root,'licenses/noble-hashes-MIT.txt'),'utf8')}\n */\nwindow.__ModuleLoader__.load({id:'dsh-icpc-workbench',factory:(require)=>{const module={exports:{}};const exports=module.exports;\n${code}\nreturn module.exports;}});\n`);
     console.log('Built classic dsh browser factory with shared React.');
   } finally {await bundle.close();}
 }
