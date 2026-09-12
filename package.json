@@ -31,7 +31,7 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --experimental-strip-types --import ./tests/loader.mjs --test --test-isolation=none \"tests/**/*.test.ts\"",
+    "test": "node --experimental-strip-types --import ./tests/loader.mjs --test --experimental-test-isolation=none \"tests/**/*.test.ts\"",
     "build": "node scripts/build.mjs",
     "check:architecture": "node scripts/check-architecture.mjs",
     "check": "npm run typecheck && npm run check:architecture && npm run test && node --test scripts/usage.test.mjs && npm run build"
