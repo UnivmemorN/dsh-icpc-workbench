@@ -20,11 +20,11 @@ for(const run of ledger.runs){
     const u=e.data.usage??(e.data.stream?lastAssistantStreamChunk(e.data.stream,'usage')?.usage:undefined);
     const p=priceUsage(u);run.settlements++;
     if(e.type==='compaction/summary')run.compactions++;
-    if(!p){run.missingUsage++;run.conservativeCny+=2.36;continue;}
+    if(!p){run.missingUsage++;run.conservativeCny+=(run.missingUsageReserveCny??2.36);continue;}
     for(const k of ['inputTokens','outputTokens','cacheReadTokens','conservativeCny'])run[k]+=p[k];
   }
   run.unsettledRequests=Math.max(0,run.requests-run.settlements+run.compactions);
-  run.conservativeCny+=run.unsettledRequests*2.36;
+  run.conservativeCny+=run.unsettledRequests*(run.missingUsageReserveCny??2.36);
   run.accountingVersion=2;
 }
 ledger.conservativeCny=ledger.runs.reduce((s,r)=>s+r.conservativeCny,0);
