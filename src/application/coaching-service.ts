@@ -134,7 +134,8 @@ export type CoachingRefusalCode =
   | 'full_solution_not_requested'
   | 'level_not_earned'
   | 'coaching_quota_exhausted'
-  | 'concurrent_call_active';
+  | 'concurrent_call_active'
+  | 'settings_changed';
 
 /** Stable code of one coaching failure: provider vocabulary plus service refusals and staleness. */
 export type CoachingErrorCode = ModelErrorCode | CoachingRefusalCode | 'stale_snapshot';
@@ -156,6 +157,17 @@ export interface CoachingAskRequest {
   readonly level: CoachingLevel;
   /** Only `true` is accepted for `level: 'full'`; hint levels must not set it. */
   readonly explicitFullSolution?: boolean;
+  /**
+   * Settings revision the caller read, compared with the stored record only when this ask would
+   * write a **new** reservation (see {@link CoachingService.ask}).
+   *
+   * A request id that already has a durable attempt is replayed for free, so an idempotent answer
+   * stays readable after the configuration changed. When this member is supplied the stored record
+   * must exist and carry exactly this revision — a missing record has no revision the caller could
+   * have read, so it is refused as `settings_changed` too. An omitted member keeps the legacy
+   * behaviour for direct callers that never stored settings.
+   */
+  readonly expectedSettingsRevision?: number;
 }
 
 /** A successful coaching answer. `text` is Markdown/plain text, never interpreted as HTML. */
@@ -307,6 +319,8 @@ interface ParsedAsk {
   readonly problemKey: string;
   readonly level: CoachingLevel;
   readonly explicitFullSolution: boolean;
+  /** `null` when the caller supplied no revision, so no new reservation is guarded. */
+  readonly expectedSettingsRevision: number | null;
 }
 
 type ReserveOutcome =
@@ -615,6 +629,7 @@ export class CoachingService {
       problemKey: key,
       level: attempt.level,
       explicitFullSolution: attempt.level === 'full',
+      expectedSettingsRevision: null,
     });
     const head = await this.store.getCurrentSnapshotHead(parseProblemKey(attempt.problemKey));
     token.throwIfCancelled();
@@ -651,6 +666,38 @@ export class CoachingService {
       if (existing !== null) {
         return { kind: 'existing', attempt: existing };
       }
+      // Narrow settings guard: a *new* reservation is written under the revision the caller read, so
+      // a preview that went stale cannot silently spend a call against settings the user no longer
+      // sees. It sits after the dedup branch on purpose — replaying a durable request id stays free
+      // after a configuration change — and compares against the record read inside this transaction.
+      // A supplied revision needs a stored record: with no record there is no revision the caller
+      // could have read, so the ask is refused instead of silently falling back to defaults.
+      const settingsRecord = await this.store.getWorkbenchSettings();
+      token.throwIfCancelled();
+      if (ask.expectedSettingsRevision !== null) {
+        if (settingsRecord === null) {
+          return {
+            kind: 'refused',
+            error: {
+              code: 'settings_changed',
+              message: `no workbench settings are stored, so expected revision ${ask.expectedSettingsRevision} cannot be current; save the settings and reload them`,
+              retryable: true,
+            },
+          };
+        }
+        if (settingsRecord.revision !== ask.expectedSettingsRevision) {
+          return {
+            kind: 'refused',
+            error: {
+              code: 'settings_changed',
+              message: `workbench settings are at revision ${settingsRecord.revision}, not ${ask.expectedSettingsRevision}; reload the settings and retry`,
+              retryable: true,
+            },
+          };
+        }
+      }
+      const settings = settingsRecord?.value ?? defaultWorkbenchSettings();
+      token.throwIfCancelled();
       const head = await this.store.getCurrentSnapshotHead(snapshot.problem.ref);
       token.throwIfCancelled();
       if (head === null || head.snapshotId !== snapshot.snapshotId) {
@@ -663,8 +710,6 @@ export class CoachingService {
           },
         };
       }
-      const settings = await this.readSettings();
-      token.throwIfCancelled();
       const blocking = active[0];
       if (blocking !== undefined && active.length >= settings.coaching.maxConcurrent) {
         return {
@@ -1184,11 +1229,6 @@ export class CoachingService {
   private isExpired(attempt: CoachingAttempt): boolean {
     return Date.parse(attempt.expiresAt) <= Date.parse(this.now());
   }
-
-  private async readSettings(): Promise<WorkbenchSettings> {
-    const record = await this.store.getWorkbenchSettings();
-    return record?.value ?? defaultWorkbenchSettings();
-  }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1211,9 +1251,25 @@ const GENERATION_CANCELLED_MESSAGE =
 const GENERATION_THREW_MESSAGE =
   'coaching generation failed before it reported an outcome; the provider outcome is unknown and the call still counts';
 
+/** Closed key set of one plain ask request; an undeclared member is refused, never ignored. */
+const ASK_REQUEST_KEYS: readonly string[] = [
+  'requestId',
+  'accountId',
+  'problemKey',
+  'level',
+  'explicitFullSolution',
+  'expectedSettingsRevision',
+];
+
 function parseAskRequest(request: CoachingAskRequest): ParsedAsk {
   if (request === null || typeof request !== 'object') {
     throw new CoachingServiceError('invalid_request', 'ask needs a request object', {});
+  }
+  const unknownKeys = Object.keys(request).filter((key) => !ASK_REQUEST_KEYS.includes(key));
+  if (unknownKeys.length > 0) {
+    throw new CoachingServiceError('invalid_request', `ask has unknown keys: ${unknownKeys.join(', ')}`, {
+      unknownKeys,
+    });
   }
   const requestId = requireRequestId(request.requestId);
   const accountId = requireAccountScope(request.accountId);
@@ -1232,7 +1288,35 @@ function parseAskRequest(request: CoachingAskRequest): ParsedAsk {
       { level },
     );
   }
-  return { requestId, accountId, problemKey, level, explicitFullSolution };
+  return {
+    requestId,
+    accountId,
+    problemKey,
+    level,
+    explicitFullSolution,
+    expectedSettingsRevision: optionalSettingsRevision(request.expectedSettingsRevision),
+  };
+}
+
+/**
+ * Optional expected settings revision of one ask.
+ *
+ * `undefined` keeps the legacy behaviour for direct callers that never stored settings; a supplied
+ * value must be a positive integer, so a malformed guard is refused instead of silently becoming
+ * "no guard at all".
+ */
+function optionalSettingsRevision(value: unknown): number | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new CoachingServiceError(
+      'invalid_request',
+      'expectedSettingsRevision must be a positive integer when present',
+      { expectedSettingsRevision: value },
+    );
+  }
+  return value;
 }
 
 function requireRequestId(value: unknown): string {

@@ -54,7 +54,7 @@ try {
     if(e.type==='step/start'||e.type==='llm/retry-started') {
       report.requests++; flush();
       console.log(JSON.stringify({event:'request',count:report.requests}));
-      if(report.requests>(task.maxRequests??40)) stop('request-limit');
+      if(report.requests>=(task.maxRequests??40)) stop('request-limit');
     }
     if(e.type==='assistant/message'||e.type==='assistant/attempt'||(e.type==='compaction/summary'&&e.data.llmStreamCall)) {
       const u=e.data.usage??(e.data.stream?lastAssistantStreamChunk(e.data.stream,'usage')?.usage:undefined);
