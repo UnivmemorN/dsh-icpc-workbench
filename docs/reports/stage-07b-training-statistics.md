@@ -1,0 +1,9 @@
+# Stage 07b: training statistics and weakness coverage
+
+Accounts with many submissions but few reviewed tags previously received an effectively empty weakness page. The formal five-problem evidence threshold is preserved; a separate, explicitly unverified platform-tag reference makes available records useful immediately.
+
+`weakness` now returns additive `solvedDistribution` and `platformTagStats` fields from the same bounded evidence read. The service performs one additional source lookup to select the expected raw dimension. The domain aggregates each accepted key once, visits each solved problem's ratings once for bucket accumulation, deduplicates raw labels, and retains unknowns. It never promotes raw labels to effective tags or training-plan evidence. The wire response has aggregate counts, not a per-problem spoiler mapping.
+
+Today and Weakness share an accessible table with proportional horizontal bars, original-dimension selection and unknown counts. A known series is preferred when the default has no numeric values; explicit choices always win. The weakness view switch and primary overview precede the long chart, while exact coverage and material/review guidance are in a native disclosure. Existing reviewed ranking and retrospective evidence remain available. All statistics reads and navigation are free of automatic model dispatch.
+
+Focused domain, service, API and histogram tests cover deduplication, AC followed by WA, metadata gaps, invalid numeric values, multi-dimension first-occurrence rules, label overlap, deterministic ties, sparse reviewed evidence, unchanged formal report/plan behavior, identity guards and read discipline. The worker's final check passed574behavior+9script tests. The coordinator repeated final checks and tested the installed browser; see [0.1.2 acceptance](stage-07-acceptance.md). Platform labels remain unverified and missing metadata remains unknown.

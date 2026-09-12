@@ -31,6 +31,7 @@ import {
   assertIsoTimestamp,
   assertKnownTag,
   checkOffTask as checkOffTrainingTask,
+  computeTrainingStatistics,
   computeWeaknessReports,
   contentHashOf,
   createManualTagDecision,
@@ -39,6 +40,7 @@ import {
   createTrainingCandidate,
   decisionIsEffective,
   editPlanTask as editTrainingTask,
+  expectedRatingDimension,
   generateRulePlan,
   invariant,
   isAccepted,
@@ -75,7 +77,16 @@ import {
   type TrainingTaskKind,
 } from '../domain/index.js';
 import { currentDecisionPerTag } from '../domain/tags.js';
-import { BROWSE_PAGE_LIMITS, PROBLEM_SOLVED_FILTERS, type ProblemSolvedFilter, type TrainingStore } from './ports.js';
+import {
+  BROWSE_PAGE_LIMITS,
+  MAX_RATING_DIMENSION_CHARS,
+  PROBLEM_SOLVED_FILTERS,
+  PROBLEM_SORTS,
+  RATING_SORTS,
+  type ProblemSolvedFilter,
+  type ProblemSort,
+  type TrainingStore,
+} from './ports.js';
 import { STORAGE_PAGE_LIMITS } from './storage-types.js';
 import type {
   WorkbenchAnalysisView,
@@ -91,6 +102,7 @@ import type {
   WorkbenchPlanTaskPatch,
   WorkbenchPlanTaskView,
   WorkbenchPlanView,
+  WorkbenchPlatformTagStatsView,
   WorkbenchProblemBrowsePage,
   WorkbenchProblemDetail,
   WorkbenchProblemPage,
@@ -101,6 +113,7 @@ import type {
   WorkbenchRetrospectiveView,
   WorkbenchSnapshotView,
   WorkbenchSolutionView,
+  WorkbenchSolvedDistributionView,
   WorkbenchSuggestionView,
   WorkbenchTagDecisionView,
   WorkbenchTagReviewResult,
@@ -197,6 +210,13 @@ export interface WorkbenchListRequest {
  * `status` and `onlyAttempted` are solved filters relative to `accountId` and are refused without
  * one; `page` is the 1-based page number that replaces the cursor contract of
  * {@link WorkbenchListRequest} for this operation.
+ *
+ * `sort` defaults to the legacy canonical-key ascending order, so an existing caller that omits it
+ * (or sends `null`) keeps exactly the order it had. A difficulty sort additionally requires
+ * `sourceInstanceId` and a non-empty `ratingDimension`: comparing ratings of two source instances,
+ * or two platforms' dimensions, would invent a scale the platforms never agreed on. Changing the
+ * sort is the caller's business — the service simply orders the whole filtered set before paging,
+ * so `page: 1` is what a UI sends after the user picks a different order.
  */
 export interface WorkbenchBrowseRequest {
   readonly sourceInstanceId?: string | null;
@@ -210,6 +230,10 @@ export interface WorkbenchBrowseRequest {
   readonly reveal?: boolean;
   /** Keep only problems with an unresolved item at the current snapshot head. */
   readonly needsReviewOnly?: boolean;
+  /** Ordering of the whole filtered set; omitted/`null` is the legacy canonical-key ascending order. */
+  readonly sort?: ProblemSort | null;
+  /** Raw rating dimension of a difficulty sort; required exactly for the difficulty sorts. */
+  readonly ratingDimension?: string | null;
   /** 1-based page number. */
   readonly page: number;
   /** Page size within `1..MAX_BROWSE_PAGE_SIZE`. */
@@ -308,7 +332,7 @@ interface ListFilters {
   readonly cursor: string | null;
 }
 
-/** Normalized numbered-page filter set; `status` is always resolved to a concrete filter. */
+/** Normalized numbered-page filter set; `status` and `sort` are always resolved to concrete values. */
 interface BrowseFilters {
   readonly sourceInstanceId: string | null;
   readonly accountId: string | null;
@@ -317,6 +341,9 @@ interface BrowseFilters {
   readonly query: string | null;
   readonly needsReviewOnly: boolean;
   readonly reveal: boolean;
+  readonly sort: ProblemSort;
+  /** Bound raw rating dimension of a difficulty sort; `null` for every other sort. */
+  readonly ratingDimension: string | null;
   readonly page: number;
   readonly limit: number;
 }
@@ -476,6 +503,8 @@ export class WorkbenchService {
         onlyAttempted: filters.onlyAttempted,
         query: filters.query,
         needsReviewOnly: filters.needsReviewOnly,
+        sort: filters.sort,
+        ratingDimension: filters.ratingDimension,
         page: filters.page,
         limit: filters.limit,
       });
@@ -808,6 +837,11 @@ export class WorkbenchService {
    * overflow is a typed refusal — statistics computed from a silently truncated history would
    * describe a different sample. Raw platform tags come back separately as unverified provenance;
    * they never enter the report. Accounts are never mixed: only the selected account's rows are read.
+   *
+   * The same one evidence read also feeds the two additive, explicitly provisional projections: the
+   * solved-problem distribution over this source's own raw difficulty dimension, and the raw
+   * platform-label reference. Neither is formal evidence and neither reaches the weakness ranking or
+   * a plan, which keeps using only effective/adopted tags.
    */
   async weakness(request: WorkbenchWeaknessRequest, token: CancellationToken): Promise<WorkbenchWeaknessResult> {
     requireToken(token);
@@ -818,8 +852,27 @@ export class WorkbenchService {
       token.throwIfCancelled();
       const account = await this.requireAccount(accountId, token);
       const evidence = await this.collectWeaknessEvidence(account, token);
+      // The source instance is the only extra read: it says which raw dimension this platform
+      // reports, which the UI must always be able to render. The reduction itself reuses the
+      // evidence above and never walks submissions, problems or the bank again.
+      const source = await this.store.getSourceInstance(account.sourceInstanceId);
+      token.throwIfCancelled();
+      invariant(
+        source !== null,
+        'invalid_input',
+        `account ${account.id} names source instance ${account.sourceInstanceId}, which is not stored`,
+        { reason: 'source_instance_missing', accountId: account.id, sourceInstanceId: account.sourceInstanceId },
+      );
+      const statistics = computeTrainingStatistics({
+        problems: evidence.problems,
+        submissions: evidence.submissions,
+        expectedDimension: expectedRatingDimension(source.platform),
+        minimumSampleSize: WORKBENCH_MIN_WEAKNESS_SAMPLE,
+      });
       return {
         report: this.weaknessReportOf(account, evidence),
+        solvedDistribution: solvedDistributionView(statistics.solvedDistribution),
+        platformTagStats: platformTagStatsView(statistics.platformTagStats),
         coverage: evidence.coverage,
         rawTagProvenance: {
           problemsWithRawTags: evidence.problemsWithRawTags,
@@ -1551,21 +1604,72 @@ function parseListRequest(request: WorkbenchListRequest): ListFilters {
  *
  * `page`/`limit` are required (a page number is the whole point of this operation), `status` is
  * resolved to a concrete filter, and the same literal search term as `listProblems` is reused so
- * both bank operations cannot drift apart.
+ * both bank operations cannot drift apart. `sort` is resolved to a concrete order, and a difficulty
+ * order additionally demands an explicit source instance and a non-empty raw rating dimension, so
+ * one difficulty comparison can never mix source instances or platforms; every other order ignores
+ * the dimension and forwards `null`.
  */
 function parseBrowseRequest(request: WorkbenchBrowseRequest): BrowseFilters {
   invariant(request !== null && typeof request === 'object', 'invalid_input', 'browseProblems needs a request object', {});
+  const sourceInstanceId = optionalId('sourceInstanceId', request.sourceInstanceId);
+  const sort = requireBrowseSort(request.sort);
+  const ratingDimension = requireRatingDimension(request.ratingDimension);
+  if (RATING_SORTS.includes(sort)) {
+    invariant(
+      sourceInstanceId !== null,
+      'invalid_input',
+      'a difficulty sort needs an explicit source instance id; a rating is only comparable inside one',
+      { reason: 'rating_source_required', sort },
+    );
+    invariant(
+      ratingDimension !== null,
+      'invalid_input',
+      `a difficulty sort needs a rating dimension of 1..${MAX_RATING_DIMENSION_CHARS} characters`,
+      { reason: 'rating_dimension_required', sort },
+    );
+  }
   return {
-    sourceInstanceId: optionalId('sourceInstanceId', request.sourceInstanceId),
+    sourceInstanceId,
     accountId: optionalId('accountId', request.accountId),
     status: requireSolvedFilter(request.status),
     onlyAttempted: optionalFlag('onlyAttempted', request.onlyAttempted),
     query: normalizeProblemQuery(request.query),
     needsReviewOnly: optionalFlag('needsReviewOnly', request.needsReviewOnly),
     reveal: optionalFlag('reveal', request.reveal),
+    sort,
+    ratingDimension: RATING_SORTS.includes(sort) ? ratingDimension : null,
     page: requireBrowsePage(request.page),
     limit: requireBrowseLimit(request.limit),
   };
+}
+
+/** Bank sort: omitted/`null` is the legacy canonical-key ascending order of every existing caller. */
+function requireBrowseSort(value: ProblemSort | null | undefined): ProblemSort {
+  if (value === undefined || value === null) {
+    return 'default';
+  }
+  invariant(PROBLEM_SORTS.includes(value), 'invalid_input', `sort must be one of: ${PROBLEM_SORTS.join(', ')}`, {
+    sort: value,
+  });
+  return value;
+}
+
+/** Raw rating dimension of a difficulty sort: a non-blank bounded label, or `null` when omitted. */
+function requireRatingDimension(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  invariant(typeof value === 'string', 'invalid_input', 'ratingDimension must be a string when present', {
+    reason: 'invalid_rating_dimension',
+  });
+  const trimmed = value.trim();
+  invariant(
+    trimmed.length > 0 && trimmed.length <= MAX_RATING_DIMENSION_CHARS,
+    'invalid_input',
+    `ratingDimension must be 1..${MAX_RATING_DIMENSION_CHARS} characters`,
+    { reason: 'invalid_rating_dimension' },
+  );
+  return trimmed;
 }
 
 /** Solved-state filter: omitted/`null` means `all`; an unknown value is refused, never coerced. */
@@ -2424,6 +2528,53 @@ function beginnerRecommendationView(recommendation: BeginnerRecommendation): Wor
     nameZh: recommendation.nameZh,
     basis: recommendation.basis,
     rationale: recommendation.rationale,
+  };
+}
+
+/**
+ * Explicit projection of the pure solved distribution.
+ *
+ * Only the members the UI renders are copied, so a later domain addition cannot silently appear in
+ * the response and a bucket never carries anything but its numeric value and count.
+ */
+function solvedDistributionView(
+  distribution: ReturnType<typeof computeTrainingStatistics>['solvedDistribution'],
+): WorkbenchSolvedDistributionView {
+  return {
+    totalSolved: distribution.totalSolved,
+    metadataMissingSolved: distribution.metadataMissingSolved,
+    dimensions: distribution.dimensions.map((dimension) => ({
+      dimension: dimension.dimension,
+      buckets: dimension.buckets.map((bucket) => ({ value: bucket.value, count: bucket.count })),
+      knownCount: dimension.knownCount,
+      unknownCount: dimension.unknownCount,
+    })),
+  };
+}
+
+/**
+ * Explicit projection of the raw platform-label reference.
+ *
+ * `verified` is written as the literal `false` the DTO demands, so no code path can present a
+ * platform label as accepted evidence. Tag rows keep only the label and its distinct-problem
+ * counts: a per-problem label mapping would be spoiler-bearing and is not part of this projection.
+ */
+function platformTagStatsView(
+  stats: ReturnType<typeof computeTrainingStatistics>['platformTagStats'],
+): WorkbenchPlatformTagStatsView {
+  return {
+    verified: false,
+    attemptedTaggedDistinct: stats.attemptedTaggedDistinct,
+    solvedTaggedDistinct: stats.solvedTaggedDistinct,
+    minimumSampleSize: stats.minimumSampleSize,
+    tags: stats.tags.map((tag) => ({
+      rawTag: tag.rawTag,
+      attemptedDistinct: tag.attemptedDistinct,
+      solvedDistinct: tag.solvedDistinct,
+      unconfirmedDistinct: tag.unconfirmedDistinct,
+      solveRate: tag.solveRate,
+      sufficientEvidence: tag.sufficientEvidence,
+    })),
   };
 }
 

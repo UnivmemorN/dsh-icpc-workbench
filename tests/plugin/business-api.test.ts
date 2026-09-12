@@ -759,6 +759,19 @@ void test('bank, review, retrospective, weakness and plan operations delegate th
     assert.equal(weakness.coverage.submissionRows, 1);
     assert.equal(weakness.rawTagProvenance.verified, false);
     assert.ok(weakness.report);
+    // The additive provisional projections travel over this same operation: one solved problem with
+    // its raw Codeforces rating, and the unverified platform-label reference beside the formal report.
+    assert.deepEqual(weakness.solvedDistribution, {
+      totalSolved: 1,
+      metadataMissingSolved: 0,
+      dimensions: [{ dimension: 'rating', buckets: [{ value: 1800, count: 1 }], knownCount: 1, unknownCount: 0 }],
+    });
+    assert.equal(weakness.platformTagStats.verified, false);
+    assert.equal(weakness.platformTagStats.minimumSampleSize, 5);
+    assert.deepEqual(
+      weakness.platformTagStats.tags.map((tag: { rawTag: string }) => tag.rawTag),
+      ['data structures', 'segment tree'],
+    );
 
     const plans = await ok(bench, 'plan.list', { accountId: scope.account.id });
     assert.equal(plans.plans.length, 1);
@@ -848,6 +861,32 @@ void test('problem.browse pages by number, refuses a cursor and rejects anonymou
     assert.equal(Object.hasOwn(hidden.items[0], 'rawTags'), false);
     assert.equal(Object.hasOwn(hidden.items[0], 'effectiveTaxonomyIds'), false);
 
+    // A requested order reaches the real store: `problem_desc` reverses the natural key order, and a
+    // difficulty sort reads one raw dimension of the requested source instance.
+    const sorted = await ok(bench, 'problem.browse', {
+      sourceInstanceId: scope.instance.id,
+      sort: 'problem_desc',
+      page: 1,
+      limit: 25,
+    });
+    assert.deepEqual(
+      sorted.items.map((item: { problemKey: string }) => item.problemKey),
+      [later.key, scope.problem.key],
+      'the whole filtered set is ordered before the page is taken',
+    );
+    const byDifficulty = await ok(bench, 'problem.browse', {
+      sourceInstanceId: scope.instance.id,
+      sort: 'difficulty_asc',
+      ratingDimension: 'rating',
+      page: 1,
+      limit: 25,
+    });
+    assert.deepEqual(
+      byDifficulty.items.map((item: { problemKey: string }) => item.problemKey).sort(),
+      [later.key, scope.problem.key].sort(),
+      'both fixtures share one rating, so the canonical key decides the tie',
+    );
+
     const cases: readonly unknown[] = [
       { page: 1, limit: 25, cursor: null },
       { page: 1, limit: 25, status: 'solved' },
@@ -855,6 +894,11 @@ void test('problem.browse pages by number, refuses a cursor and rejects anonymou
       { page: 0, limit: 25 },
       { page: 1, limit: 101 },
       { page: 1, limit: 25, status: 'all', unknown: true },
+      { page: 1, limit: 25, sort: 'by_vibes' },
+      { page: 1, limit: 25, sourceInstanceId: scope.instance.id, sort: 'difficulty_asc' },
+      { page: 1, limit: 25, sort: 'difficulty_asc', ratingDimension: 'rating' },
+      { page: 1, limit: 25, sourceInstanceId: scope.instance.id, sort: 'difficulty_asc', ratingDimension: '  ' },
+      { page: 1, limit: 25, sort: 'problem_asc', ratingDimension: 'x'.repeat(101) },
     ];
     for (const body of cases) {
       const parsed = await refused(bench, 'problem.browse', body, 400);

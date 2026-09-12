@@ -20,6 +20,50 @@ type SolvedStatus = (typeof STATUS_OPTIONS)[number][0];
 const STATUS_HINT = '未选择当前账号：通过状态无法判断，请先在顶部选择账号。';
 
 /**
+ * Ordering choices, matching the sort names `problem.browse` accepts.
+ *
+ * The bank always requests an explicit sort; `problem_asc` (natural 题号 order, so `2A` is before
+ * `10A`) is what it opens with.
+ */
+const SORT_OPTIONS = [
+  ['problem_asc', '题号升序'],
+  ['problem_desc', '题号降序'],
+  ['title_asc', '题目名称升序'],
+  ['title_desc', '题目名称降序'],
+  ['difficulty_asc', '难度从低到高'],
+  ['difficulty_desc', '难度从高到低'],
+] as const;
+
+type BankSort = (typeof SORT_OPTIONS)[number][0];
+
+/** The sort requested when the user has not chosen one. */
+const DEFAULT_BANK_SORT: BankSort = 'problem_asc';
+
+/** Raw rating dimension a known platform publishes; `null` means the user must name one. */
+function knownRatingDimension(platform: string): string | null {
+  if (platform === 'codeforces') {
+    return 'rating';
+  }
+  if (platform === 'luogu') {
+    return 'difficulty';
+  }
+  return null;
+}
+
+/** Dimension offered for a source whose platform publishes no known rating label. */
+const FALLBACK_RATING_DIMENSION = 'difficulty';
+
+/** Explains, beside a difficulty order, where a problem without that dimension lands. */
+const MISSING_RATING_HINT = '没有该维度、空值或非数值的难度，在升序和降序中都排在最后。';
+
+/** Longest difficulty-dimension name `problem.browse` accepts; keeps the field inside the API bound. */
+const MAX_DIMENSION_LENGTH = 100;
+
+/** Inline refusals; an invalid draft keeps the previous committed dimension in effect. */
+const DIMENSION_BLANK_WARNING = '难度维度不能为空，已保留上一个维度。';
+const DIMENSION_TOO_LONG_WARNING = `难度维度最多 ${MAX_DIMENSION_LENGTH} 个字符，已保留上一个维度。`;
+
+/**
  * Nearby numbered pages around `current`, with `null` marking an elided gap.
  *
  * Only the first page, the last page, the current page and two neighbours on each side are offered,
@@ -58,13 +102,22 @@ function pageNumbers(current: number, total: number): readonly (number | null)[]
  * a newer one. Counters come only from a confirmed response: with none, the pager reports
  * `正在读取…`/`暂无结果` and disables every control instead of fabricating zero pages, and a
  * confirmed empty page displays `第 0 / 0 页`. The jump field accepts only a positive safe-integer
- * page and explains a malformed value inline. The inline problem detail below the table never
- * disturbs this state.
+ * page and explains a malformed value inline. The sort selector always sends an explicit order and
+ * opens on the natural `题号升序` order (`problem_asc`); changing it resets the page to 1. A
+ * difficulty order additionally shows the raw dimension it compares — the platform's own label, or
+ * an editable one for a source whose platform publishes none — and states that a problem without
+ * that dimension sorts last in both directions, and its editable value stays inside the API's
+ * 1..100 bound: a blank or over-long draft keeps the previous committed dimension and explains
+ * itself inline. The inline problem detail below the table never disturbs this state.
  */
 export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
   const { boot, accountId, problemKey, navigate, selectedKeys, setSelectedKeys } = useWorkbench();
   const account = boot.accounts.find((entry) => entry.id === accountId);
   const [sourceId, setSourceId] = useState(account?.sourceInstanceId ?? boot.sources[0]?.id ?? '');
+  // The raw dimension label the selected platform publishes, or `null` when it is unknown.
+  const platformDimension = knownRatingDimension(
+    boot.sources.find((entry) => entry.id === sourceId)?.platform ?? '',
+  );
   const [query, setQuery] = useState('');
   const [search, setSearch] = useState('');
   const [reveal, setReveal] = useState(false);
@@ -73,7 +126,15 @@ export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0]);
   const [page, setPage] = useState(1);
   const [jump, setJump] = useState('');
+  const [sort, setSort] = useState<BankSort>(DEFAULT_BANK_SORT);
+  const [dimension, setDimension] = useState(platformDimension ?? FALLBACK_RATING_DIMENSION);
+  const [dimensionDraft, setDimensionDraft] = useState(platformDimension ?? FALLBACK_RATING_DIMENSION);
+  const [dimensionWarning, setDimensionWarning] = useState<string | null>(null);
   const results = useRef<HTMLDivElement | null>(null);
+
+  // A difficulty order compares one raw dimension of one source instance; every other order ignores
+  // the field. The committed dimension is never blank, so an invalid request is never sent.
+  const needsDimension = sort === 'difficulty_asc' || sort === 'difficulty_desc';
 
   const read = useRequest('problem.browse', {
     ...(sourceId ? { sourceInstanceId: sourceId } : {}),
@@ -81,6 +142,8 @@ export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
     // Solved state is a statement about one account, so the filter is only sent with an account.
     ...(accountId ? { status } : {}),
     ...(search.trim() ? { query: search.trim() } : {}),
+    sort,
+    ...(needsDimension ? { ratingDimension: dimension } : {}),
     limit: pageSize,
     page,
     reveal,
@@ -115,6 +178,26 @@ export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
       results.current?.scrollIntoView({ block: 'start' });
       results.current?.focus();
     }
+  }
+
+  /**
+   * Commit an edited difficulty dimension.
+   *
+   * The API accepts a trimmed length of 1..100, so a blank or over-long draft is refused with inline
+   * feedback while the previous committed dimension stays in effect. Only a valid change resets the
+   * page to 1: a refused edit must not move an unrelated page position.
+   */
+  function commitDimension(): void {
+    const next = dimensionDraft.trim();
+    if (next.length === 0 || next.length > MAX_DIMENSION_LENGTH) {
+      setDimensionDraft(dimension);
+      setDimensionWarning(next.length === 0 ? DIMENSION_BLANK_WARNING : DIMENSION_TOO_LONG_WARNING);
+      return;
+    }
+    setDimension(next);
+    setDimensionDraft(next);
+    setDimensionWarning(null);
+    setPage(1);
   }
 
   function toggle(key: string): void {
@@ -237,7 +320,16 @@ export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
           <select
             value={sourceId}
             onChange={(event) => {
-              setSourceId(event.target.value);
+              const nextId = event.target.value;
+              // A rating is only comparable inside one source instance, so the previous source's
+              // dimension and page never carry over to the next one.
+              const nextDimension =
+                knownRatingDimension(boot.sources.find((entry) => entry.id === nextId)?.platform ?? '') ??
+                FALLBACK_RATING_DIMENSION;
+              setSourceId(nextId);
+              setDimension(nextDimension);
+              setDimensionDraft(nextDimension);
+              setDimensionWarning(null);
               setPage(1);
               navigate('bank', '');
             }}
@@ -275,6 +367,22 @@ export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
         >
           搜索
         </button>
+        <label>
+          排序
+          <select
+            value={sort}
+            onChange={(event) => {
+              setSort(event.target.value as BankSort);
+              setPage(1);
+            }}
+          >
+            {SORT_OPTIONS.map(([value, text]) => (
+              <option key={value} value={value}>
+                {text}
+              </option>
+            ))}
+          </select>
+        </label>
         <label>
           状态
           <select
@@ -337,6 +445,43 @@ export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
           显示列表中的算法标签
         </label>
       </div>
+      {needsDimension && (
+        <div className="icpc-toolbar">
+          {platformDimension === null ? (
+            <label>
+              难度维度
+              <input
+                value={dimensionDraft}
+                maxLength={MAX_DIMENSION_LENGTH}
+                aria-invalid={dimensionWarning === null ? undefined : true}
+                aria-describedby={
+                  dimensionWarning === null
+                    ? 'icpc-bank-dimension-hint'
+                    : 'icpc-bank-dimension-hint icpc-bank-dimension-warning'
+                }
+                onChange={(event) => setDimensionDraft(event.target.value)}
+                onBlur={commitDimension}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    commitDimension();
+                  }
+                }}
+              />
+            </label>
+          ) : (
+            <span className="icpc-muted">难度维度：{dimension}（平台原始难度）</span>
+          )}
+          {dimensionWarning !== null && (
+            <small className="icpc-muted" id="icpc-bank-dimension-warning" role="status">
+              {dimensionWarning}
+            </small>
+          )}
+          <small className="icpc-muted" id="icpc-bank-dimension-hint">
+            {MISSING_RATING_HINT}
+          </small>
+        </div>
+      )}
       <ImportPanel sourceId={sourceId} onChange={read.refresh} />
       <Panel
         title={reviewOnly ? '当前快照待审核题目' : '本地题库'}

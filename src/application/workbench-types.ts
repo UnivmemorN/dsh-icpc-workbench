@@ -337,10 +337,75 @@ export interface WorkbenchRawTagProvenance {
   readonly note: string;
 }
 
+/** One numeric value of one raw dimension and how many distinct solved problems carry it. */
+export interface WorkbenchSolvedBucketView {
+  readonly value: number;
+  readonly count: number;
+}
+
+/**
+ * One raw platform dimension of the solved distribution.
+ *
+ * `knownCount + unknownCount` is always the number of distinct solved problems, so an
+ * all-unknown or empty series is renderable and never silently smaller than the real sample.
+ */
+export interface WorkbenchSolvedDimensionView {
+  /** Original platform dimension name (`rating`, `difficulty`, …), never a merged scale. */
+  readonly dimension: string;
+  /** Numeric buckets sorted ascending; `sum(count)` equals `knownCount`. */
+  readonly buckets: readonly WorkbenchSolvedBucketView[];
+  readonly knownCount: number;
+  readonly unknownCount: number;
+}
+
+/**
+ * Difficulty distribution of every distinct accepted problem, one series per raw platform
+ * dimension. `metadataMissingSolved` names the part of the sample that carries no local metadata
+ * and therefore cannot appear in any bucket.
+ */
+export interface WorkbenchSolvedDistributionView {
+  readonly totalSolved: number;
+  readonly metadataMissingSolved: number;
+  /** At least the dimension the source is expected to report, even when it has no usable value. */
+  readonly dimensions: readonly WorkbenchSolvedDimensionView[];
+}
+
+/** One raw platform label with its distinct-problem sample; never an accepted tag. */
+export interface WorkbenchPlatformTagStatView {
+  readonly rawTag: string;
+  readonly attemptedDistinct: number;
+  readonly solvedDistinct: number;
+  readonly unconfirmedDistinct: number;
+  readonly solveRate: number;
+  /** True from `minimumSampleSize` distinct attempts; insufficient samples stay listed. */
+  readonly sufficientEvidence: boolean;
+}
+
+/**
+ * Descriptive reference over raw platform labels of one account.
+ *
+ * `verified: false` is the whole point: these labels are platform claims, so they are displayed
+ * next to the formal report and never counted as accepted tags. Counts are per distinct problem
+ * and per distinct label, they overlap across labels, and they therefore do not sum to the
+ * attempted total.
+ */
+export interface WorkbenchPlatformTagStatsView {
+  /** Always `false`: a raw platform label is not an accepted/effective taxonomy tag. */
+  readonly verified: false;
+  readonly attemptedTaggedDistinct: number;
+  readonly solvedTaggedDistinct: number;
+  readonly minimumSampleSize: number;
+  readonly tags: readonly WorkbenchPlatformTagStatView[];
+}
+
 /** One account's weakness statistics plus the coverage they were computed from. */
 export interface WorkbenchWeaknessResult {
   /** Pure domain report: distinct problems, minimum-sample gate, latest retrospective wins. */
   readonly report: AccountWeaknessReport;
+  /** Every distinct accepted problem over its own raw platform dimensions (provisional). */
+  readonly solvedDistribution: WorkbenchSolvedDistributionView;
+  /** Unverified platform-label reference; descriptive only, never formal weakness evidence. */
+  readonly platformTagStats: WorkbenchPlatformTagStatsView;
   readonly coverage: WorkbenchWeaknessCoverage;
   readonly rawTagProvenance: WorkbenchRawTagProvenance;
 }

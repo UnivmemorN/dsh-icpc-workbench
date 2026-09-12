@@ -46,6 +46,7 @@ import {
   contentHashOf,
   invariant,
   isLeaseExpired,
+  naturalSortKey,
   problemKey,
   recoverAfterRestart,
   transitionJob,
@@ -66,13 +67,17 @@ import {
 } from '../../domain/index.js';
 import {
   BROWSE_PAGE_LIMITS,
+  MAX_RATING_DIMENSION_CHARS,
   PROBLEM_SOLVED_FILTERS,
+  PROBLEM_SORTS,
+  RATING_SORTS,
   type Page,
   type PageRequest,
   type ProblemBrowsePage,
   type ProblemBrowseQuery,
   type ProblemQuery,
   type ProblemSolvedFilter,
+  type ProblemSort,
   type StoreCapabilities,
   type TrainingStore,
 } from '../../application/ports.js';
@@ -161,6 +166,7 @@ import {
   readMarker,
   readUserVersion,
 } from './schema.js';
+import { NATURAL_KEY_FUNCTION, RATING_VALUE_FUNCTION, ratingValueFromBody } from './sorting.js';
 
 /** Values this adapter binds into prepared statements. */
 type SqlValue = null | number | string;
@@ -235,6 +241,7 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
     this.connection = connection;
     try {
       this.openSchema(inMemory);
+      this.registerSortFunctions();
     } catch (error) {
       // A half-opened store must not leak its file handle.
       let closeCause: string | null = null;
@@ -678,6 +685,9 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
         filters.push(PENDING_REVIEW_PREDICATE);
       }
       const where = filters.length === 0 ? '' : ` WHERE ${filters.join(' AND ')}`;
+      // The ordering — and, for a difficulty sort, its explicit source instance and raw dimension —
+      // is resolved before the first read, so an unsupported order never reaches the count.
+      const ordering = browseOrdering(query.sort, query.ratingDimension, query.sourceInstanceId);
       const counted = this.find(`SELECT COUNT(*) AS total FROM problems${where}`, params);
       const totalItems = counted === null ? 0 : intColumn(counted, 'total');
       const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
@@ -689,9 +699,9 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
       const rows = this.all(
         `SELECT problems.key, problems.body, ${solvedSelect} AS solved
            FROM problems${where}
-          ORDER BY problems.key ASC
+          ORDER BY ${ordering.clause}
           LIMIT ? OFFSET ?`,
-        [...solvedParams, ...params, limit, (page - 1) * limit],
+        [...solvedParams, ...params, ...ordering.params, limit, (page - 1) * limit],
       );
       const items = rows.map((row) => {
         const key = textColumn(row, 'key');
@@ -715,6 +725,36 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
       const row = this.find('SELECT body FROM problems WHERE key = ?', [requireProblemKey(problemKeyValue)]);
       return row === null ? null : entityFromRow<NormalizedProblem>('problems.body', row);
     });
+  }
+
+  /**
+   * Register the two deterministic scalar functions the bank sorts use.
+   *
+   * Both are `deterministic: true`, so SQLite may evaluate them inside an `ORDER BY` (and would let
+   * them appear in an index expression). They take only bound values — never a SQL fragment — and
+   * are pure: the same input always produces the same output, which is what makes a page built from
+   * them repeatable. They live as long as the connection; `close()` releases the connection (and
+   * with it the function table) and clears the prepared-statement cache that referenced them.
+   *
+   * A host whose `DatabaseSync` predates `function()` cannot serve a sorted bank, and that is
+   * reported here as a typed refusal instead of letting the first sorted request fail with a raw
+   * `no such function` error.
+   */
+  private registerSortFunctions(): void {
+    const register = (this.connection as { function?: unknown }).function;
+    if (typeof register !== 'function') {
+      throw new StorageError(
+        'open_failed',
+        'this node:sqlite build cannot register the deterministic sort functions the bank needs',
+        { path: this.path, node: process.version },
+      );
+    }
+    this.connection.function(NATURAL_KEY_FUNCTION, { deterministic: true }, (value: unknown) =>
+      typeof value === 'string' ? naturalSortKey(value) : null,
+    );
+    this.connection.function(RATING_VALUE_FUNCTION, { deterministic: true }, (body: unknown, dimension: unknown) =>
+      ratingValueFromBody(body, dimension),
+    );
   }
 
   async upsertSubmissions(submissions: readonly Submission[]): Promise<void> {
@@ -2200,6 +2240,100 @@ function browseAttemptedFlag(value: boolean | null | undefined): boolean {
   }
   invariant(typeof value === 'boolean', 'invalid_input', 'onlyAttempted must be a boolean when present', { value });
   return value;
+}
+
+/**
+ * Static `ORDER BY` fragments of one bank page, keyed by the accepted sort names.
+ *
+ * Two properties matter here:
+ *
+ * - **Allowlisted, never interpolated.** A request only selects a key of this table; the fragment
+ *   itself is a literal, so no caller input ever reaches the SQL text. The one variable value — the
+ *   rating dimension — is a bound parameter, so even a hostile dimension (quotes, `--`, `;`) is
+ *   matched as literal data by `json_extract` and can neither change the statement nor inject one.
+ * - **Total and deterministic.** Every fragment ends in `problems.key ASC`, the canonical key, so
+ *   rows that compare equal under the requested order (the same title, the same difficulty, keys
+ *   that differ only in leading zeros) still have exactly one order and a `LIMIT/OFFSET` page can
+ *   neither omit nor repeat a row.
+ *
+ * Natural problem order compares the encoded natural key (digit runs as integers, other characters
+ * by code point). Title order uses SQLite's `NOCASE` collation: it is **ASCII** case-insensitive
+ * only, so `Zebra` and `apple` order as `apple` then `Zebra`, while a title that differs only in
+ * ASCII case compares equal and falls through to the canonical key; non-ASCII text keeps code point
+ * order (SQLite folds no non-ASCII case). Difficulty order reads the raw dimension from the stored
+ * body with {@link RATING_VALUE_FUNCTION}; `IS NULL ASC` puts a missing, blank or non-numeric value
+ * before the value comparison in BOTH directions, i.e. always last, because a problem without a
+ * comparable rating is not "the easiest" one.
+ */
+const BROWSE_ORDERINGS: Readonly<Record<ProblemSort, string>> = {
+  default: 'problems.key ASC',
+  problem_asc: `${NATURAL_KEY_FUNCTION}(problems.external_key) ASC, problems.key ASC`,
+  problem_desc: `${NATURAL_KEY_FUNCTION}(problems.external_key) DESC, problems.key ASC`,
+  title_asc: 'problems.title COLLATE NOCASE ASC, problems.key ASC',
+  title_desc: 'problems.title COLLATE NOCASE DESC, problems.key ASC',
+  difficulty_asc: `${RATING_VALUE_FUNCTION}(problems.body, ?) IS NULL ASC, ${RATING_VALUE_FUNCTION}(problems.body, ?) ASC, problems.key ASC`,
+  difficulty_desc: `${RATING_VALUE_FUNCTION}(problems.body, ?) IS NULL ASC, ${RATING_VALUE_FUNCTION}(problems.body, ?) DESC, problems.key ASC`,
+};
+
+/**
+ * Resolve one requested sort into a static SQL fragment plus its bound parameters.
+ *
+ * The sort name is validated against the allowlist, the optional dimension against its own type and
+ * bound, and a difficulty sort demands an explicit source instance and a non-empty dimension: a
+ * difficulty compared across two source instances, or across two platforms' dimensions, would be
+ * this adapter inventing a scale the platforms never agreed on. The adapter repeats checks the
+ * service already makes, so a direct caller of the port cannot bypass them.
+ */
+function browseOrdering(
+  sort: ProblemSort | null | undefined,
+  ratingDimension: string | null | undefined,
+  sourceInstanceId: string | null | undefined,
+): { readonly clause: string; readonly params: readonly SqlValue[] } {
+  const resolved = sort === undefined || sort === null ? 'default' : sort;
+  invariant(
+    typeof resolved === 'string' && PROBLEM_SORTS.includes(resolved),
+    'invalid_input',
+    `unknown bank sort ${String(resolved)}`,
+    { sort: resolved },
+  );
+  const dimension = optionalRatingDimension(ratingDimension);
+  if (!RATING_SORTS.includes(resolved)) {
+    // The clause is a literal allowlisted fragment, so no caller input reaches the SQL text.
+    return { clause: BROWSE_ORDERINGS[resolved], params: [] };
+  }
+  invariant(
+    dimension !== null,
+    'invalid_input',
+    `a difficulty sort needs a rating dimension of 1..${MAX_RATING_DIMENSION_CHARS} characters`,
+    { sort: resolved, reason: 'rating_dimension_required' },
+  );
+  invariant(
+    typeof sourceInstanceId === 'string' && sourceInstanceId.length > 0,
+    'invalid_input',
+    'a difficulty sort needs an explicit source instance id; a rating is only comparable inside one',
+    { sort: resolved, reason: 'rating_source_required' },
+  );
+  // The fragment uses the dimension twice (null test and value), so it is bound twice.
+  return { clause: BROWSE_ORDERINGS[resolved], params: [dimension, dimension] };
+}
+
+/** Bound the optional rating dimension: absent means `null`, present means a non-blank bounded label. */
+function optionalRatingDimension(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  invariant(typeof value === 'string', 'invalid_input', 'ratingDimension must be a string when present', {
+    reason: 'invalid_rating_dimension',
+    value,
+  });
+  const trimmed = value.trim();
+  invariant(
+    trimmed.length > 0 && trimmed.length <= MAX_RATING_DIMENSION_CHARS,
+    'invalid_input',
+    `ratingDimension must be 1..${MAX_RATING_DIMENSION_CHARS} characters`,
+    { reason: 'invalid_rating_dimension' },
+  );
+  return trimmed;
 }
 
 function requireSyncResource(resource: SyncResource): SyncResource {

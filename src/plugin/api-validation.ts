@@ -29,7 +29,7 @@ import {
   type DomainError,
 } from '../domain/index.js';
 import { PlatformError } from '../application/platform-errors.js';
-import { PROBLEM_SOLVED_FILTERS } from '../application/ports.js';
+import { MAX_RATING_DIMENSION_CHARS, PROBLEM_SOLVED_FILTERS, PROBLEM_SORTS } from '../application/ports.js';
 import { STORAGE_PAGE_LIMITS } from '../application/storage-types.js';
 import {
   MAX_BROWSE_PAGE_SIZE,
@@ -613,7 +613,10 @@ export function validateProblemList(value: unknown): ApiProblemListRequest {
  *
  * `page` and `limit` are required (this operation exists to page by number) and there is no
  * `cursor` field: sending one is an unknown field and is refused. `status` and `onlyAttempted` are
- * shape-checked here and refused by the service when no account context can answer them.
+ * shape-checked here and refused by the service when no account context can answer them. `sort` is a
+ * closed enum (`null` keeps the legacy order, as omitting it does) and `ratingDimension` is a bounded
+ * non-blank string or `null`; whether a difficulty sort may run without a source/dimension is the
+ * service's rule, not a shape question.
  */
 export function validateProblemBrowse(value: unknown): ApiProblemBrowseRequest {
   const object = plainObject('problem.browse', value);
@@ -625,6 +628,8 @@ export function validateProblemBrowse(value: unknown): ApiProblemBrowseRequest {
     'query',
     'reveal',
     'needsReviewOnly',
+    'sort',
+    'ratingDimension',
   ]);
   return {
     ...(object['sourceInstanceId'] === undefined
@@ -646,6 +651,16 @@ export function validateProblemBrowse(value: unknown): ApiProblemBrowseRequest {
     ...(object['needsReviewOnly'] === undefined
       ? {}
       : { needsReviewOnly: booleanValue('needsReviewOnly', object['needsReviewOnly']) }),
+    ...(object['sort'] === undefined
+      ? {}
+      : object['sort'] === null
+        ? { sort: null }
+        : { sort: enumValue('sort', object['sort'], PROBLEM_SORTS) }),
+    ...(object['ratingDimension'] === undefined
+      ? {}
+      : {
+          ratingDimension: nullableString('ratingDimension', object['ratingDimension'], MAX_RATING_DIMENSION_CHARS),
+        }),
     page: pageNumber('page', object['page']),
     limit: boundedInteger('limit', object['limit'], 1, MAX_BROWSE_PAGE_SIZE),
   };

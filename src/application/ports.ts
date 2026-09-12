@@ -388,6 +388,42 @@ export type ProblemSolvedFilter = 'all' | 'solved' | 'unconfirmed';
 /** Accepted solved-state filters, in the order the bank UI presents them. */
 export const PROBLEM_SOLVED_FILTERS: readonly ProblemSolvedFilter[] = ['all', 'solved', 'unconfirmed'];
 
+/**
+ * Ordering of one numbered bank page.
+ *
+ * `default` is the legacy canonical-key ascending order and is what an omitted/`null` sort means, so
+ * existing callers keep their exact order and `problem.list`'s cursor order is untouched.
+ * `problem_asc`/`problem_desc` order by the problem's own external key in **natural** order (`2A`
+ * before `10A`), `title_asc`/`title_desc` by title and `difficulty_asc`/`difficulty_desc` by one raw
+ * platform rating dimension. Every order is fully deterministic: ties are broken by the canonical
+ * key, so no row is ever skipped or repeated across pages.
+ */
+export type ProblemSort =
+  | 'default'
+  | 'problem_asc'
+  | 'problem_desc'
+  | 'title_asc'
+  | 'title_desc'
+  | 'difficulty_asc'
+  | 'difficulty_desc';
+
+/** Accepted bank sorts, in the order the bank UI presents them. */
+export const PROBLEM_SORTS: readonly ProblemSort[] = [
+  'default',
+  'problem_asc',
+  'problem_desc',
+  'title_asc',
+  'title_desc',
+  'difficulty_asc',
+  'difficulty_desc',
+];
+
+/** Sorts that read one raw rating dimension; each needs a source instance and a non-empty dimension. */
+export const RATING_SORTS: readonly ProblemSort[] = ['difficulty_asc', 'difficulty_desc'];
+
+/** Longest accepted `ratingDimension`: a dimension is a short platform label (`rating`, `difficulty`). */
+export const MAX_RATING_DIMENSION_CHARS = 100;
+
 /** Legal page sizes of {@link ProblemBrowseQuery.limit}: any integer within `min..max`. */
 export const BROWSE_PAGE_LIMITS = { minPageSize: 1, maxPageSize: 100 } as const;
 
@@ -396,7 +432,10 @@ export const BROWSE_PAGE_LIMITS = { minPageSize: 1, maxPageSize: 100 } as const;
  *
  * Every predicate is applied in SQL before both the count and the selected page, so `items` and the
  * totals always describe the same filter set. `status` and `onlyAttempted` are statements about the
- * selected account's own submissions and are refused without one.
+ * selected account's own submissions and are refused without one. `sort` is applied inside the same
+ * `ORDER BY` before `LIMIT/OFFSET`; a difficulty sort additionally requires `sourceInstanceId` and a
+ * non-empty `ratingDimension`, so one difficulty comparison always stays within one source instance
+ * and one raw dimension instead of inventing a cross-platform scale.
  */
 export interface ProblemBrowseQuery {
   readonly sourceInstanceId?: string | null;
@@ -407,6 +446,10 @@ export interface ProblemBrowseQuery {
   /** Literal case-insensitive substring over title and external key, as in {@link ProblemQuery}. */
   readonly query?: string | null;
   readonly needsReviewOnly?: boolean | null;
+  /** Ordering of the whole filtered set; omitted/`null` is the legacy canonical-key ascending order. */
+  readonly sort?: ProblemSort | null;
+  /** Raw rating dimension of a difficulty sort; required exactly for {@link RATING_SORTS}. */
+  readonly ratingDimension?: string | null;
   /** 1-based page number; a page beyond the last match is clamped to the last valid page. */
   readonly page: number;
   readonly limit: number;

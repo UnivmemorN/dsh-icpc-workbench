@@ -66,6 +66,8 @@ export {
   type RawTag,
 } from './problem.js';
 
+export { compareNaturalKeys, naturalSortKey, numericRatingValue, numericText } from './sorting.js';
+
 export {
   SUBMISSION_VERDICTS,
   createSubmission,
@@ -233,6 +235,18 @@ export {
   type TagWeaknessSample,
   type WeaknessSettings,
 } from './weakness.js';
+
+export {
+  computeTrainingStatistics,
+  expectedRatingDimension,
+  type ComputeTrainingStatisticsInput,
+  type PlatformTagStatRow,
+  type PlatformTagStatistics,
+  type SolvedBucket,
+  type SolvedDimensionDistribution,
+  type SolvedDistribution,
+  type TrainingStatistics,
+} from './training-stats.js';
 
 export {
   TRAINING_TASK_KINDS,
