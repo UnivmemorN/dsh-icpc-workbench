@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, appendFileSync, mkdirSync, openSync, close
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { priceUsage } from './usage.mjs';
 const root = resolve(import.meta.dirname, '..');
 const install = resolve(process.env.DSH_INSTALL_ROOT ?? 'D:/DeepSeek Harness/source');
 const taskPath = resolve(process.argv[2] ?? '');
@@ -51,14 +52,14 @@ try {
       console.log(JSON.stringify({event:'request',count:report.requests}));
       if(report.requests>(task.maxRequests??40)) stop('request-limit');
     }
-    if(e.type==='assistant/message'||e.type==='assistant/attempt') {
-      const u=e.data.usage??lastAssistantStreamChunk(e.data.stream,'usage')?.usage;
+    if(e.type==='assistant/message'||e.type==='assistant/attempt'||(e.type==='compaction/summary'&&e.data.llmStreamCall)) {
+      const u=e.data.usage??(e.data.stream?lastAssistantStreamChunk(e.data.stream,'usage')?.usage:undefined);
       report.settlements++;
-      if(u && Number.isFinite(u.inputTokens) && Number.isFinite(u.outputTokens)) {
-        const cache=Number.isFinite(u.cacheReadTokens)?Math.min(u.inputTokens,u.cacheReadTokens):0;
-        report.inputTokens+=u.inputTokens; report.outputTokens+=u.outputTokens; report.cacheReadTokens+=cache;
-        report.conservativeCny+=((u.inputTokens-cache)*2+cache*0.04+u.outputTokens*8)/1e6;
-      } else { report.missingUsage++; report.conservativeCny+=2.262144; }
+      const priced=priceUsage(u);
+      if(priced) {
+        for(const k of ['inputTokens','outputTokens','cacheReadTokens','conservativeCny']) report[k]+=priced[k];
+      } else { report.missingUsage++; report.conservativeCny+=2.36; }
+      if(e.type==='compaction/summary') report.compactions=(report.compactions??0)+1;
       if(e.type==='assistant/message'){
         const summary=joinAssistantStreamText(e.data.stream);
         console.log(JSON.stringify({event:'assistant', text:summary.slice(0,1500), cny:report.conservativeCny}));
@@ -81,5 +82,8 @@ try {
 } finally {
   clearTimeout(timer);
   try { await harness?.close(); } catch(e) { report.cleanupError=String(e.message); process.exitCode=1; }
+  report.unsettledRequests=Math.max(0,report.requests-report.settlements+(report.compactions??0));
+  report.conservativeCny+=report.unsettledRequests*2.36;
+  report.accountingVersion=2;
   report.finishedAt=new Date().toISOString(); flush(); unlinkSync(lock);
 }

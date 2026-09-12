@@ -1,0 +1,47 @@
+{
+  "name": "dsh-icpc-workbench",
+  "version": "0.1.0",
+  "description": "Personal ICPC training workbench plugin: normalized problems, evidence-checked tag analysis, weakness statistics and training plans.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "main": "./dist/domain/index.js",
+  "types": "./dist/domain/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/domain/index.d.ts",
+      "default": "./dist/domain/index.js"
+    },
+    "./domain": {
+      "types": "./dist/domain/index.d.ts",
+      "default": "./dist/domain/index.js"
+    },
+    "./application/ports": {
+      "types": "./dist/application/ports.d.ts",
+      "default": "./dist/application/ports.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --import ./tests/loader.mjs --test --test-isolation=none \"tests/**/*.test.ts\"",
+    "build": "node scripts/build.mjs",
+    "check:architecture": "node scripts/check-architecture.mjs",
+    "check": "npm run typecheck && npm run check:architecture && npm run test && node --test scripts/usage.test.mjs && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.4.0"
+  }
+}
