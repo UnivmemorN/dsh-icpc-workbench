@@ -25,6 +25,8 @@ export {
   type LuoguListCursorInput,
 } from './cursors.js';
 
+export { LUOGU_UID_PATTERN, canonicalLuoguUid, createLuoguAccount, requireLuoguUid } from './account.js';
+
 export {
   LUOGU_PID_PATTERN,
   LUOGU_TAG_RAW_PREFIX,
