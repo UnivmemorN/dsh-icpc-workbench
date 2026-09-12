@@ -796,5 +796,7 @@ const TECHNIQUES: readonly TaxonomyNode[] = [
 /** Frozen initial taxonomy. */
 export const TAXONOMY_V1: Taxonomy = createTaxonomy({ version: TAXONOMY_V1_VERSION, nodes: TECHNIQUES });
 
-/** Current taxonomy shipped with this build. */
-export const CURRENT_TAXONOMY: Taxonomy = TAXONOMY_V1;
+/**
+ * The current vocabulary (`CURRENT_TAXONOMY`) lives in `v2.ts`. `TAXONOMY_V1` stays frozen so
+ * snapshots pinned to 2026.09.1 keep resolving against exactly these nodes.
+ */

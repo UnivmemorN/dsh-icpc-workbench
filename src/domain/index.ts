@@ -123,6 +123,8 @@ export {
   TAXONOMY_ID_PATTERN,
   TAXONOMY_V1,
   TAXONOMY_V1_VERSION,
+  TAXONOMY_V2,
+  TAXONOMY_V2_VERSION,
   algorithmRawTags,
   algorithmTagIds,
   assertKnownTag,

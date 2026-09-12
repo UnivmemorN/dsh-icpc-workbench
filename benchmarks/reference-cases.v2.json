@@ -1,0 +1,620 @@
+{
+  "schemaVersion": 1,
+  "taxonomyVersion": "2026.09.2",
+  "status": "frozen-before-paid-model-evaluation",
+  "reviewer": "Codex coordinator (not an independent human expert panel)",
+  "priorReferenceFiles": [
+    "tag-cases.v1.json",
+    "supplemental-cases.v1.json"
+  ],
+  "changeBasis": "Only pre-evaluation taxonomy additions refine the existing independently derived methods. Original reference files remain unchanged; no model output has been observed.",
+  "methodology": "Use the complete 37-case access cohort; score the 30 cases with usable real editorials. Expected methods/notes are evaluation-only and must never be supplied to the model. Not random: some contests overlap. Report access, adoption, needs-review, exact reference recall and adjudicated semantic precision separately. Count unique problem/tag pairs; duplicates never improve scores. Reference recall uses the union of all preregistered valid methods, including alternatives that may not appear in a particular fetched editorial, and is therefore not a claim of complete editorial-method recall. Additional legitimate tags require recorded coordinator evidence-based adjudication; preserve exact-reference and adjudicated metrics side by side. Generic/redundant ancestor suggestions are reported separately. Empty adoption cannot pass the >=90% precision gate.",
+  "cases": [
+    {
+      "source": "codeforces",
+      "externalKey": "20C",
+      "title": "Dijkstra?",
+      "url": "https://codeforces.com/problemset/problem/20/C",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "graph.shortest-path",
+          "data-structure.heap"
+        ]
+      ],
+      "reviewNote": "Run heap-based Dijkstra on the nonnegative weighted graph; retain predecessor vertices to print a shortest path."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "580C",
+      "title": "Kefa and Park",
+      "url": "https://codeforces.com/problemset/problem/580/C",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "search.traversal",
+          "graph.tree"
+        ]
+      ],
+      "reviewNote": "Traverse root-to-leaf paths carrying the consecutive-cat count. Reset at cat-free vertices, prune counts above m, and count reachable leaves."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "455A",
+      "title": "Boredom",
+      "url": "https://codeforces.com/problemset/problem/455/A",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "dp"
+        ]
+      ],
+      "reviewNote": "Aggregate each value's total score. The best score through value x is max(best[x-1], best[x-2]+x*frequency[x])."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "279B",
+      "title": "Books",
+      "url": "https://codeforces.com/problemset/problem/279/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "search.two-pointers",
+          "search.sliding-window"
+        ],
+        [
+          "data-structure.prefix-sum",
+          "search.binary"
+        ]
+      ],
+      "reviewNote": "Positive durations permit a moving window with monotone endpoints. Alternatively binary-search the farthest endpoint in increasing prefix sums."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "466C",
+      "title": "Number of Ways",
+      "url": "https://codeforces.com/problemset/problem/466/C",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.prefix-sum"
+        ]
+      ],
+      "reviewNote": "If total is divisible by three, scan nonfinal cuts and count earlier prefix sums equal to total/3 when the current prefix equals twice that value. Update order matters when total is zero."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "706B",
+      "title": "Interesting drink",
+      "url": "https://codeforces.com/problemset/problem/706/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "search.binary",
+          "implementation.sorting"
+        ],
+        [
+          "data-structure.prefix-sum"
+        ]
+      ],
+      "reviewNote": "Sort prices and upper-bound each budget; alternatively accumulate a frequency table over the bounded price range."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "520B",
+      "title": "Two Buttons",
+      "url": "https://codeforces.com/problemset/problem/520/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "search.traversal"
+        ],
+        [
+          "greedy"
+        ]
+      ],
+      "reviewNote": "Breadth-first search the positive states up to twice max(n,m). Alternatively work backward: halve even targets, increment odd targets, then subtract the remaining gap."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "189A",
+      "title": "Cut Ribbon",
+      "url": "https://codeforces.com/problemset/problem/189/A",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "dp.knapsack"
+        ],
+        [
+          "implementation.brute-force"
+        ]
+      ],
+      "reviewNote": "Unbounded exact-length DP maximizes piece count with unreachable lengths marked invalid. A second method enumerates two piece counts and checks divisibility by the third length."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "363B",
+      "title": "Fence",
+      "url": "https://codeforces.com/problemset/problem/363/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.prefix-sum"
+        ],
+        [
+          "search.sliding-window"
+        ]
+      ],
+      "reviewNote": "Evaluate every fixed-length window by prefix-sum subtraction or maintain its sum while adding the entering plank and removing the leaving plank."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "510C",
+      "title": "Fox And Names",
+      "url": "https://codeforces.com/problemset/problem/510/C",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "graph.topological-sort"
+        ]
+      ],
+      "reviewNote": "Compare adjacent names at their first differing letter to add precedence edges. Reject a longer word preceding its own prefix. A topological ordering must include all 26 letters."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "295B",
+      "title": "Greg and Graph",
+      "url": "https://codeforces.com/problemset/problem/295/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "graph.shortest-path",
+          "offline"
+        ]
+      ],
+      "reviewNote": "Reverse deletions into vertex additions. For each new intermediate vertex, perform a full Floyd relaxation; sum distances only between currently active endpoints."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "547B",
+      "title": "Mike and Feet",
+      "url": "https://codeforces.com/problemset/problem/547/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.monotonic-stack"
+        ]
+      ],
+      "reviewNote": "Find each value's maximal interval bounded by a smaller value. It can be the minimum for that interval length; propagate maxima from larger lengths down to smaller lengths."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "380C",
+      "title": "Sereja and Brackets",
+      "url": "https://codeforces.com/problemset/problem/380/C",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.segment-tree"
+        ]
+      ],
+      "reviewNote": "Each segment stores matched pairs plus unmatched opens and closes. Merge by pairing the left opens with right closes; ordered range merges answer the subsequence length."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "459D",
+      "title": "Pashmak and Parmida's problem",
+      "url": "https://codeforces.com/problemset/problem/459/D",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.bit"
+        ],
+        [
+          "data-structure.segment-tree"
+        ]
+      ],
+      "reviewNote": "Compute occurrence counts in prefixes and suffixes. Sweep i while querying how many later suffix-count values are smaller than the current prefix count."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "242E",
+      "title": "XOR on Segment",
+      "url": "https://codeforces.com/problemset/problem/242/E",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.segment-tree",
+          "data-structure.segment-tree-lazy",
+          "tricks.bitwise"
+        ]
+      ],
+      "reviewNote": "Store bit-one counts in each segment. XOR toggles selected counts to segmentLength-count; compose lazy masks by XOR and reconstruct the sum from the counts."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "86D",
+      "title": "Powerful array",
+      "url": "https://codeforces.com/problemset/problem/86/D",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "offline.mo"
+        ]
+      ],
+      "reviewNote": "Sort offline range queries by endpoint blocks. Maintain frequencies and sum(value*frequency^2); each endpoint move adjusts the affected value's contribution."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "617E",
+      "title": "XOR and Favorite Number",
+      "url": "https://codeforces.com/problemset/problem/617/E",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "offline.mo",
+          "tricks.bitwise"
+        ]
+      ],
+      "reviewNote": "Convert subarray XOR into pairs of prefix-XOR values on [l-1,r]. Mo's algorithm maintains frequencies; insertion/removal updates the number of pairs differing by k."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "600E",
+      "title": "Lomsat gelral",
+      "url": "https://codeforces.com/problemset/problem/600/E",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "tricks.small-to-large",
+          "graph.tree"
+        ]
+      ],
+      "reviewNote": "Merge subtree color-frequency maps from smaller into larger, maintaining maximum frequency and sum of colors attaining it. A DSU-on-tree traversal offers another implementation."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "191C",
+      "title": "Fools and Roads",
+      "url": "https://codeforces.com/problemset/problem/191/C",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "graph.lca",
+          "data-structure.difference-array",
+          "graph.tree"
+        ]
+      ],
+      "reviewNote": "For each path add one at both endpoints and subtract two at their LCA. Sum differences upward; each child's accumulated value is the count for its parent edge."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "438D",
+      "title": "The Child and Sequence",
+      "url": "https://codeforces.com/problemset/problem/438/D",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.segment-tree"
+        ]
+      ],
+      "reviewNote": "Store segment sum and maximum. A modulo update skips segments whose maximum is below the modulus and descends otherwise. Effective modulo reductions at least halve values; point assignments account for new potential."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "126B",
+      "title": "Password",
+      "url": "https://codeforces.com/problemset/problem/126/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "strings.kmp"
+        ],
+        [
+          "strings.z-algorithm"
+        ]
+      ],
+      "reviewNote": "Use prefix-function border links and an internal occurrence check, or a Z-function scan. Exclude the single suffix occurrence when requiring an occurrence strictly inside the string."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "432D",
+      "title": "Prefixes and Suffixes",
+      "url": "https://codeforces.com/problemset/problem/432/D",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "strings.kmp"
+        ],
+        [
+          "strings.z-algorithm"
+        ]
+      ],
+      "reviewNote": "Accumulate prefix occurrence counts along failure links, then enumerate borders. Alternatively count how many Z-values reach each border length."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "271D",
+      "title": "Good Substrings",
+      "url": "https://codeforces.com/problemset/problem/271/D",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "strings.trie",
+          "implementation.brute-force"
+        ],
+        [
+          "strings.hashing",
+          "implementation.brute-force"
+        ]
+      ],
+      "reviewNote": "Enumerate substring starts and extend while the number of bad letters is within k. Count newly created trie nodes for exact distinctness, or use verified/collision-aware substring hashing."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "5C",
+      "title": "Longest Regular Bracket Sequence",
+      "url": "https://codeforces.com/problemset/problem/5/C",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "dp"
+        ],
+        [
+          "data-structure.stack"
+        ]
+      ],
+      "reviewNote": "Track the longest valid substring ending at each position with DP, or maintain unmatched bracket indices on a stack with a sentinel. Count maximal-length endings, with the required 0 1 empty case."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "427C",
+      "title": "Checkposts",
+      "url": "https://codeforces.com/problemset/problem/427/C",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "graph.scc"
+        ]
+      ],
+      "reviewNote": "Find strongly connected components. Choose a minimum-cost vertex in each; add those minima and multiply their multiplicities modulo 1e9+7."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "609E",
+      "title": "Minimum spanning tree for each edge",
+      "url": "https://codeforces.com/problemset/problem/609/E",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.dsu",
+          "graph.lca",
+          "graph.tree",
+          "graph.minimum-spanning-tree",
+          "implementation.sorting"
+        ]
+      ],
+      "reviewNote": "Build an MST by Kruskal. For each required edge, replace the maximum-weight edge on the corresponding MST path; binary-lifting path maxima give efficient queries. MST and sorting have dedicated nodes in taxonomy 2026.09.2."
+    },
+    {
+      "source": "luogu",
+      "externalKey": "P3374",
+      "title": "【模板】树状数组 1",
+      "url": "https://www.luogu.com.cn/problem/P3374",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.bit"
+        ],
+        [
+          "data-structure.segment-tree"
+        ]
+      ],
+      "reviewNote": "Support point additions and range sums with a Fenwick tree (two prefix queries), or a segment tree."
+    },
+    {
+      "source": "luogu",
+      "externalKey": "P3367",
+      "title": "【模板】并查集",
+      "url": "https://www.luogu.com.cn/problem/P3367",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.dsu"
+        ]
+      ],
+      "reviewNote": "Use disjoint-set representatives, path compression and union by size to process merges and membership queries."
+    },
+    {
+      "source": "luogu",
+      "externalKey": "P3372",
+      "title": "【模板】线段树 1",
+      "url": "https://www.luogu.com.cn/problem/P3372",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "data-structure.segment-tree",
+          "data-structure.segment-tree-lazy"
+        ],
+        [
+          "data-structure.bit",
+          "data-structure.difference-array"
+        ]
+      ],
+      "reviewNote": "Maintain range-add lazy tags and segment sums. An alternative uses two Fenwick trees for range-add/range-sum formulas; results require a wide integer representation."
+    },
+    {
+      "source": "luogu",
+      "externalKey": "P3383",
+      "title": "【模板】线性筛素数",
+      "url": "https://www.luogu.com.cn/problem/P3383",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement; methods derived independently",
+      "validMethods": [
+        [
+          "math.number-theory.prime-sieve"
+        ]
+      ],
+      "reviewNote": "Precompute primes through n with an Euler linear sieve or an Eratosthenes sieve, then answer kth-prime queries from the ordered prime list."
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "580A",
+      "title": "Kefa and First Steps",
+      "url": "https://codeforces.com/problemset/problem/580/A",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "implementation.simulation"
+        ],
+        [
+          "dp"
+        ]
+      ],
+      "reviewNote": "Track the current nondecreasing run length, reset on a drop, and retain its maximum. This also admits a one-dimensional recurrence.",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "blogEntryId": 20468
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "580B",
+      "title": "Kefa and Company",
+      "url": "https://codeforces.com/problemset/problem/580/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "search.two-pointers",
+          "search.sliding-window",
+          "implementation.sorting"
+        ],
+        [
+          "search.binary",
+          "data-structure.prefix-sum",
+          "implementation.sorting"
+        ]
+      ],
+      "reviewNote": "Sort friends by money, keep a window whose endpoint difference is strictly below d, and maximize its friendship sum. A prefix-sum plus binary-search variant is valid. Sorting is represented in taxonomy 2026.09.2.",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "blogEntryId": 20468
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "580D",
+      "title": "Kefa and Dishes",
+      "url": "https://codeforces.com/problemset/problem/580/D",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "dp.bitmask"
+        ]
+      ],
+      "reviewNote": "Use a visited-dish mask and final dish as the DP state; append an unused dish with its base satisfaction and adjacency bonus. Only states with m selected dishes are answers.",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "blogEntryId": 20468
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "580E",
+      "title": "Kefa and Watch",
+      "url": "https://codeforces.com/problemset/problem/580/E",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "strings.hashing",
+          "data-structure.segment-tree-lazy"
+        ]
+      ],
+      "reviewNote": "A substring has period d when its prefix and suffix shifted by d agree. Maintain normalized polynomial hashes under range digit assignment using a lazy segment tree. Hash collision handling is an implementation concern.",
+      "editorialUrl": "https://codeforces.com/blog/entry/20468",
+      "blogEntryId": 20468
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "456A",
+      "title": "Laptops",
+      "url": "https://codeforces.com/problemset/problem/456/A",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "implementation.ad-hoc"
+        ],
+        [
+          "implementation.sorting"
+        ]
+      ],
+      "reviewNote": "Both prices and qualities are permutations of 1..n. If all paired values agree no inversion exists; otherwise an inversion must occur. Sorting followed by an inversion check is another valid method; sorting has a dedicated node in taxonomy 2026.09.2.",
+      "editorialUrl": "https://codeforces.com/blog/entry/13336",
+      "blogEntryId": 13336
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "456B",
+      "title": "Fedya and Maths",
+      "url": "https://codeforces.com/problemset/problem/456/B",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "math.number-theory"
+        ],
+        [
+          "math.number-theory.modular-exponentiation"
+        ]
+      ],
+      "reviewNote": "The residue of the sum of the four powers depends on the decimal exponent modulo 4; stream the digits to compute that residue. Modular exponentiation by decimal digits is an alternative. Modular exponentiation is represented in taxonomy 2026.09.2.",
+      "editorialUrl": "https://codeforces.com/blog/entry/13336",
+      "blogEntryId": 13336
+    },
+    {
+      "source": "codeforces",
+      "externalKey": "706A",
+      "title": "Beru-taxi",
+      "url": "https://codeforces.com/problemset/problem/706/A",
+      "reviewedAt": "2026-09-12",
+      "reviewBasis": "coordinator inspected official statement and independently derived valid methods before model benchmark",
+      "validMethods": [
+        [
+          "geometry",
+          "implementation.brute-force"
+        ]
+      ],
+      "reviewNote": "Compute Euclidean distance divided by speed for each available taxi, then take the minimum; no routing algorithm is needed.",
+      "editorialUrl": "https://codeforces.com/blog/entry/46510",
+      "blogEntryId": 46510
+    }
+  ]
+}

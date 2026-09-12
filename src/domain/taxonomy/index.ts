@@ -13,7 +13,9 @@ export {
   type TaxonomyNodeKind,
 } from './types.js';
 
-export { CURRENT_TAXONOMY, TAXONOMY_V1, TAXONOMY_V1_VERSION } from './v1.js';
+export { TAXONOMY_V1, TAXONOMY_V1_VERSION } from './v1.js';
+
+export { CURRENT_TAXONOMY, TAXONOMY_V2, TAXONOMY_V2_VERSION } from './v2.js';
 
 export {
   NON_ALGORITHM_TAG_RULES,
