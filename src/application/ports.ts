@@ -120,10 +120,31 @@ export interface ListSubmissionsRequest extends PageRequest {
   readonly since?: string | null;
 }
 
+/**
+ * Direct problem-detail request.
+ *
+ * Catalog/list metadata does not contain a statement, so full statements are fetched through
+ * this explicit operation. A blocked detail fetch must stay visible as an operational failure
+ * instead of being reported as a metadata-only problem.
+ */
+export interface FetchProblemRequest {
+  readonly problemRef: ProblemRef;
+  readonly token: CancellationToken;
+  readonly limits: PlatformLimits;
+}
+
 export interface FetchEditorialRequest {
   readonly problemRef: ProblemRef;
   readonly token: CancellationToken;
   readonly limits: PlatformLimits;
+  /**
+   * Optional official tutorial/editorial URL supplied by the caller (for example the
+   * attribution of a manual import).
+   *
+   * An adapter must strictly validate it against its own official origin and article shape
+   * *before* issuing any request; it never turns an arbitrary URL into a fetch target.
+   */
+  readonly officialTutorialUrl?: string | null;
 }
 
 /**
@@ -158,6 +179,8 @@ export interface PlatformAdapter {
   capabilities(): PlatformCapabilities;
   listProblems(request: ListProblemsRequest): Promise<Page<NormalizedProblem>>;
   listSubmissions(request: ListSubmissionsRequest): Promise<Page<Submission>>;
+  /** Fetch one problem's full detail, including its statement when the platform has one. */
+  fetchProblem(request: FetchProblemRequest): Promise<NormalizedProblem>;
   fetchEditorial(request: FetchEditorialRequest): Promise<EditorialFetchResult>;
 }
 

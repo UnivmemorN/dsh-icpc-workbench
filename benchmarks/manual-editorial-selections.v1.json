@@ -1,0 +1,71 @@
+{
+  "status": "prepared-before-model-evaluation",
+  "note": "Coordinator-selected boundaries in verified public editorial bodies. This supplemental manual extraction is benchmark preparation, not evidence of automatic adapter coverage. No expected tags are included in model inputs.",
+  "selections": [
+    {
+      "problem": "86D",
+      "blogEntryId": 2028,
+      "start": {
+        "tag": "b",
+        "text": "D. Powerful array."
+      },
+      "end": {
+        "tag": "b",
+        "text": "E. Long sequence."
+      },
+      "basis": "Problem-specific title in multi-problem Yandex Round 2 editorial."
+    },
+    {
+      "problem": "126B",
+      "blogEntryId": 3140,
+      "start": {
+        "tag": "b",
+        "text": "div2 D. div1 B."
+      },
+      "end": {
+        "tag": "b",
+        "text": "div2 E. div1 C."
+      },
+      "basis": "Coordinator verified contest126 Div1B corresponds to the paired Div2D/Div1B section; not inferred by the automatic adapter."
+    },
+    {
+      "problem": "706A",
+      "blogEntryId": 46510,
+      "start": {
+        "tag": "h2",
+        "text": "A"
+      },
+      "end": {
+        "tag": "h2",
+        "text": "B"
+      },
+      "basis": "Verified Round367 tutorial; explicit section selection by coordinator."
+    },
+    {
+      "problem": "706B",
+      "blogEntryId": 46510,
+      "start": {
+        "tag": "h2",
+        "text": "B"
+      },
+      "end": {
+        "tag": "h2",
+        "text": "C"
+      },
+      "basis": "Verified Round367 tutorial; explicit section selection by coordinator."
+    },
+    {
+      "problem": "295B",
+      "blogEntryId": 7329,
+      "start": {
+        "tag": "a",
+        "href": "/contest/295/problem/B"
+      },
+      "end": {
+        "tag": "a",
+        "href": "/contest/295/problem/C"
+      },
+      "basis": "Malformed legacy markup has all problem sections inside one paragraph; exact adjacent problem anchors delimit the requested section."
+    }
+  ]
+}
