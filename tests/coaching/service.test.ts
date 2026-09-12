@@ -1176,3 +1176,70 @@ void test('malformed asks and history reads are refused with a stable code and n
     await bench.close();
   }
 });
+
+void test('a supplied settings revision needs a stored record: missing or mismatched refuses before any reservation', async () => {
+  const bench = new Bench();
+  const world = makeWorld();
+  try {
+    await seed(bench, world);
+
+    // No stored record: a supplied revision cannot be the stored one, so nothing is reserved.
+    const missing = unanswered(
+      await bench.service.ask(askRequest(world, { requestId: 'guard-missing', expectedSettingsRevision: 1 }), TOKEN),
+    );
+    assert.equal(missing.status, 'refused');
+    assert.equal(missing.error.code, 'settings_changed');
+    assert.equal(missing.error.retryable, true);
+    assert.equal(missing.attemptId, null);
+    assert.equal(await bench.store.getCoachingAttempt('guard-missing'), null);
+    assert.equal(bench.calls.length, 0);
+
+    // An omitted revision keeps the legacy behaviour for direct callers that never stored settings.
+    assert.equal(answered(await bench.service.ask(askRequest(world, { requestId: 'legacy-1' }), TOKEN)).text, HINT_1);
+    assert.equal(bench.calls.length, 1);
+
+    assert.equal(await bench.store.saveWorkbenchSettings(defaultWorkbenchSettings(), null), 1);
+    const mismatch = unanswered(
+      await bench.service.ask(
+        askRequest(world, { requestId: 'guard-mismatch', level: 2, expectedSettingsRevision: 7 }),
+        TOKEN,
+      ),
+    );
+    assert.equal(mismatch.error.code, 'settings_changed');
+    assert.equal(await bench.store.getCoachingAttempt('guard-mismatch'), null);
+    assert.equal(bench.calls.length, 1);
+
+    // A revision that matches the stored record still reserves and dispatches normally.
+    assert.equal(
+      answered(
+        await bench.service.ask(
+          askRequest(world, { requestId: 'guard-ok', level: 2, expectedSettingsRevision: 1 }),
+          TOKEN,
+        ),
+      ).text,
+      HINT_1,
+    );
+    assert.equal(bench.calls.length, 2);
+
+    // A durable request id still replays for free after the configuration changed.
+    assert.equal(
+      answered(
+        await bench.service.ask(askRequest(world, { requestId: 'legacy-1', expectedSettingsRevision: 7 }), TOKEN),
+      ).text,
+      HINT_1,
+    );
+    assert.equal(bench.calls.length, 2);
+
+    // An undeclared ask member is refused, never ignored.
+    await assert.rejects(
+      bench.service.ask(
+        { ...askRequest(world, { requestId: 'strict-1' }), typo: true } as unknown as CoachingAskRequest,
+        TOKEN,
+      ),
+      invalidRequest,
+    );
+    assert.equal(await bench.store.getCoachingAttempt('strict-1'), null);
+  } finally {
+    await bench.close();
+  }
+});

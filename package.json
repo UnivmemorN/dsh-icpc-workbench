@@ -5,14 +5,14 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=22.19.0"
+    "node": "^22.19.0 || >=24.0.0"
   },
-  "main": "./dist/domain/index.js",
-  "types": "./dist/domain/index.d.ts",
+  "main": "./dist/plugin/index.js",
+  "types": "./dist/plugin/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/domain/index.d.ts",
-      "default": "./dist/domain/index.js"
+      "types": "./dist/plugin/index.d.ts",
+      "default": "./dist/plugin/index.js"
     },
     "./domain": {
       "types": "./dist/domain/index.d.ts",
@@ -21,14 +21,16 @@
     "./application/ports": {
       "types": "./dist/application/ports.d.ts",
       "default": "./dist/application/ports.js"
-    }
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
     "dist",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
-    "licenses"
+    "licenses",
+    "cordis.patch.yml"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
@@ -59,5 +61,16 @@
     "domhandler": "6.0.1",
     "domutils": "4.0.2",
     "htmlparser2": "12.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-llm": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-session": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-client-connection": "0.1.5-rc.2"
   }
 }

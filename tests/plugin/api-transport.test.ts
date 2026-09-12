@@ -184,7 +184,7 @@ async function withoutUnhandledRejections(work: () => Promise<void>): Promise<vo
 // Registration
 // ---------------------------------------------------------------------------------------
 
-void test('a route registers the exact path, one method and the streaming body mode', () => {
+void test('GET registers a buffered body mode compatible with the host bridge', () => {
   const h = harness({ method: 'GET' });
 
   assert.equal(h.routes.length, 1);
@@ -192,7 +192,8 @@ void test('a route registers the exact path, one method and the streaming body m
   assert.ok(route);
   assert.equal(route.path, `${API_PREFIX}test.run`);
   assert.deepEqual(route.methods, ['GET']);
-  assert.equal(route.requestBody, 'streaming');
+  assert.equal(route.requestBody, 'buffered');
+  assert.equal(harness({ method: 'POST' }).routes[0]?.requestBody, 'streaming');
   assert.equal(typeof route.fetch, 'function');
 });
 

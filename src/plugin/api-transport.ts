@@ -32,6 +32,7 @@ export const MAX_OPERATION_LENGTH = 128;
 
 /** Stable failure codes of the transport envelope. */
 export type ApiErrorCode =
+  | 'settings_changed' | 'model_busy' | 'model_invalid'
   | 'invalid_input'
   | 'not_found'
   | 'conflict'
@@ -43,6 +44,7 @@ export type ApiErrorCode =
 
 /** HTTP status of each stable failure code. */
 export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
+  settings_changed: 409, model_busy: 409, model_invalid: 409,
   invalid_input: 400,
   not_found: 404,
   conflict: 409,
@@ -55,6 +57,9 @@ export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
 
 /** Fixed message of each code, used whenever a typed error supplies none. */
 const DEFAULT_ERROR_MESSAGES: Readonly<Record<ApiErrorCode, string>> = {
+  settings_changed: 'settings changed; reload before starting',
+  model_busy: 'another model operation is active',
+  model_invalid: 'the configured model is unavailable or unsupported',
   invalid_input: 'the request is invalid',
   not_found: 'the requested resource does not exist',
   conflict: 'the request conflicts with the current state',
@@ -187,7 +192,8 @@ export function registerApiRoute<T, R>(
   const route: ConnectionFetchRoute = {
     path: `${API_PREFIX}${operation}`,
     methods: [method],
-    requestBody: 'streaming',
+    // The pinned host bridge attaches a body to streaming routes; WHATWG GET forbids it.
+    requestBody: method === 'GET' ? 'buffered' : 'streaming',
     fetch: (request) =>
       serve(prepared, request).catch((error: unknown) => {
         // The last containment barrier: even a failure outside the handler path answers with the

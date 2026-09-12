@@ -1,3 +1,5 @@
+import type * as Bootstrap from './bootstrap-types.js';
+import type * as Model from './model-operation-types.js';
 /**
  * Business-API contract of the workbench (Stage 4h1): **types only**, shared by the browser half
  * and the plugin half.
@@ -494,6 +496,22 @@ export type ApiPlanCheckoffResult = WorkbenchPlanView;
  * its handler; an operation that is not here has no route at all.
  */
 export interface WorkbenchApiMap {
+  bootstrap: ApiEndpoint<Record<string,never>, Bootstrap.BootstrapResult>;
+  'model.catalog': ApiEndpoint<{readonly provider:string}, Bootstrap.ModelCatalogResult>;
+  backup: ApiEndpoint<Record<string,never>, Bootstrap.BackupResult>;
+  'batch.prepare': ApiEndpoint<Model.ModelBatchPrepareRequest, Model.ModelBatchPrepareResult>;
+  'batch.run': ApiEndpoint<Model.ModelBatchRunRequest, Model.ModelBatchStartResult>;
+  'batch.resume': ApiEndpoint<Model.ModelBatchResumeRequest, Model.ModelBatchStartResult>;
+  'batch.pause': ApiEndpoint<Model.ModelBatchIdRequest, Model.ModelBatchControlResult>;
+  'batch.cancel': ApiEndpoint<Model.ModelBatchIdRequest, Model.ModelBatchControlResult>;
+  'batch.recover': ApiEndpoint<Model.ModelBatchRecoverRequest, Model.ModelBatchRecoverResult>;
+  'batch.detail': ApiEndpoint<Model.ModelBatchIdRequest, Model.ModelBatchDetailResult>;
+  'batch.list': ApiEndpoint<Model.ModelBatchListRequest, Model.ModelBatchListResult>;
+  'coaching.ask': ApiEndpoint<Model.ModelCoachingAskRequest, Model.ModelCoachingAskResult>;
+  'coaching.status': ApiEndpoint<Model.ModelCoachingStatusRequest, Model.ModelCoachingStatusResult>;
+  'coaching.history': ApiEndpoint<Model.ModelCoachingHistoryRequest, Model.ModelCoachingHistoryResult>;
+  'coaching.cancel': ApiEndpoint<Model.ModelCoachingCancelRequest, Model.ModelCoachingCancelResult>;
+  'settings.save': ApiEndpoint<Model.ModelSettingsSaveRequest, Model.ModelSettingsSaveResult>;
   'account.create': ApiEndpoint<ApiAccountCreateRequest, ApiAccountCreateResult>;
   'sync.page': ApiEndpoint<ApiSyncPageRequest, ApiSyncPageResult>;
   'import.preview': ApiEndpoint<ApiImportRequest, ApiImportPreviewResult>;
