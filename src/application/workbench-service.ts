@@ -75,7 +75,7 @@ import {
   type TrainingTaskKind,
 } from '../domain/index.js';
 import { currentDecisionPerTag } from '../domain/tags.js';
-import type { TrainingStore } from './ports.js';
+import { BROWSE_PAGE_LIMITS, PROBLEM_SOLVED_FILTERS, type ProblemSolvedFilter, type TrainingStore } from './ports.js';
 import { STORAGE_PAGE_LIMITS } from './storage-types.js';
 import type {
   WorkbenchAnalysisView,
@@ -91,6 +91,7 @@ import type {
   WorkbenchPlanTaskPatch,
   WorkbenchPlanTaskView,
   WorkbenchPlanView,
+  WorkbenchProblemBrowsePage,
   WorkbenchProblemDetail,
   WorkbenchProblemPage,
   WorkbenchProblemSummary,
@@ -116,6 +117,9 @@ export const MAX_ACCOUNT_SUBMISSIONS = 50_000;
 
 /** Maximum accepted `query` length; longer input is rejected instead of being truncated. */
 export const MAX_PROBLEM_QUERY_CHARS = 200;
+
+/** Maximum page size of one numbered bank page (`browseProblems`); the UI offers 25/50/100. */
+export const MAX_BROWSE_PAGE_SIZE = BROWSE_PAGE_LIMITS.maxPageSize;
 
 /** Maximum accepted review note length. */
 export const MAX_REVIEW_NOTE_CHARS = 2000;
@@ -185,6 +189,31 @@ export interface WorkbenchListRequest {
   readonly reveal?: boolean;
   /** Keep only problems with an unresolved item at the current snapshot head. */
   readonly needsReviewOnly?: boolean;
+}
+
+/**
+ * Numbered bank page request (`browseProblems`).
+ *
+ * `status` and `onlyAttempted` are solved filters relative to `accountId` and are refused without
+ * one; `page` is the 1-based page number that replaces the cursor contract of
+ * {@link WorkbenchListRequest} for this operation.
+ */
+export interface WorkbenchBrowseRequest {
+  readonly sourceInstanceId?: string | null;
+  readonly accountId?: string | null;
+  /** Solved-state filter relative to the selected account; omitted/`null` means `all`. */
+  readonly status?: ProblemSolvedFilter | null;
+  /** Restrict the bank to problems this account submitted to; requires an explicit account. */
+  readonly onlyAttempted?: boolean;
+  /** Literal case-insensitive substring over title and external key, across the whole bank. */
+  readonly query?: string | null;
+  readonly reveal?: boolean;
+  /** Keep only problems with an unresolved item at the current snapshot head. */
+  readonly needsReviewOnly?: boolean;
+  /** 1-based page number. */
+  readonly page: number;
+  /** Page size within `1..MAX_BROWSE_PAGE_SIZE`. */
+  readonly limit: number;
 }
 
 export interface WorkbenchGetProblemRequest {
@@ -277,6 +306,19 @@ interface ListFilters {
   readonly reveal: boolean;
   readonly limit: number;
   readonly cursor: string | null;
+}
+
+/** Normalized numbered-page filter set; `status` is always resolved to a concrete filter. */
+interface BrowseFilters {
+  readonly sourceInstanceId: string | null;
+  readonly accountId: string | null;
+  readonly status: ProblemSolvedFilter;
+  readonly onlyAttempted: boolean;
+  readonly query: string | null;
+  readonly needsReviewOnly: boolean;
+  readonly reveal: boolean;
+  readonly page: number;
+  readonly limit: number;
 }
 
 /**
@@ -376,6 +418,91 @@ export class WorkbenchService {
       reveal: filters.reveal,
       pendingReviewOnly: filters.needsReviewOnly,
       fetchedAt: stored.fetchedAt,
+    };
+  }
+
+  // -------------------------------------------------------------------------------------
+  // browseProblems
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * One numbered page of the problem bank, with the totals of exactly this filter set.
+   *
+   * This is the paging contract the bank UI uses: the store counts the filtered unique problems and
+   * selects one `LIMIT/OFFSET` page inside the SAME transaction, so `totalItems`/`totalPages` can
+   * never describe a different query than `items`, and no page is assembled by filtering a previous
+   * one in the client. `status` and `onlyAttempted` are relative to the selected account and are
+   * refused without one; `status: 'unconfirmed'` means "this account has no accepted submission",
+   * which includes problems never attempted, while `onlyAttempted` stays an independent
+   * intersection. Solved status is decided by SQL against this account's own accepted submissions
+   * for the problem's full stored identity, and only when the account's stored source instance
+   * matches the problem's, so another account, source instance or domain can never mark a row
+   * solved. The store-reported verdict is re-checked here: a claim made without an account or for a
+   * foreign source instance is refused, so a hostile port cannot reveal spoilers. Withheld spoiler
+   * material stays absent unless a row is solved or `reveal` is
+   * explicit, exactly like {@link WorkbenchService.listProblems}.
+   */
+  async browseProblems(request: WorkbenchBrowseRequest, token: CancellationToken): Promise<WorkbenchProblemBrowsePage> {
+    requireToken(token);
+    token.throwIfCancelled();
+    const filters = parseBrowseRequest(request);
+    // Count, selected page and projection share ONE store transaction: the totals and the rows they
+    // describe are a single serialized read, so a concurrent write can never pair a fresh count with
+    // a stale page (or the reverse) inside the same response.
+    const stored = await this.store.transaction(async () => {
+      token.throwIfCancelled();
+      const account = filters.accountId === null ? null : await this.requireAccount(filters.accountId, token);
+      if (account !== null && filters.sourceInstanceId !== null && account.sourceInstanceId !== filters.sourceInstanceId) {
+        throw sourceMismatch(account, filters.sourceInstanceId);
+      }
+      // Both filters are statements about one account's own submission history; without an account
+      // neither has an answer, so they are refused instead of being silently dropped.
+      invariant(
+        !filters.onlyAttempted || account !== null,
+        'invalid_input',
+        'onlyAttempted needs an explicit account id; there is no account whose attempts could be listed',
+        { reason: 'only_attempted_without_account' },
+      );
+      invariant(
+        filters.status === 'all' || account !== null,
+        'invalid_input',
+        'a solved-state filter needs an explicit account id; solved status is relative to one account',
+        { reason: 'status_without_account', status: filters.status },
+      );
+      const page = await this.store.browseProblems({
+        sourceInstanceId: filters.sourceInstanceId,
+        accountId: account === null ? null : account.id,
+        status: filters.status,
+        onlyAttempted: filters.onlyAttempted,
+        query: filters.query,
+        needsReviewOnly: filters.needsReviewOnly,
+        page: filters.page,
+        limit: filters.limit,
+      });
+      token.throwIfCancelled();
+      const items: WorkbenchProblemSummary[] = [];
+      for (const row of page.items) {
+        assertBrowsedProblemCoherent(row.problem, filters.sourceInstanceId);
+        assertSolvedProjectionCoherent(row.problem, row.solvedByAccount, account);
+        const visible = row.solvedByAccount || filters.reveal;
+        items.push(
+          await this.projectSummary(row.problem, row.solvedByAccount, visible, filters.needsReviewOnly, token),
+        );
+      }
+      return {
+        items,
+        page: page.page,
+        pageSize: page.pageSize,
+        totalItems: page.totalItems,
+        totalPages: page.totalPages,
+        fetchedAt: page.fetchedAt,
+      };
+    });
+    return {
+      pageId: this.mintId(),
+      ...stored,
+      reveal: filters.reveal,
+      pendingReviewOnly: filters.needsReviewOnly,
     };
   }
 
@@ -1417,6 +1544,137 @@ function parseListRequest(request: WorkbenchListRequest): ListFilters {
     limit: requirePageLimit(request.limit),
     cursor: optionalCursor(request.cursor),
   };
+}
+
+/**
+ * One numbered bank page request; every member is validated here, never coerced.
+ *
+ * `page`/`limit` are required (a page number is the whole point of this operation), `status` is
+ * resolved to a concrete filter, and the same literal search term as `listProblems` is reused so
+ * both bank operations cannot drift apart.
+ */
+function parseBrowseRequest(request: WorkbenchBrowseRequest): BrowseFilters {
+  invariant(request !== null && typeof request === 'object', 'invalid_input', 'browseProblems needs a request object', {});
+  return {
+    sourceInstanceId: optionalId('sourceInstanceId', request.sourceInstanceId),
+    accountId: optionalId('accountId', request.accountId),
+    status: requireSolvedFilter(request.status),
+    onlyAttempted: optionalFlag('onlyAttempted', request.onlyAttempted),
+    query: normalizeProblemQuery(request.query),
+    needsReviewOnly: optionalFlag('needsReviewOnly', request.needsReviewOnly),
+    reveal: optionalFlag('reveal', request.reveal),
+    page: requireBrowsePage(request.page),
+    limit: requireBrowseLimit(request.limit),
+  };
+}
+
+/** Solved-state filter: omitted/`null` means `all`; an unknown value is refused, never coerced. */
+function requireSolvedFilter(value: ProblemSolvedFilter | null | undefined): ProblemSolvedFilter {
+  if (value === undefined || value === null) {
+    return 'all';
+  }
+  invariant(
+    PROBLEM_SOLVED_FILTERS.includes(value),
+    'invalid_input',
+    `status must be one of: ${PROBLEM_SOLVED_FILTERS.join(', ')}`,
+    { status: value },
+  );
+  return value;
+}
+
+/**
+ * 1-based page number.
+ *
+ * There is deliberately no upper bound: an out-of-range page is clamped to the last valid page by
+ * the store, so refusing a large number would reject a request the contract defines as legal.
+ */
+function requireBrowsePage(value: number): number {
+  invariant(Number.isInteger(value) && value >= 1, 'invalid_input', 'page must be an integer >= 1', { page: value });
+  return value;
+}
+
+/** Page size of one numbered bank page: any integer within `1..MAX_BROWSE_PAGE_SIZE`. */
+function requireBrowseLimit(value: number): number {
+  invariant(
+    Number.isInteger(value) && value >= 1 && value <= MAX_BROWSE_PAGE_SIZE,
+    'invalid_input',
+    `page limit must be an integer within 1..${MAX_BROWSE_PAGE_SIZE}`,
+    { limit: value },
+  );
+  return value;
+}
+
+/**
+ * Prove one browsed row is a coherent bank row of the requested scope.
+ *
+ * The row's own canonical key is re-derived from its reference, so a store that returned a body
+ * whose key no longer matches its identity is refused instead of being projected under a borrowed
+ * key; and a row of another source instance is refused instead of being counted for this page
+ * (a silently different bank would describe a different query than the totals beside it).
+ */
+function assertBrowsedProblemCoherent(problem: NormalizedProblem, sourceInstanceId: string | null): void {
+  const canonical = canonicalKeyOfStoredRef(`browsed problem ${problem.key}`, problem.ref, {
+    reason: 'problem_key_mismatch',
+    problemKey: problem.key,
+  });
+  invariant(
+    canonical === problem.key,
+    'invalid_input',
+    `browsed problem ${problem.key} does not match its own reference ${canonical}`,
+    { reason: 'problem_key_mismatch', problemKey: problem.key, canonicalKey: canonical },
+  );
+  if (sourceInstanceId === null) {
+    return;
+  }
+  invariant(
+    problem.ref.sourceInstanceId === sourceInstanceId,
+    'invalid_input',
+    `stored problem ${problem.key} belongs to ${problem.ref.sourceInstanceId}, not to ${sourceInstanceId}`,
+    {
+      reason: 'problem_source_mismatch',
+      problemKey: problem.key,
+      sourceInstanceId,
+      rowSource: problem.ref.sourceInstanceId,
+    },
+  );
+}
+
+/**
+ * Prove a store-reported solve can only belong to the account that asked for it.
+ *
+ * Solved status is answered by the store port, but it authorises withheld spoiler material here, so
+ * a broken or hostile implementation must not be able to claim it for an anonymous request or for a
+ * problem of another source instance. Such a claim is refused instead of being projected (and never
+ * silently downgraded): producing no result is honest, while revealing a spoiler on an unverifiable
+ * claim is not. A legitimate solve of the same source instance, including another domain of it, is
+ * untouched.
+ */
+function assertSolvedProjectionCoherent(
+  problem: NormalizedProblem,
+  solvedByAccount: boolean,
+  account: Account | null,
+): void {
+  if (!solvedByAccount) {
+    return;
+  }
+  invariant(
+    account !== null,
+    'invalid_input',
+    `browsed problem ${problem.key} is reported solved without an account context`,
+    { reason: 'solved_projection_without_account', problemKey: problem.key },
+  );
+  invariant(
+    problem.ref.sourceInstanceId === account.sourceInstanceId,
+    'invalid_input',
+    `browsed problem ${problem.key} belongs to ${problem.ref.sourceInstanceId}, not to account ${account.id} of ${account.sourceInstanceId}`,
+    {
+      reason: 'solved_projection_foreign_source',
+      problemKey: problem.key,
+      accountId: account.id,
+      rowSource: problem.ref.sourceInstanceId,
+      accountSource: account.sourceInstanceId,
+    },
+  );
 }
 
 /** Optional opaque id: omitted/`null` means "no scope", a non-empty string is passed through. */

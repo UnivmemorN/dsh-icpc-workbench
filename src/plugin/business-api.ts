@@ -98,6 +98,7 @@ import {
   validatePlanEdit,
   validatePlanList,
   validatePlanPreview,
+  validateProblemBrowse,
   validateProblemDetail,
   validateProblemList,
   validateRetroRecord,
@@ -429,6 +430,11 @@ function businessRoutes(context: ApiContext): readonly BusinessRouteEntry[] {
       method: 'POST',
       validate: validateProblemList,
       handle: async (input, token) => context.workbench.listProblems(input, token),
+    }),
+    businessRoute(WORKBENCH_API_OPERATIONS.problemBrowse, {
+      method: 'POST',
+      validate: validateProblemBrowse,
+      handle: async (input, token) => context.workbench.browseProblems(input, token),
     }),
     businessRoute(WORKBENCH_API_OPERATIONS.problemDetail, {
       method: 'POST',

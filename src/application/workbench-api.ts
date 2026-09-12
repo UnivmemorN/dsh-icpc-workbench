@@ -34,6 +34,7 @@ import type {
 import type { PlatformErrorCode } from './platform-errors.js';
 import type { SyncResource } from './storage-types.js';
 import type {
+  WorkbenchBrowseRequest,
   WorkbenchCheckOffTaskRequest,
   WorkbenchEditPlanTaskRequest,
   WorkbenchGetPlanRequest,
@@ -50,6 +51,7 @@ import type {
   WorkbenchPlanListResult,
   WorkbenchPlanPreviewResult,
   WorkbenchPlanView,
+  WorkbenchProblemBrowsePage,
   WorkbenchProblemDetail,
   WorkbenchProblemPage,
   WorkbenchRetrospectiveResult,
@@ -108,6 +110,7 @@ export const WORKBENCH_API_OPERATIONS = {
   materialRefresh: 'material.refresh',
   materialSupplement: 'material.supplement',
   problemList: 'problem.list',
+  problemBrowse: 'problem.browse',
   problemDetail: 'problem.detail',
   reviewTag: 'review.tag',
   retroRecord: 'retro.record',
@@ -453,6 +456,16 @@ export interface ApiMaterialSupplementResult {
 export type ApiProblemListRequest = ApiRequestOf<WorkbenchListRequest>;
 export type ApiProblemListResult = WorkbenchProblemPage;
 
+/**
+ * Numbered bank page request; `problem.list` keeps its cursor contract unchanged.
+ *
+ * `page` is 1-based and `limit` a page size within 1..100 (the UI offers 25/50/100). `status` and
+ * `onlyAttempted` are solved filters relative to `accountId` and are refused without one; there is
+ * deliberately no `cursor` field on this operation.
+ */
+export type ApiProblemBrowseRequest = ApiRequestOf<WorkbenchBrowseRequest>;
+export type ApiProblemBrowseResult = WorkbenchProblemBrowsePage;
+
 /** Problem detail request; `reveal` and `accountId` are the service's own spoiler context. */
 export type ApiProblemDetailRequest = ApiRequestOf<WorkbenchGetProblemRequest>;
 export type ApiProblemDetailResult = WorkbenchProblemDetail;
@@ -519,6 +532,7 @@ export interface WorkbenchApiMap {
   'material.refresh': ApiEndpoint<ApiMaterialRefreshRequest, ApiMaterialRefreshResult>;
   'material.supplement': ApiEndpoint<ApiMaterialSupplementRequest, ApiMaterialSupplementResult>;
   'problem.list': ApiEndpoint<ApiProblemListRequest, ApiProblemListResult>;
+  'problem.browse': ApiEndpoint<ApiProblemBrowseRequest, ApiProblemBrowseResult>;
   'problem.detail': ApiEndpoint<ApiProblemDetailRequest, ApiProblemDetailResult>;
   'review.tag': ApiEndpoint<ApiReviewTagRequest, ApiReviewTagResult>;
   'retro.record': ApiEndpoint<ApiRetroRecordRequest, ApiRetroRecordResult>;

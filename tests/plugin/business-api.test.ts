@@ -814,6 +814,55 @@ void test('bank, review, retrospective, weakness and plan operations delegate th
   });
 });
 
+void test('problem.browse pages by number, refuses a cursor and rejects anonymous solved filters', async () => {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1234A');
+  await withBench({ sources: [{ instance: scope.instance }] }, async (bench) => {
+    await seedScope(bench.store, scope);
+    // A solved match whose key sorts after the first page proves count/filter/page run in SQL.
+    const later = fx.makeProblem(fx.makeRef(scope.instance, '9999Z'));
+    await bench.store.upsertProblems([later]);
+    await bench.store.upsertSubmissions([fx.makeSubmission(scope.account, later.ref, '9002', 'accepted', AT)]);
+
+    assert.equal(WORKBENCH_API_OPERATIONS.problemBrowse, 'problem.browse');
+
+    const solved = await ok(bench, 'problem.browse', {
+      sourceInstanceId: scope.instance.id,
+      accountId: scope.account.id,
+      status: 'solved',
+      page: 1,
+      limit: 25,
+    });
+    assert.equal(solved.totalItems, 1);
+    assert.equal(solved.totalPages, 1);
+    assert.equal(solved.page, 1);
+    assert.equal(solved.pageSize, 25);
+    assert.equal(Object.hasOwn(solved, 'nextCursor'), false, 'the numbered contract has no cursor');
+    assert.deepEqual(
+      solved.items.map((item: { problemKey: string }) => item.problemKey),
+      [later.key],
+    );
+    assert.equal(solved.items[0].solvedByAccount, true);
+
+    const hidden = await ok(bench, 'problem.browse', { sourceInstanceId: scope.instance.id, page: 1, limit: 25 });
+    assert.equal(hidden.totalItems, 2);
+    assert.equal(Object.hasOwn(hidden.items[0], 'rawTags'), false);
+    assert.equal(Object.hasOwn(hidden.items[0], 'effectiveTaxonomyIds'), false);
+
+    const cases: readonly unknown[] = [
+      { page: 1, limit: 25, cursor: null },
+      { page: 1, limit: 25, status: 'solved' },
+      { page: 1, limit: 25, onlyAttempted: true },
+      { page: 0, limit: 25 },
+      { page: 1, limit: 101 },
+      { page: 1, limit: 25, status: 'all', unknown: true },
+    ];
+    for (const body of cases) {
+      const parsed = await refused(bench, 'problem.browse', body, 400);
+      assert.equal(failureOf(parsed).code, 'invalid_input', `${JSON.stringify(body)} must be refused`);
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------------------
 // Strict boundary and unexpected failures
 // ---------------------------------------------------------------------------------------

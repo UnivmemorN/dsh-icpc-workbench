@@ -373,6 +373,67 @@ export interface ProblemQuery {
 }
 
 /**
+ * Solved-state filter of one numbered bank page, relative to the selected account.
+ *
+ * `solved` means "this account has at least one accepted submission for the problem"; `unconfirmed`
+ * means exactly the negation — a problem never attempted and one attempted without an accepted
+ * submission are the same statement. A later wrong answer never revokes an earlier AC, duplicate
+ * submissions still count one problem, and another account, source instance or domain can never
+ * confer solved status — an implementation must additionally require the account's own stored source
+ * instance to match the problem's, so an incoherent stored row cannot confer one either. `all` (the
+ * default) imposes no solved filter at all.
+ */
+export type ProblemSolvedFilter = 'all' | 'solved' | 'unconfirmed';
+
+/** Accepted solved-state filters, in the order the bank UI presents them. */
+export const PROBLEM_SOLVED_FILTERS: readonly ProblemSolvedFilter[] = ['all', 'solved', 'unconfirmed'];
+
+/** Legal page sizes of {@link ProblemBrowseQuery.limit}: any integer within `min..max`. */
+export const BROWSE_PAGE_LIMITS = { minPageSize: 1, maxPageSize: 100 } as const;
+
+/**
+ * One numbered page of the bank: page number and size instead of a cursor.
+ *
+ * Every predicate is applied in SQL before both the count and the selected page, so `items` and the
+ * totals always describe the same filter set. `status` and `onlyAttempted` are statements about the
+ * selected account's own submissions and are refused without one.
+ */
+export interface ProblemBrowseQuery {
+  readonly sourceInstanceId?: string | null;
+  /** Solved context and the scope of `status`/`onlyAttempted`; both need an explicit account. */
+  readonly accountId?: string | null;
+  readonly status?: ProblemSolvedFilter | null;
+  readonly onlyAttempted?: boolean | null;
+  /** Literal case-insensitive substring over title and external key, as in {@link ProblemQuery}. */
+  readonly query?: string | null;
+  readonly needsReviewOnly?: boolean | null;
+  /** 1-based page number; a page beyond the last match is clamped to the last valid page. */
+  readonly page: number;
+  readonly limit: number;
+}
+
+/** One bank row plus the requested account's solved verdict, decided in SQL. */
+export interface BrowsedProblem {
+  readonly problem: NormalizedProblem;
+  /**
+   * True when this account has an accepted submission for the problem's full stored identity and
+   * the account's own stored source instance matches the problem's.
+   */
+  readonly solvedByAccount: boolean;
+}
+
+/** One numbered bank page plus the totals of exactly the same filter set. */
+export interface ProblemBrowsePage {
+  readonly items: readonly BrowsedProblem[];
+  /** Page actually returned: `1` when nothing matched, otherwise within `1..totalPages`. */
+  readonly page: number;
+  readonly pageSize: number;
+  readonly totalItems: number;
+  readonly totalPages: number;
+  readonly fetchedAt: string;
+}
+
+/**
  * Persistence port.
  *
  * Implemented by the SQLite adapter (`adapters/sqlite`). Declared here so Stage 1 code,
@@ -405,6 +466,16 @@ export interface TrainingStore {
   // Problems & submissions
   upsertProblems(problems: readonly NormalizedProblem[]): Promise<void>;
   listProblems(query: ProblemQuery): Promise<Page<NormalizedProblem>>;
+  /**
+   * One numbered page of the bank, with the filtered total and the account's solved verdict.
+   *
+   * This is not cursor paging: the implementation counts the filtered unique problems and selects
+   * exactly one `LIMIT/OFFSET` page in the SAME read, deciding `solvedByAccount` in SQL against the
+   * indexed submissions, so no submission history is walked and no page is filtered by the caller.
+   * A page beyond the last match is clamped to the last valid page (and to `1` when the filter
+   * matched nothing) instead of answering with an empty out-of-range page.
+   */
+  browseProblems(query: ProblemBrowseQuery): Promise<ProblemBrowsePage>;
   /**
    * One problem by its canonical key, without a scan.
    *

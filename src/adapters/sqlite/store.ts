@@ -64,7 +64,18 @@ import {
   type TagDecision,
   type TrainingPlan,
 } from '../../domain/index.js';
-import type { Page, PageRequest, ProblemQuery, StoreCapabilities, TrainingStore } from '../../application/ports.js';
+import {
+  BROWSE_PAGE_LIMITS,
+  PROBLEM_SOLVED_FILTERS,
+  type Page,
+  type PageRequest,
+  type ProblemBrowsePage,
+  type ProblemBrowseQuery,
+  type ProblemQuery,
+  type ProblemSolvedFilter,
+  type StoreCapabilities,
+  type TrainingStore,
+} from '../../application/ports.js';
 import {
   validateWorkbenchSettings,
   type SettingsStore,
@@ -597,6 +608,103 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
         nextCursor: rows.length > limit && last !== undefined ? encodeCursor('problem', last.key) : null,
         fetchedAt: this.clock(),
       };
+    });
+  }
+
+  /**
+   * One numbered page of the filtered bank, with the total of the SAME predicate set.
+   *
+   * The `COUNT(*)` and the `LIMIT/OFFSET` selection run in one serialized read, so `totalItems` can
+   * never describe a different query than `items`. Solved status is decided per row by an indexed
+   * `EXISTS` over `submissions_by_problem`, scoped to the account, to the account's own stored source
+   * instance AND to the problem's full stored identity (canonical key plus source instance, domain
+   * and external key), so a submission that is foreign to the problem's instance — or an incoherent
+   * stored row that borrows this account id for another instance — can never confer a solve; no
+   * submission history is walked, so the legacy 50k-row history cap does not
+   * apply here. A page beyond the last match is clamped to the last valid page, and an empty filter
+   * set reports `page: 1` with `totalPages: 0`.
+   */
+  async browseProblems(query: ProblemBrowseQuery): Promise<ProblemBrowsePage> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const limit = browsePageLimit(query.limit);
+      const requestedPage = browsePageNumber(query.page);
+      const accountId = browseAccountId(query.accountId);
+      const status = browseStatus(query.status);
+      const onlyAttempted = browseAttemptedFlag(query.onlyAttempted);
+      // Both predicates are answered from one account's own submissions; without an account they
+      // have no meaning, so the adapter refuses them instead of quietly dropping the filter.
+      invariant(
+        status === 'all' || accountId !== null,
+        'invalid_input',
+        'a solved-state filter needs an explicit account id',
+        { status },
+      );
+      invariant(
+        !onlyAttempted || accountId !== null,
+        'invalid_input',
+        'an attempt filter needs an explicit account id',
+        {},
+      );
+      const filters: string[] = [];
+      const params: SqlValue[] = [];
+      if (query.sourceInstanceId !== undefined && query.sourceInstanceId !== null) {
+        filters.push('problems.source_instance_id = ?');
+        params.push(requireId('source instance id', query.sourceInstanceId));
+      }
+      if (accountId !== null) {
+        if (status === 'solved') {
+          filters.push(ACCEPTED_SUBMISSION_EXISTS);
+          params.push(accountId);
+        } else if (status === 'unconfirmed') {
+          filters.push(`NOT ${ACCEPTED_SUBMISSION_EXISTS}`);
+          params.push(accountId);
+        }
+        if (onlyAttempted) {
+          filters.push(ATTEMPTED_SUBMISSION_EXISTS);
+          params.push(accountId);
+        }
+      }
+      const search = problemSearchTerm(query.query);
+      if (search !== null) {
+        // The same literal `instr` match as `listProblems`: `%`, `_` and quotes stay ordinary
+        // characters, and the term is always a bound parameter, never interpolated.
+        filters.push(
+          '(instr(lower(problems.title), lower(?)) > 0 OR instr(lower(problems.external_key), lower(?)) > 0)',
+        );
+        params.push(search, search);
+      }
+      if (reviewOnlyFlag(query.needsReviewOnly)) {
+        filters.push(PENDING_REVIEW_PREDICATE);
+      }
+      const where = filters.length === 0 ? '' : ` WHERE ${filters.join(' AND ')}`;
+      const counted = this.find(`SELECT COUNT(*) AS total FROM problems${where}`, params);
+      const totalItems = counted === null ? 0 : intColumn(counted, 'total');
+      const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
+      const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
+      // The solved expression stands in the SELECT list, i.e. BEFORE the WHERE clause, so its bound
+      // account parameter precedes every filter parameter.
+      const solvedSelect = accountId === null ? '0' : ACCEPTED_SUBMISSION_EXISTS;
+      const solvedParams: SqlValue[] = accountId === null ? [] : [accountId];
+      const rows = this.all(
+        `SELECT problems.key, problems.body, ${solvedSelect} AS solved
+           FROM problems${where}
+          ORDER BY problems.key ASC
+          LIMIT ? OFFSET ?`,
+        [...solvedParams, ...params, limit, (page - 1) * limit],
+      );
+      const items = rows.map((row) => {
+        const key = textColumn(row, 'key');
+        const problem = entityFromRow<NormalizedProblem>('problems.body', row);
+        invariant(
+          problem.key === key,
+          'invalid_input',
+          `stored problem row ${key} carries a body for ${problem.key}`,
+          { reason: 'problem_key_mismatch', rowKey: key, bodyKey: problem.key },
+        );
+        return { problem, solvedByAccount: intColumn(row, 'solved') === 1 };
+      });
+      return { items, page, pageSize: limit, totalItems, totalPages, fetchedAt: this.clock() };
     });
   }
 
@@ -1976,6 +2084,41 @@ const PENDING_REVIEW_PREDICATE = `(
   )
 )`;
 
+/**
+ * Indexed `EXISTS` proving the requested account solved the row's problem.
+ *
+ * Scoped to the full problem identity — canonical key plus the stored source instance, domain and
+ * external key — to the account, and to the account's own stored source instance: the submission's
+ * `accounts` row must itself belong to the problem's source instance, so an incoherent stored row
+ * that borrows this account id for a problem of another instance (a legacy database may contain one)
+ * can never confer a solve. The `accounts` lookup is its primary key and `submissions_by_problem`
+ * serves the rest, so nothing walks submission history. It binds exactly one parameter (the account
+ * id) and is used both as a `solved`/`unconfirmed` filter and as the projected `solved` column.
+ */
+const ACCEPTED_SUBMISSION_EXISTS = `EXISTS (
+  SELECT 1 FROM submissions s
+    JOIN accounts a ON a.id = s.account_id
+   WHERE s.problem_key = problems.key
+     AND s.account_id = ?
+     AND s.source_instance_id = problems.source_instance_id
+     AND s.external_key = problems.external_key
+     AND s.domain IS problems.domain
+     AND a.source_instance_id = problems.source_instance_id
+     AND s.verdict = 'accepted'
+)`;
+
+/** Indexed `EXISTS` proving the account attempted the row's problem, with the same identity scope. */
+const ATTEMPTED_SUBMISSION_EXISTS = `EXISTS (
+  SELECT 1 FROM submissions s
+    JOIN accounts a ON a.id = s.account_id
+   WHERE s.problem_key = problems.key
+     AND s.account_id = ?
+     AND s.source_instance_id = problems.source_instance_id
+     AND s.external_key = problems.external_key
+     AND s.domain IS problems.domain
+     AND a.source_instance_id = problems.source_instance_id
+)`;
+
 /** Validate the optional literal search term of {@link ProblemQuery.query}. */
 function problemSearchTerm(value: string | null | undefined): string | null {
   if (value === undefined || value === null) {
@@ -2009,6 +2152,54 @@ function pageLimit(limit: number): number {
     { limit },
   );
   return limit;
+}
+
+/** Validate the page size of one numbered bank page; the port's own `1..100` bound. */
+function browsePageLimit(limit: number): number {
+  invariant(
+    Number.isInteger(limit) && limit >= BROWSE_PAGE_LIMITS.minPageSize && limit <= BROWSE_PAGE_LIMITS.maxPageSize,
+    'invalid_input',
+    `page limit must be an integer within ${BROWSE_PAGE_LIMITS.minPageSize}..${BROWSE_PAGE_LIMITS.maxPageSize}`,
+    { limit },
+  );
+  return limit;
+}
+
+/** Validate the 1-based page number of one numbered bank page (no upper bound: it clamps). */
+function browsePageNumber(page: number): number {
+  invariant(Number.isInteger(page) && page >= 1, 'invalid_input', 'page must be an integer >= 1', { page });
+  return page;
+}
+
+/** The solved/attempted scope of one numbered page; omitted/`null` means "no account context". */
+function browseAccountId(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return requireId('account id', value);
+}
+
+/** Validate the optional solved-state filter of {@link ProblemBrowseQuery.status}. */
+function browseStatus(value: ProblemSolvedFilter | null | undefined): ProblemSolvedFilter {
+  if (value === undefined || value === null) {
+    return 'all';
+  }
+  invariant(
+    PROBLEM_SOLVED_FILTERS.includes(value),
+    'invalid_input',
+    `unknown solved-state filter ${String(value)}`,
+    { status: value },
+  );
+  return value;
+}
+
+/** Validate the optional attempt filter of {@link ProblemBrowseQuery.onlyAttempted}. */
+function browseAttemptedFlag(value: boolean | null | undefined): boolean {
+  if (value === undefined || value === null) {
+    return false;
+  }
+  invariant(typeof value === 'boolean', 'invalid_input', 'onlyAttempted must be a boolean when present', { value });
+  return value;
 }
 
 function requireSyncResource(resource: SyncResource): SyncResource {

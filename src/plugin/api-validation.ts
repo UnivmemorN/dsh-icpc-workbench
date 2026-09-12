@@ -29,8 +29,10 @@ import {
   type DomainError,
 } from '../domain/index.js';
 import { PlatformError } from '../application/platform-errors.js';
+import { PROBLEM_SOLVED_FILTERS } from '../application/ports.js';
 import { STORAGE_PAGE_LIMITS } from '../application/storage-types.js';
 import {
+  MAX_BROWSE_PAGE_SIZE,
   MAX_PLAN_CANDIDATES,
   MAX_PLAN_HORIZON_DAYS,
   MAX_PLAN_MINUTES_PER_DAY,
@@ -58,6 +60,7 @@ import {
   type ApiPlanEditRequest,
   type ApiPlanListRequest,
   type ApiPlanPreviewRequest,
+  type ApiProblemBrowseRequest,
   type ApiProblemDetailRequest,
   type ApiProblemListRequest,
   type ApiRetroRecordRequest,
@@ -603,6 +606,65 @@ export function validateProblemList(value: unknown): ApiProblemListRequest {
       ? {}
       : { needsReviewOnly: booleanValue('needsReviewOnly', object['needsReviewOnly']) }),
   };
+}
+
+/**
+ * `problem.browse` request.
+ *
+ * `page` and `limit` are required (this operation exists to page by number) and there is no
+ * `cursor` field: sending one is an unknown field and is refused. `status` and `onlyAttempted` are
+ * shape-checked here and refused by the service when no account context can answer them.
+ */
+export function validateProblemBrowse(value: unknown): ApiProblemBrowseRequest {
+  const object = plainObject('problem.browse', value);
+  requireKeys('problem.browse', object, ['page', 'limit'], [
+    'sourceInstanceId',
+    'accountId',
+    'status',
+    'onlyAttempted',
+    'query',
+    'reveal',
+    'needsReviewOnly',
+  ]);
+  return {
+    ...(object['sourceInstanceId'] === undefined
+      ? {}
+      : { sourceInstanceId: nullableString('sourceInstanceId', object['sourceInstanceId'], MAX_API_ID_CHARS) }),
+    ...(object['accountId'] === undefined
+      ? {}
+      : { accountId: nullableAccountId('accountId', object['accountId']) }),
+    ...(object['status'] === undefined
+      ? {}
+      : { status: enumValue('status', object['status'], PROBLEM_SOLVED_FILTERS) }),
+    ...(object['onlyAttempted'] === undefined
+      ? {}
+      : { onlyAttempted: booleanValue('onlyAttempted', object['onlyAttempted']) }),
+    ...(object['query'] === undefined
+      ? {}
+      : { query: nullableString('query', object['query'], MAX_PROBLEM_QUERY_CHARS) }),
+    ...(object['reveal'] === undefined ? {} : { reveal: booleanValue('reveal', object['reveal']) }),
+    ...(object['needsReviewOnly'] === undefined
+      ? {}
+      : { needsReviewOnly: booleanValue('needsReviewOnly', object['needsReviewOnly']) }),
+    page: pageNumber('page', object['page']),
+    limit: boundedInteger('limit', object['limit'], 1, MAX_BROWSE_PAGE_SIZE),
+  };
+}
+
+/**
+ * 1-based page number of a numbered bank page.
+ *
+ * There is no upper bound: an out-of-range page is clamped to the last valid page by the store, so a
+ * large page number is a legal request. `0`, a negative value and a non-integer are refused.
+ */
+function pageNumber(label: string, value: unknown): number {
+  const integer = integerValue(label, value);
+  invariant(integer >= 1, 'invalid_input', `${label} must be an integer >= 1`, {
+    reason: 'out_of_range',
+    field: label,
+    value: integer,
+  });
+  return integer;
 }
 
 export function validateProblemDetail(value: unknown): ApiProblemDetailRequest {

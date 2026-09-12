@@ -70,6 +70,27 @@ export interface WorkbenchProblemPage {
   readonly fetchedAt: string;
 }
 
+/**
+ * One numbered page of the bank: the redacted rows plus the totals of exactly this filter set.
+ *
+ * `page`, `pageSize`, `totalItems` and `totalPages` describe the same serialized read as `items`.
+ * The store clamps an out-of-range `page` to the last valid page, so `page <= totalPages` whenever
+ * `totalPages > 0`, while an empty filter set reports `totalItems: 0`, `totalPages: 0`, `page: 1`
+ * and no items at all.
+ */
+export interface WorkbenchProblemBrowsePage {
+  readonly pageId: string;
+  readonly items: readonly WorkbenchProblemSummary[];
+  readonly page: number;
+  readonly pageSize: number;
+  readonly totalItems: number;
+  readonly totalPages: number;
+  /** True when this page was projected with spoilers visible (`reveal` or solved rows). */
+  readonly reveal: boolean;
+  readonly pendingReviewOnly: boolean;
+  readonly fetchedAt: string;
+}
+
 /** One editorial source; `contentHash` is a digest, never the body. */
 export interface WorkbenchEditorialSourceView {
   readonly sourceId: string;
