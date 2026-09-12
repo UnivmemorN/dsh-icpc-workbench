@@ -99,7 +99,9 @@ const realFileSystem: ConfigFileSystem = {
     }
   },
   realpath(path) {
-    return realpathSync(path);
+    // Match fs.promises.realpath used by the backup boundary: Windows native resolution
+    // expands 8.3 aliases (e.g. RUNNER~1) that the JavaScript walker can preserve.
+    return realpathSync.native(path);
   },
 };
 
