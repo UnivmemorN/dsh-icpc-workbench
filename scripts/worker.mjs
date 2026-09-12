@@ -4,11 +4,13 @@ import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { priceUsage } from './usage.mjs';
+import { taskContext } from './worker-context.mjs';
 const root = resolve(import.meta.dirname, '..');
 const install = resolve(process.env.DSH_INSTALL_ROOT ?? 'D:/DeepSeek Harness/source');
 const taskPath = resolve(process.argv[2] ?? '');
 if (!process.argv[2]) throw new Error('Usage: node scripts/worker.mjs <task.json>');
 const task = JSON.parse(readFileSync(taskPath, 'utf8'));
+const providedContext = taskContext(task, root);
 const maxOutputTokens=65536, missingUsageReserveCny=2.63;
 const local = join(root, '.local');
 mkdirSync(local, {recursive:true});
@@ -43,7 +45,7 @@ try {
   console.log(JSON.stringify({event:'ready', task:task.id, model:report.model, effort:report.effort}));
   report.status='running'; flush();
   timer=setTimeout(()=>stop('timeout'),(task.timeoutMinutes??30)*60000);
-  const prompt = 'Execute only the assigned Sprint Contract. You are the implementation worker; the coordinator owns review and Git. Do not spawn agents, invoke paid APIs outside ctx.llm, inspect secrets, alter security settings, commit or push. The agreed plan is already approved. If a required permission is unavailable, report the exact blocker; do not bypass it.\n\n'+task.prompt;
+  const prompt = 'Execute only the assigned Sprint Contract. You are the implementation worker; the coordinator owns review and Git. Do not spawn agents, invoke paid APIs outside ctx.llm, inspect secrets, alter security settings, commit or push. The agreed plan is already approved. If a required permission is unavailable, report the exact blocker; do not bypass it.\n\n'+task.prompt+providedContext;
   const result=await harness.run(prompt, {onNotification:n=>{
     appendFileSync(log,JSON.stringify(n)+'\n');
     if(n.method!=='session.event') return;
