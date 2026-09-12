@@ -15,6 +15,10 @@
  *   `immutable_violation` instead of overwriting history, and an identical re-save is a
  *   no-op. Mutable records (problems, submissions, jobs, plans, checkpoints) are upserted,
  *   with monotonic guards where losing data would corrupt accounting.
+ * - **Batches are revision-guarded and attempts are append-only audits.** `saveBatch` refuses
+ *   a stale `expectedRevision` before writing anything and never lets counters or a terminal
+ *   state go backwards. A model-call attempt is inserted `reserved` before dispatch and only
+ *   moves forward (`reserved → uncertain | settled`); a settled row can never be rewritten.
  * - **The head only moves forward.** `saveSnapshot` refuses to install an older version than
  *   the stored head, so an analysis of a newer snapshot can never be reverted by a late
  *   write of an old one.
@@ -53,6 +57,18 @@ import {
 } from '../../domain/index.js';
 import type { Page, PageRequest, ProblemQuery, StoreCapabilities, TrainingStore } from '../../application/ports.js';
 import {
+  ANALYSIS_BATCH_STATUSES,
+  MODEL_CALL_STATUSES,
+  validateAnalysisBatch,
+  validateAnalysisBatchTransition,
+  validateModelCallAttempt,
+  validateModelCallAttemptTransition,
+  type AnalysisBatch,
+  type AnalysisBatchStatus,
+  type ModelCallAttempt,
+  type ModelCallAttemptQuery,
+} from '../../application/batch-types.js';
+import {
   STORAGE_PAGE_LIMITS,
   SYNC_RESOURCES,
   syncCheckpointKey,
@@ -66,8 +82,10 @@ import { StorageError } from './errors.js';
 import {
   ACCOUNT_FIELDS,
   ANALYSIS_FIELDS,
+  BATCH_FIELDS,
   JOB_FIELDS,
   MANUAL_DECISION_FIELDS,
+  MODEL_CALL_ATTEMPT_FIELDS,
   PLAN_FIELDS,
   PROBLEM_FIELDS,
   RETROSPECTIVE_FIELDS,
@@ -93,12 +111,14 @@ import {
 } from './entities.js';
 import {
   SCHEMA_VERSION_EMPTY,
+  SCHEMA_VERSION_V1,
   STORE_MARKER,
   STORE_SCHEMA_VERSION,
   backupFileName,
   configureConnection,
   detectSchemaState,
-  initializeSchemaV1,
+  initializeSchemaV2,
+  migrateSchemaV1ToV2,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -209,8 +229,9 @@ export class SqliteTrainingStore implements TrainingStore {
       transactional: true,
       notes: [
         `node:sqlite DatabaseSync; schema marker ${STORE_MARKER}; one serialized connection`,
-        'Databases from a newer schema are rejected before any write; v0 databases are migrated after a consistent backup',
+        'Databases from a newer schema are rejected before any write; v0 and v1 databases are migrated after a verified consistent backup',
         'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
+        'Batches are revision-guarded with monotonic counters; model-call attempts move reserved -> uncertain|settled and settled rows are immutable',
       ],
     };
   }
@@ -539,6 +560,15 @@ export class SqliteTrainingStore implements TrainingStore {
     });
   }
 
+  /** One problem by canonical key; the deterministic lookup the pipeline and adapters use. */
+  async getProblem(problemKeyValue: string): Promise<NormalizedProblem | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM problems WHERE key = ?', [requireProblemKey(problemKeyValue)]);
+      return row === null ? null : entityFromRow<NormalizedProblem>('problems.body', row);
+    });
+  }
+
   async upsertSubmissions(submissions: readonly Submission[]): Promise<void> {
     this.assertOpen();
     return this.withWrite(() => {
@@ -730,6 +760,86 @@ export class SqliteTrainingStore implements TrainingStore {
       }
       return recovered;
     });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Analysis batches & model-call attempts
+  // -------------------------------------------------------------------------------------
+
+  async getBatch(batchId: string): Promise<AnalysisBatch | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM analysis_batches WHERE batch_id = ?', [
+        requireId('batch id', batchId),
+      ]);
+      return row === null ? null : entityFromRow<AnalysisBatch>('analysis_batches.body', row);
+    });
+  }
+
+  async listBatches(status: AnalysisBatchStatus | null): Promise<readonly AnalysisBatch[]> {
+    this.assertOpen();
+    return this.withRead(() => {
+      if (status !== null && !ANALYSIS_BATCH_STATUSES.includes(status)) {
+        throw new DomainError('invalid_input', `unknown batch status ${String(status)}`, { status });
+      }
+      const rows =
+        status === null
+          ? this.all('SELECT body FROM analysis_batches ORDER BY created_at ASC, batch_id ASC')
+          : this.all('SELECT body FROM analysis_batches WHERE status = ? ORDER BY created_at ASC, batch_id ASC', [
+              status,
+            ]);
+      return rows.map((row) => entityFromRow<AnalysisBatch>('analysis_batches.body', row));
+    });
+  }
+
+  async saveBatch(batch: AnalysisBatch, expectedRevision: number | null): Promise<number> {
+    this.assertOpen();
+    return this.withWrite(() => this.writeBatch(batch, expectedRevision));
+  }
+
+  async getModelCallAttempt(attemptId: string): Promise<ModelCallAttempt | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM model_call_attempts WHERE attempt_id = ?', [
+        requireId('attempt id', attemptId),
+      ]);
+      return row === null ? null : entityFromRow<ModelCallAttempt>('model_call_attempts.body', row);
+    });
+  }
+
+  async listModelCallAttempts(query: ModelCallAttemptQuery): Promise<readonly ModelCallAttempt[]> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const filters: string[] = [];
+      const params: SqlValue[] = [];
+      if (query.batchId !== undefined && query.batchId !== null) {
+        filters.push('batch_id = ?');
+        params.push(requireId('batch id', query.batchId));
+      }
+      if (query.jobId !== undefined && query.jobId !== null) {
+        filters.push('job_id = ?');
+        params.push(requireId('job id', query.jobId));
+      }
+      if (query.status !== undefined && query.status !== null) {
+        if (!MODEL_CALL_STATUSES.includes(query.status)) {
+          throw new DomainError('invalid_input', `unknown model call status ${String(query.status)}`, {
+            status: query.status,
+          });
+        }
+        filters.push('status = ?');
+        params.push(query.status);
+      }
+      const where = filters.length === 0 ? '' : ` WHERE ${filters.join(' AND ')}`;
+      return this.all(
+        `SELECT body FROM model_call_attempts${where} ORDER BY requested_at ASC, attempt_id ASC`,
+        params,
+      ).map((row) => entityFromRow<ModelCallAttempt>('model_call_attempts.body', row));
+    });
+  }
+
+  async saveModelCallAttempt(attempt: ModelCallAttempt): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => this.writeModelCallAttempt(attempt));
   }
 
   // -------------------------------------------------------------------------------------
@@ -1119,6 +1229,140 @@ export class SqliteTrainingStore implements TrainingStore {
     );
   }
 
+  /**
+   * Persist a batch under optimistic concurrency control.
+   *
+   * The stored revision is the authority: `expectedRevision === null` means "this is a
+   * create" and a number must equal the stored revision. A mismatch rejects before any write,
+   * so a stale caller can never overwrite a newer state (or resurrect a deleted one). The
+   * application validators own identity/counter/end-state rules, so they cannot drift from the
+   * pure records other callers use.
+   */
+  private writeBatch(batch: AnalysisBatch, expectedRevision: number | null): number {
+    validateAnalysisBatch(batch);
+    invariant(
+      expectedRevision === null || (Number.isInteger(expectedRevision) && expectedRevision >= 1),
+      'invalid_input',
+      'expectedRevision must be null (create) or an integer >= 1 (update)',
+      { batchId: batch.batchId, expectedRevision },
+    );
+    const existing = this.find('SELECT revision, body FROM analysis_batches WHERE batch_id = ?', [batch.batchId]);
+    if (existing === null) {
+      invariant(
+        expectedRevision === null,
+        'invalid_transition',
+        `batch ${batch.batchId} does not exist; a create must pass expectedRevision null`,
+        { batchId: batch.batchId, expectedRevision },
+      );
+      this.upsertBatch(batch, 1);
+      return 1;
+    }
+    const storedRevision = intColumn(existing, 'revision');
+    invariant(
+      expectedRevision !== null,
+      'duplicate_id',
+      `batch ${batch.batchId} already exists at revision ${storedRevision}`,
+      { batchId: batch.batchId, storedRevision },
+    );
+    invariant(
+      expectedRevision === storedRevision,
+      'invalid_transition',
+      `batch ${batch.batchId} is at revision ${storedRevision}, not ${expectedRevision}; re-read before saving`,
+      { batchId: batch.batchId, expectedRevision, storedRevision, reason: 'stale_revision' },
+    );
+    const stored = entityFromRow<AnalysisBatch>('analysis_batches.body', existing);
+    validateAnalysisBatchTransition(stored, batch);
+    const next = storedRevision + 1;
+    this.upsertBatch(batch, next);
+    return next;
+  }
+
+  /**
+   * Insert or update one batch row; `revision` is always the store-assigned token.
+   *
+   * Identity columns (`created_at`, `job_count`) are written once and never updated, so the
+   * indexed columns cannot disagree with the immutable body.
+   */
+  private upsertBatch(batch: AnalysisBatch, revision: number): void {
+    this.write(
+      `INSERT INTO analysis_batches (batch_id, status, revision, created_at, updated_at, lease_owner,
+         lease_expires_at, analysis_calls, reasoning_calls, retries, job_count, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(batch_id) DO UPDATE SET status = excluded.status, revision = excluded.revision,
+         updated_at = excluded.updated_at, lease_owner = excluded.lease_owner,
+         lease_expires_at = excluded.lease_expires_at, analysis_calls = excluded.analysis_calls,
+         reasoning_calls = excluded.reasoning_calls, retries = excluded.retries, body = excluded.body`,
+      [
+        batch.batchId,
+        batch.status,
+        revision,
+        batch.createdAt,
+        batch.updatedAt,
+        batch.owner,
+        batch.leaseExpiresAt,
+        batch.counters.analysisCalls,
+        batch.counters.reasoningCalls,
+        batch.counters.retries,
+        batch.jobs.length,
+        bodyOf({ ...batch, revision }, BATCH_FIELDS),
+      ],
+    );
+  }
+
+  /**
+   * Insert one reserved attempt, or advance an existing one.
+   *
+   * A new attempt must be `reserved`: reservation is what makes an in-flight call visible, so
+   * a caller cannot record a finished call first. An identical re-save is a no-op (recovery may
+   * replay the same record); a different body on a settled row is refused. The caller owns the
+   * surrounding transaction, so the insert and the job/batch counter bump roll back together.
+   */
+  private writeModelCallAttempt(attempt: ModelCallAttempt): void {
+    validateModelCallAttempt(attempt);
+    const body = bodyOf(attempt, MODEL_CALL_ATTEMPT_FIELDS);
+    const existing = this.find('SELECT body FROM model_call_attempts WHERE attempt_id = ?', [attempt.attemptId]);
+    if (existing === null) {
+      invariant(
+        attempt.status === 'reserved',
+        'invalid_transition',
+        `attempt ${attempt.attemptId} must be inserted as reserved before dispatch`,
+        { attemptId: attempt.attemptId, status: attempt.status },
+      );
+      this.write(
+        `INSERT INTO model_call_attempts (attempt_id, batch_id, job_id, snapshot_id, role, status, provider,
+           model, prompt_version, requested_at, finished_at, host_session_id, host_call_id, body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          attempt.attemptId,
+          attempt.batchId,
+          attempt.jobId,
+          attempt.snapshotId,
+          attempt.role,
+          attempt.status,
+          attempt.provider,
+          attempt.model,
+          attempt.promptVersion,
+          attempt.requestedAt,
+          attempt.finishedAt,
+          attempt.hostSessionId,
+          attempt.hostCallId,
+          body,
+        ],
+      );
+      return;
+    }
+    if (textColumn(existing, 'body') === body) {
+      return;
+    }
+    const stored = entityFromRow<ModelCallAttempt>('model_call_attempts.body', existing);
+    validateModelCallAttemptTransition(stored, attempt);
+    this.write(
+      `UPDATE model_call_attempts SET status = ?, finished_at = ?, host_session_id = ?, host_call_id = ?,
+         body = ? WHERE attempt_id = ?`,
+      [attempt.status, attempt.finishedAt, attempt.hostSessionId, attempt.hostCallId, body, attempt.attemptId],
+    );
+  }
+
   // -------------------------------------------------------------------------------------
   // Read helpers
   // -------------------------------------------------------------------------------------
@@ -1231,41 +1475,52 @@ export class SqliteTrainingStore implements TrainingStore {
   // -------------------------------------------------------------------------------------
 
   /**
-   * Classify, migrate and only then configure the connection.
+   * Classify, back up and migrate a database, and only then configure the connection.
    *
    * Ordering is load-bearing:
    *
    * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
    *    switched into another journal mode or otherwise touched.
-   * 2. A supported v0 database is backed up **before** `configureConnection`, so the backup is
-   *    the database as it was found and switching the journal mode is not part of the
-   *    pre-migration state.
-   * 3. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
+   * 2. A supported older database (v0 or v1) is backed up **before** `configureConnection`, so
+   *    the backup is the database as it was found and switching the journal mode is not part
+   *    of the pre-migration state. The copy is verified before migration starts.
+   * 3. Migration adds tables only: `initializeSchemaV2` applies v1+v2 in one transaction for an
+   *    empty or metadata-only database, `migrateSchemaV1ToV2` adds v2 to a real v1 store while
+   *    keeping every row.
+   * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
    *    succeeded, so a failed migration leaves the original file — including its original
    *    journal mode — untouched.
    */
   private openSchema(inMemory: boolean): void {
     const state = detectSchemaState(this.connection);
-    if (state === 'legacy_v0') {
-      // A pre-store database that carries our marker: keep a consistent copy before migrating.
-      const target = this.uniquePath(backupFileName(this.path, SCHEMA_VERSION_EMPTY, this.clock()));
+    if (state === 'legacy_v0' || state === 'v1') {
+      // Keep a consistent copy of the database as found before any migration writes to it.
+      const from = state === 'legacy_v0' ? SCHEMA_VERSION_EMPTY : SCHEMA_VERSION_V1;
+      const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
-      this.verifyBackup(target, SCHEMA_VERSION_EMPTY, false);
+      this.verifyBackup(target, from, from === SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        initializeSchemaV1(this.connection);
+        if (state === 'v1') {
+          migrateSchemaV1ToV2(this.connection);
+        } else {
+          initializeSchemaV2(this.connection);
+        }
       } catch (error) {
         if (error instanceof StorageError) {
           throw error;
         }
-        throw new StorageError('migration_failed', `database could not be initialized to schema v1`, {
-          path: this.path,
-          cause: String(error),
-        });
+        throw new StorageError(
+          'migration_failed',
+          `database could not be initialized to schema v${STORE_SCHEMA_VERSION}`,
+          { path: this.path, cause: String(error) },
+        );
       }
       if (detectSchemaState(this.connection) !== 'current') {
-        throw new StorageError('migration_failed', 'database did not reach schema v1', { path: this.path });
+        throw new StorageError('migration_failed', `database did not reach schema v${STORE_SCHEMA_VERSION}`, {
+          path: this.path,
+        });
       }
     }
     configureConnection(this.connection, inMemory);

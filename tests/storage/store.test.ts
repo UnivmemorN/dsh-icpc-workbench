@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { SqliteTrainingStore } from '../../src/adapters/sqlite/index.js';
+import { SqliteTrainingStore, STORE_SCHEMA_VERSION } from '../../src/adapters/sqlite/index.js';
 import { StorageError } from '../../src/adapters/sqlite/errors.js';
 import { syncCheckpointKey, type SyncCheckpoint } from '../../src/application/storage-types.js';
 import {
@@ -84,7 +84,7 @@ void test('every record type survives close and reopen', async () => {
 
   assert.deepEqual(store.capabilities(), {
     implemented: true,
-    schemaVersion: 1,
+    schemaVersion: STORE_SCHEMA_VERSION,
     transactional: true,
     notes: store.capabilities().notes,
   });
@@ -97,6 +97,8 @@ void test('every record type survives close and reopen', async () => {
     assert.deepEqual((await reopened.listSourceInstances()).length, 1);
     assert.deepEqual(await reopened.listAccounts(scope.instance.id), [scope.account]);
     assert.deepEqual((await reopened.listProblems(problemQuery)).items, [scope.problem]);
+    assert.deepEqual(await reopened.getProblem(scope.problem.key), scope.problem);
+    assert.equal(await reopened.getProblem(fx.makeProblem(fx.makeRef(scope.instance, '2B')).key), null);
     assert.equal((await reopened.listSubmissions(scope.account.id, problemQuery)).items[0]?.id, submission.id);
     assert.deepEqual(await reopened.getSnapshot(snapshot.snapshotId), snapshot);
     assert.deepEqual(await reopened.getCurrentSnapshotHead(scope.problem.ref), {

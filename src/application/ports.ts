@@ -16,6 +16,12 @@
  */
 import type { JobLeaseRequest, SyncCheckpoint, SyncCheckpointRef } from './storage-types.js';
 import type {
+  AnalysisBatch,
+  AnalysisBatchStatus,
+  ModelCallAttempt,
+  ModelCallAttemptQuery,
+} from './batch-types.js';
+import type {
   Account,
   AiTagSuggestion,
   AnalysisJobLimits,
@@ -320,6 +326,13 @@ export interface TrainingStore {
   // Problems & submissions
   upsertProblems(problems: readonly NormalizedProblem[]): Promise<void>;
   listProblems(query: ProblemQuery): Promise<Page<NormalizedProblem>>;
+  /**
+   * One problem by its canonical key, without a scan.
+   *
+   * The adapter/pipeline resolves a job's problem through this method instead of paging
+   * through `listProblems`; `null` means the problem is not stored.
+   */
+  getProblem(key: string): Promise<NormalizedProblem | null>;
   upsertSubmissions(submissions: readonly Submission[]): Promise<void>;
   listSubmissions(accountId: string, query: PageRequest): Promise<Page<Submission>>;
 
@@ -355,6 +368,37 @@ export interface TrainingStore {
   claimJob(request: JobLeaseRequest): Promise<AnalysisJobState | null>;
   /** Returns every expired `running` lease to `pending`, preserving counters. */
   recoverExpiredJobs(now: string): Promise<number>;
+
+  // Analysis batches & model-call attempts (durable groundwork; orchestration is a later stage)
+  getBatch(batchId: string): Promise<AnalysisBatch | null>;
+  listBatches(status: AnalysisBatchStatus | null): Promise<readonly AnalysisBatch[]>;
+  /**
+   * Persist a batch under optimistic concurrency control and return the stored revision.
+   *
+   * `expectedRevision` is `null` only for the first save of a new batch and the previously
+   * read revision for every update; a mismatch rejects before any write (a stale caller must
+   * re-read instead of overwriting a newer state). A create stores revision 1, an update
+   * `expectedRevision + 1`. Identity (`batchId`, `createdAt`, `jobs`, `maxJobs`) is immutable,
+   * counters never decrease, a `completed`/`cancelled` batch stays terminal, and the lease
+   * shape must match the status (`running` holds one lease; every other status holds none).
+   * Temporal metadata must be ordered: `updatedAt >= createdAt`, and a running lease expires
+   * strictly after `updatedAt`.
+   */
+  saveBatch(batch: AnalysisBatch, expectedRevision: number | null): Promise<number>;
+  getModelCallAttempt(attemptId: string): Promise<ModelCallAttempt | null>;
+  /** Attempts of one batch and/or job, in deterministic `requestedAt, attemptId` order. */
+  listModelCallAttempts(query: ModelCallAttemptQuery): Promise<readonly ModelCallAttempt[]>;
+  /**
+   * Insert a `reserved` attempt before model dispatch, or advance an existing one
+   * (`reserved → uncertain | settled`, `uncertain → settled`; nothing returns to `reserved`).
+   *
+   * A settled attempt is immutable and an identical re-save is a no-op; a different body is
+   * rejected, so a finished call can never be rewritten. Once `hostSessionId`/`hostCallId` are
+   * known they are never reassigned or cleared, and `finishedAt >= requestedAt`. The caller owns
+   * the surrounding transaction, so the reservation and the job/batch counter bump commit
+   * together.
+   */
+  saveModelCallAttempt(attempt: ModelCallAttempt): Promise<void>;
 
   // Tag decisions
   listTagDecisions(problemKey: string): Promise<readonly TagDecision[]>;

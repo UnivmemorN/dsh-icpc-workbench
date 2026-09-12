@@ -160,6 +160,38 @@ export const PLAN_FIELDS: readonly string[] = [
   'evidence',
   'unmetMinutes',
 ];
+export const BATCH_FIELDS: readonly string[] = [
+  'batchId',
+  'jobs',
+  'maxJobs',
+  'createdAt',
+  'status',
+  'revision',
+  'owner',
+  'leaseExpiresAt',
+  'limits',
+  'counters',
+  'updatedAt',
+  'lastError',
+];
+export const MODEL_CALL_ATTEMPT_FIELDS: readonly string[] = [
+  'attemptId',
+  'batchId',
+  'jobId',
+  'snapshotId',
+  'role',
+  'provider',
+  'model',
+  'promptVersion',
+  'requestedAt',
+  'finishedAt',
+  'status',
+  'hostSessionId',
+  'hostCallId',
+  'usage',
+  'error',
+  'outcome',
+];
 
 /** Fields that take part in a snapshot's *identity* (observation timestamps excluded). */
 const PROBLEM_IDENTITY_FIELDS: readonly string[] = ['ref', 'key', 'title', 'url', 'statement', 'ratings', 'rawTags'];

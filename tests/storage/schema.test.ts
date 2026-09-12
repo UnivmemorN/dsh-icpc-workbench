@@ -14,7 +14,22 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { SqliteTrainingStore, StorageError, STORE_MARKER, STORE_SCHEMA_VERSION } from '../../src/adapters/sqlite/index.js';
+import {
+  SqliteTrainingStore,
+  StorageError,
+  STORE_MARKER,
+  STORE_SCHEMA_VERSION,
+  STORE_TABLES_V1,
+  STORE_TABLES_V2,
+} from '../../src/adapters/sqlite/index.js';
+import { applySchemaV1 } from '../../src/adapters/sqlite/schema.js';
+import { createAnalysisBatch } from '../../src/application/batch-types.js';
+import {
+  canonicalJson,
+  type AnalysisJobState,
+  type ManualTagDecision,
+  type ProblemSnapshot,
+} from '../../src/domain/index.js';
 import * as fx from './fixtures.js';
 
 interface Fingerprint {
@@ -66,6 +81,79 @@ function rawScalar(path: string, sql: string): unknown {
   } finally {
     db.close();
   }
+}
+
+/**
+ * Build a real schema-v1 database with rows, using the frozen v1 DDL.
+ *
+ * `applySchemaV1` must keep producing exactly what the previous build wrote, so this fixture
+ * is a genuine older database rather than a v2 shape carrying a lower version number.
+ */
+function seedV1(path: string, scope: fx.Scope, job: AnalysisJobState, manual: ManualTagDecision): void {
+  const db = new DatabaseSync(path);
+  try {
+    applySchemaV1(db);
+    db.prepare(
+      `INSERT INTO problems (key, source_instance_id, domain, external_key, title, fetched_at, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      scope.problem.key,
+      scope.problem.ref.sourceInstanceId,
+      scope.problem.ref.domain,
+      scope.problem.ref.externalKey,
+      scope.problem.title,
+      scope.problem.fetchedAt,
+      canonicalJson(scope.problem),
+    );
+    db.prepare(
+      `INSERT INTO jobs (job_id, problem_key, snapshot_id, status, attempts, analysis_calls, reasoning_calls,
+         retries, created_at, updated_at, lease_owner, lease_expires_at, analysis_id, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      job.jobId,
+      job.problemKey,
+      job.snapshotId,
+      job.status,
+      job.attempts,
+      job.counters.analysisCalls,
+      job.counters.reasoningCalls,
+      job.counters.retries,
+      job.createdAt,
+      job.updatedAt,
+      job.leaseOwner,
+      job.leaseExpiresAt,
+      job.analysisId,
+      canonicalJson(job),
+    );
+    db.prepare(
+      `INSERT INTO manual_decisions (decision_id, problem_key, taxonomy_id, action, decided_at, body)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(manual.decisionId, manual.problemKey, manual.taxonomyId, manual.action, manual.decidedAt, canonicalJson(manual));
+    db.prepare(`INSERT INTO manual_revisions (problem_key, revision, updated_at) VALUES (?, 1, ?)`).run(
+      scope.problem.key,
+      fx.AT,
+    );
+  } finally {
+    db.close();
+  }
+  assert.equal(rawScalar(path, 'PRAGMA user_version'), 1, 'the fixture is a schema-v1 database');
+}
+
+interface V1World {
+  readonly scope: fx.Scope;
+  readonly snapshot: ProblemSnapshot;
+  readonly job: AnalysisJobState;
+  readonly manual: ManualTagDecision;
+}
+
+/** One real v1 database: a problem, its job, one manual decision and the manual revision. */
+function seedV1World(path: string): V1World {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1A');
+  const snapshot = fx.makeSnapshot(scope.problem);
+  const job = fx.makeJob(scope.problem, snapshot);
+  const manual = fx.makeManualDecision(scope.problem, fx.SEGMENT_TREE_TAG, 'accept', fx.AT, 'manual note');
+  seedV1(path, scope, job, manual);
+  return { scope, snapshot, job, manual };
 }
 
 void test('a fresh path is initialized with the marker, the current schema and its parent directory', async () => {
@@ -178,6 +266,107 @@ void test('a supported v0 database is backed up before it is migrated', async ()
   assert.equal(migrated.marker, STORE_MARKER);
   assert.ok(migrated.tables.includes('problems'));
   assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'wal', 'the migrated database is configured afterwards');
+  fx.removeDirectory(paths.dir);
+});
+
+void test('a v1 database is copied, then migrated to v2 with every row kept', async () => {
+  const paths = fx.tempDatabase();
+  const world = seedV1World(paths.path);
+  const before = fingerprint(paths.path);
+  assert.equal(before.userVersion, 1);
+  assert.deepEqual(before.tables, [...STORE_TABLES_V1].sort(), 'the fixture is exactly a v1 store');
+
+  const store = new SqliteTrainingStore({ path: paths.path, now: () => fx.LATER });
+  try {
+    assert.deepEqual(await store.getProblem(world.scope.problem.key), world.scope.problem, 'the problem body survived');
+    assert.deepEqual(await store.getJob(world.job.jobId), world.job, 'job status and counters survived');
+    assert.equal(await store.getManualRevision(world.scope.problem.key), 1, 'the manual revision survived');
+    assert.deepEqual(await store.listManualDecisions(world.scope.problem.key), [world.manual]);
+    const batch = createAnalysisBatch({
+      batchId: 'batch-after-v1-migration',
+      jobs: [{ jobId: world.job.jobId, snapshotId: world.snapshot.snapshotId }],
+      createdAt: fx.LATER,
+    });
+    assert.equal(await store.saveBatch(batch, null), 1, 'the added v2 tables are usable on the migrated file');
+  } finally {
+    await store.close();
+  }
+
+  const migrated = fingerprint(paths.path);
+  assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION);
+  assert.equal(migrated.marker, STORE_MARKER);
+  assert.equal(migrated.integrity, 'ok');
+  for (const table of STORE_TABLES_V2) {
+    assert.ok(migrated.tables.includes(table), `migrated schema is missing ${table}`);
+  }
+  assert.equal(
+    rawScalar(paths.path, 'PRAGMA journal_mode'),
+    'wal',
+    'the migrated database is configured after a successful migration',
+  );
+
+  const backupNames = readdirSync(paths.dir).filter((name) => name.includes('.backup-v1-') && name.endsWith('.sqlite'));
+  assert.equal(backupNames.length, 1, 'exactly one pre-migration copy of the v1 database is kept');
+  const [backupName] = backupNames;
+  assert.ok(backupName);
+  const backupPath = join(paths.dir, backupName);
+  const backup = fingerprint(backupPath);
+  assert.equal(backup.userVersion, 1, 'the copy is the pre-migration v1 database');
+  assert.equal(backup.marker, STORE_MARKER);
+  assert.equal(backup.integrity, 'ok');
+  assert.deepEqual(backup.tables, [...STORE_TABLES_V1].sort());
+  assert.equal(rawScalar(backupPath, 'PRAGMA journal_mode'), 'delete', 'the copy predates the WAL switch');
+  assert.equal(rawScalar(backupPath, 'SELECT body FROM problems'), canonicalJson(world.scope.problem));
+  assert.equal(rawScalar(backupPath, 'SELECT analysis_calls FROM jobs'), world.job.counters.analysisCalls);
+  assert.equal(rawScalar(backupPath, 'SELECT revision FROM manual_revisions'), 1);
+  fx.removeDirectory(paths.dir);
+});
+
+void test('a v1 migration that cannot finish leaves the v1 tables and the pre-migration copy readable', () => {
+  const paths = fx.tempDatabase();
+  const world = seedV1World(paths.path);
+  // A view named `analysis_batches` makes the first v2 DDL statement of the migration fail.
+  rawExec(paths.path, ['CREATE VIEW analysis_batches AS SELECT 1 AS batch_id']);
+  assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');
+
+  assert.throws(
+    () => new SqliteTrainingStore({ path: paths.path }),
+    (error) => error instanceof StorageError && error.code === 'migration_failed',
+  );
+
+  const after = fingerprint(paths.path);
+  assert.equal(after.userVersion, 1, 'the failed migration was rolled back to v1');
+  assert.equal(after.marker, STORE_MARKER, 'the original metadata is intact');
+  assert.equal(after.integrity, 'ok');
+  assert.deepEqual(after.tables, [...STORE_TABLES_V1].sort(), 'no v2 table replaced the conflicting view');
+  assert.equal(
+    rawScalar(paths.path, 'PRAGMA journal_mode'),
+    'delete',
+    'configuration only happens after a successful migration, so the original journal mode is kept',
+  );
+  assert.equal(rawScalar(paths.path, 'SELECT body FROM problems'), canonicalJson(world.scope.problem));
+  assert.equal(rawScalar(paths.path, 'SELECT analysis_calls FROM jobs'), world.job.counters.analysisCalls);
+  assert.equal(rawScalar(paths.path, 'SELECT revision FROM manual_revisions'), 1);
+  assert.equal(
+    rawScalar(
+      paths.path,
+      `SELECT count(*) FROM sqlite_master WHERE type = 'view' AND name = 'analysis_batches'`,
+    ),
+    1,
+    'the conflicting object is still there, not silently dropped',
+  );
+
+  const backupNames = readdirSync(paths.dir).filter((name) => name.includes('.backup-v1-') && name.endsWith('.sqlite'));
+  assert.equal(backupNames.length, 1, 'the pre-migration copy survives the failed migration');
+  const [backupName] = backupNames;
+  assert.ok(backupName);
+  const backupPath = join(paths.dir, backupName);
+  const backup = fingerprint(backupPath);
+  assert.equal(backup.userVersion, 1);
+  assert.equal(backup.marker, STORE_MARKER);
+  assert.equal(backup.integrity, 'ok');
+  assert.deepEqual(backup.tables, [...STORE_TABLES_V1].sort());
+  assert.equal(rawScalar(backupPath, 'SELECT body FROM problems'), canonicalJson(world.scope.problem));
   fx.removeDirectory(paths.dir);
 });
 

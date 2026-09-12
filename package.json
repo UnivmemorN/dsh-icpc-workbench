@@ -34,7 +34,7 @@
     "test": "node --experimental-strip-types --import ./tests/loader.mjs --test --experimental-test-isolation=none \"tests/**/*.test.ts\"",
     "build": "node scripts/build.mjs",
     "check:architecture": "node scripts/check-architecture.mjs",
-    "check": "npm run typecheck && npm run check:architecture && npm run test && node --test scripts/usage.test.mjs && npm run build"
+    "check": "npm run typecheck && npm run check:architecture && npm run test && node --test --experimental-test-isolation=none scripts/usage.test.mjs && npm run build"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",

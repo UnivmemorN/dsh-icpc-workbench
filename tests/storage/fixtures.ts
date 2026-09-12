@@ -55,6 +55,8 @@ export const AT = '2026-09-12T08:00:00.000Z';
 export const LATER = '2026-09-12T09:00:00.000Z';
 /** Two minutes after a 60s lease taken at `AT`. */
 export const EXPIRED = '2026-09-12T08:02:00.000Z';
+/** A batch lease deadline after `LATER`: leases must expire strictly after `updatedAt`. */
+export const LEASE_UNTIL = '2026-09-12T10:00:00.000Z';
 
 export const TAXONOMY_VERSION = 'v1';
 export const SEGMENT_TREE_TAG = 'data-structure/segment-tree';
