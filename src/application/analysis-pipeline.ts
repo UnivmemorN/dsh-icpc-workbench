@@ -1199,6 +1199,11 @@ export class AnalysisPipeline {
         // the budget for nothing. Pause the batch persistently instead of failing it.
         return { kind: 'quota', reason: result.error.message };
       }
+      if (result.usage === null) {
+        // Unknown cost: a retry could silently double-spend a call whose usage was never
+        // accounted for. The attempt is already persisted as uncertain and the job fails here.
+        return { kind: 'error', error: { ...result.error, retryable: false } };
+      }
       if (result.error.retryable && retriesLeft > 0) {
         const retry = await this.registerRetry(claim, result.error);
         if (retry === 'planned') {
@@ -1367,15 +1372,47 @@ export class AnalysisPipeline {
   }
 
   private async settleAttempt<T>(attempt: ModelCallAttempt, result: ModelCallResult<T>): Promise<void> {
+    const finishedAt = this.now();
+    const hostSessionId = result.sessionId ?? attempt.hostSessionId;
+    if (result.ok) {
+      const settled: ModelCallAttempt = {
+        ...attempt,
+        status: 'settled',
+        finishedAt,
+        hostSessionId,
+        hostCallId: result.callId,
+        usage: result.usage,
+        error: null,
+        outcome: outcomeFor(attempt.role, result.value),
+      };
+      await this.store.saveModelCallAttempt(settled);
+      return;
+    }
+    if (result.usage === null) {
+      // Unknown cost: the call was dispatched, so it is recorded as uncertain — never as free,
+      // and never retried behind the caller's back. Call/session correlation is preserved.
+      const uncertain: ModelCallAttempt = {
+        ...attempt,
+        status: 'uncertain',
+        finishedAt,
+        hostSessionId,
+        hostCallId: result.callId,
+        usage: null,
+        error: result.error,
+        outcome: null,
+      };
+      await this.store.saveModelCallAttempt(uncertain);
+      return;
+    }
     const settled: ModelCallAttempt = {
       ...attempt,
       status: 'settled',
-      finishedAt: this.now(),
-      hostSessionId: result.sessionId ?? null,
+      finishedAt,
+      hostSessionId,
       hostCallId: result.callId,
       usage: result.usage,
-      error: result.ok ? null : result.error,
-      outcome: result.ok ? outcomeFor(attempt.role, result.value) : null,
+      error: result.error,
+      outcome: null,
     };
     await this.store.saveModelCallAttempt(settled);
   }

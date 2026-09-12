@@ -240,7 +240,8 @@ export interface ModelGatewayError {
 }
 
 /**
- * Result of one model call. Usage is reported even on failure (a failed call still costs).
+ * Result of one model call. Success always carries known usage; a failure carries it when the
+ * provider reported it, and `null` when the cost is unknown (never fabricated as zero).
  *
  * `attemptId` (request) and `callId`/`sessionId` (result) exist so the host can correlate a
  * durable {@link ModelCallAttempt} with its own model log. The pipeline sets `attemptId` from
@@ -258,7 +259,14 @@ export type ModelCallResult<T> =
   | {
       readonly ok: false;
       readonly error: ModelGatewayError;
-      readonly usage: ModelUsage;
+      /**
+       * Usage of the failed call, or `null` when the provider reported no usable usage.
+       *
+       * `null` means unknown, not free: the pipeline keeps such an attempt `uncertain` and
+       * never silently retries it, so an unaccounted call stays visible instead of becoming
+       * a fabricated free request.
+       */
+      readonly usage: ModelUsage | null;
       readonly callId: string;
       readonly sessionId?: string | null;
     };
