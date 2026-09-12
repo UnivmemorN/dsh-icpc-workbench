@@ -148,6 +148,25 @@ function scriptedHistoryStore(
 }
 
 /**
+ * A real store whose submission pages are replaced by `rows`.
+ *
+ * This reproduces a port that returns a row the caller never asked for — another account's
+ * submission, or one whose key no longer matches its reference — without corrupting the database:
+ * every write still goes to the real store, and only `listSubmissions` is scripted.
+ */
+function rowsReturningStore(realStore: SqliteTrainingStore, rows: readonly Submission[]): TrainingStore {
+  return new Proxy(realStore, {
+    get(target, property, receiver) {
+      if (property === 'listSubmissions') {
+        return async () => ({ items: rows, nextCursor: null, fetchedAt: AT });
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  }) as TrainingStore;
+}
+
+/**
  * A real store whose first `listTagDecisions` call installs `replacement` as the current head.
  *
  * The install runs in the caller's async context, i.e. *inside* the service's read transaction, so
@@ -1237,4 +1256,89 @@ void test('review-queue tie-breaking follows the deterministic store decision or
     );
     assert.equal(queue.items.length, newest.status === 'needs_review' ? 1 : 0, 'and with the stored decision order');
   });
+});
+
+// ---------------------------------------------------------------------------------------
+// Stored-row coherence (account + source instance + canonical key)
+// ---------------------------------------------------------------------------------------
+
+void test('a stored submission that names another source instance is refused, not counted as a solve', async () => {
+  await withBench(async ({ store, service }) => {
+    const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1A');
+    const foreignInstance = fx.makeInstance('luogu', 'luogu.com.cn');
+    const foreign = fx.makeProblem(fx.makeRef(foreignInstance, 'P1000'));
+    await store.upsertSourceInstances([scope.instance, foreignInstance]);
+    await store.upsertAccounts([scope.account]);
+    await store.upsertProblems([scope.problem, foreign]);
+    // The real adapter accepts this row: its key and ref agree with each other, and only the
+    // account/source pair is incoherent.
+    await store.upsertSubmissions([fx.makeSubmission(scope.account, foreign.ref, 'X1', 'accepted')]);
+
+    await rejectsDomain(
+      service.listProblems({ accountId: scope.account.id, limit: 10, cursor: null }, TOKEN),
+      'invalid_input',
+      'submission_source_mismatch',
+    );
+    await rejectsDomain(
+      service.getProblem({ problemKey: scope.problem.key, accountId: scope.account.id }, TOKEN),
+      'invalid_input',
+      'submission_source_mismatch',
+    );
+
+    // Without an account context nothing is solved, so the foreign AC reveals no tag material.
+    const anonymous = await service.listProblems({ limit: 10, cursor: null }, TOKEN);
+    const row = anonymous.items.find((item) => item.problemKey === foreign.key);
+    assert.ok(row, 'the foreign problem itself stays listable');
+    assert.equal(row.solvedByAccount, false);
+    assertAbsent(row, 'rawTags', 'anonymous bank row');
+  });
+});
+
+void test('another subdomain of the same instance stays valid solved evidence', async () => {
+  await withBench(async ({ store, service }) => {
+    const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1A');
+    const gym = fx.makeProblem(fx.makeRef(scope.instance, '100001', 'gym'));
+    await store.upsertSourceInstances([scope.instance]);
+    await store.upsertAccounts([scope.account]);
+    await store.upsertProblems([scope.problem, gym]);
+    await store.upsertSubmissions([fx.makeSubmission(scope.account, gym.ref, 'G1', 'accepted')]);
+
+    const detail = await service.getProblem({ problemKey: gym.key, accountId: scope.account.id }, TOKEN);
+    assert.equal(detail.solvedByAccount, true, 'the source instance matches, the problem domain may differ');
+    assert.deepEqual(detail.rawTags, ['data structures', 'segment tree']);
+    const page = await service.listProblems({ accountId: scope.account.id, limit: 10, cursor: null }, TOKEN);
+    assert.equal(page.items.find((item) => item.problemKey === gym.key)?.solvedByAccount, true);
+    assert.equal(page.items.find((item) => item.problemKey === scope.problem.key)?.solvedByAccount, false);
+  });
+});
+
+void test('a port returning another account or a re-keyed submission is refused, not counted', async () => {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1A');
+  const bob = fx.makeAccount(scope.instance, 'bob');
+  const foreignRow = fx.makeSubmission(bob, scope.problem.ref, 'B1', 'accepted');
+  await withBench(
+    async ({ store, service }) => {
+      await seed(store, scope);
+      await rejectsDomain(
+        service.listProblems({ accountId: scope.account.id, limit: 10, cursor: null }, TOKEN),
+        'invalid_input',
+        'submission_account_mismatch',
+      );
+    },
+    (store) => rowsReturningStore(store, [foreignRow]),
+  );
+
+  const coherent = fx.makeSubmission(scope.account, scope.problem.ref, 'S1', 'accepted');
+  const rekeyed: Submission = { ...coherent, key: fx.makeProblem(fx.makeRef(scope.instance, 'OTHER')).key };
+  await withBench(
+    async ({ store, service }) => {
+      await seed(store, scope);
+      await rejectsDomain(
+        service.getProblem({ problemKey: scope.problem.key, accountId: scope.account.id }, TOKEN),
+        'invalid_input',
+        'submission_key_mismatch',
+      );
+    },
+    (store) => rowsReturningStore(store, [rekeyed]),
+  );
 });

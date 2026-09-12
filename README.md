@@ -6,7 +6,7 @@ Planned first release: Codeforces/Luogu/manual import, evidence-backed hierarchi
 
 ## Current implementation
 
-The domain rules, SQLite storage and migrations, cancellable analysis batches, CF/Luogu/manual adapters, editorial imports, audited dsh model calls, strict tag verification, settings, and progressive coaching service are implemented and tested. The host API, browser workbench, packaged installation, and paid tag benchmark are still being built. This checkout is not yet a finished installable workbench.
+The domain rules, SQLite storage and migrations, cancellable analysis batches, CF/Luogu/manual adapters, editorial imports, audited dsh model calls, strict tag verification, settings, progressive coaching, bank/manual review, distinct-problem weakness statistics and real-candidate training plans are implemented and tested. The host API, browser workbench, packaged installation, and paid tag benchmark are still being built. This checkout is not yet a finished installable workbench.
 
 Platform access failures remain visible: anonymous Luogu editorial/history access can require login, and Codeforces HTML can return a challenge. Manual material import is supported; these failures never trigger the expensive missing-editorial fallback automatically. Hydro school-OJ integration remains future work.
 

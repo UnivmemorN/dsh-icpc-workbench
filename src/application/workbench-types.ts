@@ -1,5 +1,6 @@
 /**
- * Workbench DTOs (Stage 4w1a): bank reads, manual review and retrospective projections.
+ * Workbench DTOs (Stages 4w1a–4w1b): bank reads, manual review, retrospectives, weakness
+ * statistics and training-plan projections.
  *
  * Every member is JSON-serializable and every DTO is built by explicit field projection, never by
  * spreading a storage row. Spoiler-bearing members are *optional and absent* while they are
@@ -9,7 +10,9 @@
  * which is a different statement from absence.
  */
 import type {
+  AccountWeaknessReport,
   AnalysisStatus,
+  CandidateRejectionReason,
   CompletionMode,
   DecisionReason,
   EditorialAvailability,
@@ -19,8 +22,14 @@ import type {
   ModelUsage,
   TagDecisionOrigin,
   TagDecisionStatus,
+  TrainingEvidenceLevel,
+  TrainingPlanStatus,
+  TrainingTaskKind,
+  TrainingTaskStatus,
+  UnmetMinutes,
   VerificationVerdict,
 } from '../domain/index.js';
+import type { PlanEvidenceReason } from '../domain/training.js';
 
 /** One raw platform rating dimension, preserved exactly as the platform reported it. */
 export interface WorkbenchRatingView {
@@ -269,3 +278,181 @@ export interface WorkbenchRetrospectiveResult {
   readonly note: string | null;
   readonly recorded: true;
 }
+
+// ---------------------------------------------------------------------------------------
+// Weakness statistics (Stage 4w1b)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Explicit bounds and provenance of one weakness read.
+ *
+ * `metadataMissingKeys` are attempted problems whose metadata row is absent: they still count as
+ * attempted (distinct-problem counting is submission-driven), but they carry no tags or ratings, so
+ * the caller sees exactly which part of the sample the statistics could not describe instead of
+ * getting a silently smaller report.
+ */
+export interface WorkbenchWeaknessCoverage {
+  readonly submissionRows: number;
+  readonly distinctProblems: number;
+  readonly metadataPresent: number;
+  readonly metadataMissing: number;
+  readonly metadataMissingKeys: readonly string[];
+  readonly decisionsRead: number;
+  /** AI decisions dropped because they no longer target the stored snapshot head. */
+  readonly staleAiDecisionsExcluded: number;
+  readonly retrospectivesRead: number;
+  readonly submissionRowBound: number;
+  readonly distinctProblemBound: number;
+  readonly decisionRowBound: number;
+  readonly retrospectiveRowBound: number;
+}
+
+/** Original platform tags, kept next to the report as unverified provenance. */
+export interface WorkbenchRawTagProvenance {
+  readonly problemsWithRawTags: number;
+  readonly distinctRawTags: readonly string[];
+  /** Always `false`: a raw platform tag is never an accepted/effective taxonomy tag. */
+  readonly verified: false;
+  readonly note: string;
+}
+
+/** One account's weakness statistics plus the coverage they were computed from. */
+export interface WorkbenchWeaknessResult {
+  /** Pure domain report: distinct problems, minimum-sample gate, latest retrospective wins. */
+  readonly report: AccountWeaknessReport;
+  readonly coverage: WorkbenchWeaknessCoverage;
+  readonly rawTagProvenance: WorkbenchRawTagProvenance;
+}
+
+// ---------------------------------------------------------------------------------------
+// Training plans (Stage 4w1b)
+// ---------------------------------------------------------------------------------------
+
+/** Editable scheduling fields of one task; identity, links, tags and rationale are not editable. */
+export interface WorkbenchPlanTaskPatch {
+  readonly day?: number;
+  readonly minutes?: number;
+  readonly kind?: TrainingTaskKind;
+}
+
+/**
+ * One scheduled task.
+ *
+ * `taxonomyIds` and `rationale` are spoiler material (they name the technique to use): while the
+ * selected account has not solved the task's problem and no explicit reveal was requested they are
+ * **absent** own properties, exactly like the bank/detail projections.
+ */
+export interface WorkbenchPlanTaskView {
+  readonly taskId: string;
+  readonly planId: string;
+  readonly day: number;
+  readonly order: number;
+  readonly candidateId: string;
+  readonly problemKey: string;
+  readonly title: string;
+  readonly sourceUrl: string;
+  readonly minutes: number;
+  readonly kind: TrainingTaskKind;
+  readonly status: TrainingTaskStatus;
+  readonly checkedAt: string | null;
+  /** Candidate tags; absent while this task's problem is unsolved and not revealed. */
+  readonly taxonomyIds?: readonly string[];
+  /** Why the generator scheduled this candidate; absent while withheld. */
+  readonly rationale?: string;
+}
+
+/** Per-day totals of one plan. */
+export interface WorkbenchPlanDayView {
+  readonly day: number;
+  readonly taskCount: number;
+  readonly minutes: number;
+  readonly unmetMinutes: number;
+}
+
+/**
+ * Plan-level evidence.
+ *
+ * `sufficientTagIds` is aggregate account weakness (tags with a sufficient sample), not a
+ * per-problem mapping, so it stays visible while individual task tags are withheld.
+ */
+export interface WorkbenchPlanEvidenceView {
+  readonly level: TrainingEvidenceLevel;
+  readonly reasons: readonly PlanEvidenceReason[];
+  readonly attemptedDistinctTotal: number;
+  readonly sufficientTagIds: readonly string[];
+}
+
+/** One stored plan, projected field by field (no stored plan is ever spread into a response). */
+export interface WorkbenchPlanView {
+  readonly planId: string;
+  readonly title: string;
+  readonly source: 'rule' | 'model';
+  readonly status: TrainingPlanStatus;
+  readonly createdAt: string;
+  readonly adoptedAt: string | null;
+  readonly accountId: string | null;
+  readonly horizonDays: number;
+  readonly minutesPerDay: number;
+  readonly totalPlannedMinutes: number;
+  readonly totalUnmetMinutes: number;
+  readonly taskCount: number;
+  readonly distinctCandidates: number;
+  readonly hasDuplicateCandidates: boolean;
+  readonly days: readonly WorkbenchPlanDayView[];
+  readonly tasks: readonly WorkbenchPlanTaskView[];
+  readonly unmetMinutes: readonly UnmetMinutes[];
+  readonly evidence: WorkbenchPlanEvidenceView;
+  /** Full sha256 of the stored plan; the CAS token `adoptPlan`/`editPlanTask`/`checkOffTask` take. */
+  readonly contentHash: string;
+  /** Target tags of the whole plan; absent unless spoilers are explicitly revealed. */
+  readonly targetedTagIds?: readonly string[];
+}
+
+/** Plans of one account; every plan belongs to the requested account. */
+export interface WorkbenchPlanListResult {
+  readonly accountId: string;
+  readonly plans: readonly WorkbenchPlanView[];
+}
+
+/** Effective settings of one preview, echoed so the caller can reason about the draft. */
+export interface WorkbenchPlanSettingsView {
+  readonly estimatedMinutes: number;
+  readonly horizonDays: number;
+  readonly minutesPerDay: number;
+}
+
+/** One candidate the rule generator refused, with the domain's machine-readable reason. */
+export interface WorkbenchPlanRejectedCandidateView {
+  readonly candidateId: string | null;
+  readonly reason: CandidateRejectionReason;
+  readonly detail: string;
+}
+
+/** One starter technique offered when no valid candidate exists. */
+export interface WorkbenchPlanBeginnerRecommendationView {
+  readonly taxonomyId: string;
+  readonly nameEn: string;
+  readonly nameZh: string;
+  readonly basis: 'taxonomy_default';
+  readonly rationale: string;
+}
+
+/** A draft plan was generated and stored; `plan.contentHash` is the token for the next mutation. */
+export interface WorkbenchPlanPreviewDraft {
+  readonly outcome: 'draft';
+  readonly plan: WorkbenchPlanView;
+  readonly settings: WorkbenchPlanSettingsView;
+  readonly rejectedCandidates: readonly WorkbenchPlanRejectedCandidateView[];
+}
+
+/** No valid candidate existed; nothing was stored and no problem was invented. */
+export interface WorkbenchPlanPreviewInsufficient {
+  readonly outcome: 'insufficient_evidence';
+  readonly reason: 'insufficient_evidence';
+  readonly evidence: WorkbenchPlanEvidenceView;
+  readonly beginnerRecommendations: readonly WorkbenchPlanBeginnerRecommendationView[];
+  readonly rejectedCandidates: readonly WorkbenchPlanRejectedCandidateView[];
+  readonly settings: WorkbenchPlanSettingsView;
+}
+
+export type WorkbenchPlanPreviewResult = WorkbenchPlanPreviewDraft | WorkbenchPlanPreviewInsufficient;

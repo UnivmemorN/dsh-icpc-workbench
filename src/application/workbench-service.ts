@@ -1,50 +1,78 @@
 /**
- * Workbench read/review service (Stage 4w1a): `listProblems`, `getProblem`, `reviewTag`,
- * `recordRetrospective`.
+ * Workbench service (Stages 4w1a–4w1b): `listProblems`, `getProblem`, `reviewTag`,
+ * `recordRetrospective`, `weakness` and the training-plan operations (`previewPlan`, `listPlans`,
+ * `getPlan`, `adoptPlan`, `editPlanTask`, `checkOffTask`).
  *
  * The service owns policy — paging, whole-bank search, the review queue, spoiler discipline,
- * manual precedence and retrospective validation — while the injected store owns durability and
- * the injected taxonomy owns tag identity. It never reads a clock directly (every timestamp comes
- * from `now()`), never fabricates a title, URL or solution body, and never spreads a stored
- * snapshot into a response: every DTO is built field by field, so a withheld spoiler field is an
- * *absent* own property instead of a `null` that a caller could read as "empty".
- * Weakness ranking and training plans are deliberately absent.
+ * manual precedence, retrospective validation, bounded statistics and plan CAS — while the
+ * injected store owns durability and the injected taxonomy owns tag identity. It never reads a
+ * clock directly (every timestamp comes from `now()`), never fabricates a title, URL, candidate or
+ * solution body, and never spreads a stored snapshot or plan into a response: every DTO is built
+ * field by field, so a withheld spoiler field is an *absent* own property instead of a `null` that
+ * a caller could read as "empty". Plan mutations re-read the stored plan inside their transaction
+ * and compare the caller's full content hash before transitioning, so a stale screen can never
+ * overwrite a newer edit.
  *
- * Failures are typed: `missing_reference` for an unknown problem/account/solution, `invalid_input`
- * for malformed or foreign-scope arguments (with a machine-readable `reason`), `unknown_taxonomy_id`
- * for an unknown tag, and `cancelled` on cancellation. Cancellation is checked after every awaited
- * write, so a cancelled review rolls its transaction back instead of leaving a half-recorded one.
+ * Failures are typed: `missing_reference` for an unknown problem/account/solution/plan, `invalid_input`
+ * for malformed or foreign-scope arguments and for persisted rows that are incoherent with the scope
+ * they are read for (each with a machine-readable `reason`), `invalid_transition` for a stale plan
+ * hash or a refused domain transition, `unknown_taxonomy_id` for an unknown tag, and `cancelled` on
+ * cancellation. A stored row that names another account or source instance is refused instead of
+ * filtered: a silently smaller history would describe a different account. Cancellation is checked
+ * after every awaited write, so a cancelled review or preview rolls its transaction back instead of
+ * leaving a half-recorded one.
  */
 import {
   COMPLETION_MODES,
   DomainError,
+  TRAINING_TASK_KINDS,
+  adoptPlan as adoptTrainingPlan,
   analysisIsStale,
   assertIsoTimestamp,
   assertKnownTag,
+  checkOffTask as checkOffTrainingTask,
+  computeWeaknessReports,
   contentHashOf,
   createManualTagDecision,
   createRetrospective,
   createTagDecision,
+  createTrainingCandidate,
   decisionIsEffective,
+  editPlanTask as editTrainingTask,
+  generateRulePlan,
   invariant,
   isAccepted,
   latestRetrospectiveByProblem,
   manualDecisionsForProblem,
+  parseProblemKey,
+  previewPlan as summariseTrainingPlan,
+  problemKey,
+  reportForAccount,
   verificationFor,
   type Account,
+  type AccountWeaknessReport,
   type AnalysisResult,
+  type BeginnerRecommendation,
   type CancellationToken,
   type CompletionMode,
   type ManualTagAction,
   type ManualTagDecision,
   type NormalizedProblem,
+  type PlanTaskPatch,
+  type ProblemRef,
   type ProblemSnapshot,
+  type RejectedCandidate,
   type Retrospective,
   type SnapshotHead,
   type Submission,
   type SuggestionVerification,
   type TagDecision,
   type TaxonomyIndex,
+  type TrainingCandidate,
+  type TrainingEvidence,
+  type TrainingPlan,
+  type TrainingTask,
+  type TrainingTaskKind,
 } from '../domain/index.js';
 import { currentDecisionPerTag } from '../domain/tags.js';
 import type { TrainingStore } from './ports.js';
@@ -54,6 +82,15 @@ import type {
   WorkbenchEditorialSourceView,
   WorkbenchEvidenceView,
   WorkbenchManualDecisionView,
+  WorkbenchPlanEvidenceView,
+  WorkbenchPlanBeginnerRecommendationView,
+  WorkbenchPlanListResult,
+  WorkbenchPlanPreviewResult,
+  WorkbenchPlanRejectedCandidateView,
+  WorkbenchPlanSettingsView,
+  WorkbenchPlanTaskPatch,
+  WorkbenchPlanTaskView,
+  WorkbenchPlanView,
   WorkbenchProblemDetail,
   WorkbenchProblemPage,
   WorkbenchProblemSummary,
@@ -67,6 +104,8 @@ import type {
   WorkbenchTagDecisionView,
   WorkbenchTagReviewResult,
   WorkbenchVerificationView,
+  WorkbenchWeaknessCoverage,
+  WorkbenchWeaknessResult,
 } from './workbench-types.js';
 
 /** Store rows read per internal walk of one account's submission history. */
@@ -88,6 +127,39 @@ export const MAX_REVIEW_NOTE_CHARS = 2000;
  * an unbounded dedup) with a huge array; a longer list is refused rather than truncated.
  */
 export const MAX_RETROSPECTIVE_IDS = 500;
+
+/** Minimum distinct attempted problems before a tag enters the weakness ranking (domain gate). */
+export const WORKBENCH_MIN_WEAKNESS_SAMPLE = 5;
+
+/** Distinct attempted problems one weakness read accepts; more is an explicit refusal. */
+export const MAX_WEAKNESS_DISTINCT_PROBLEMS = 20_000;
+
+/** Tag-decision rows one weakness read accepts across all attempted problems. */
+export const MAX_WEAKNESS_DECISIONS = 50_000;
+
+/** Retrospective rows one weakness read accepts for the selected account. */
+export const MAX_WEAKNESS_RETROSPECTIVES = 50_000;
+
+/** Maximum distinct candidate problems one plan preview accepts. */
+export const MAX_PLAN_CANDIDATES = 500;
+
+/** Approved bounds of the plan settings (defaults: 7 days, 60 minutes/day, 30 minutes/problem). */
+export const MAX_PLAN_HORIZON_DAYS = 30;
+export const MAX_PLAN_MINUTES_PER_DAY = 480;
+export const MAX_PLAN_ESTIMATED_MINUTES = 480;
+export const DEFAULT_PLAN_HORIZON_DAYS = 7;
+export const DEFAULT_PLAN_MINUTES_PER_DAY = 60;
+export const DEFAULT_PLAN_ESTIMATED_MINUTES = 30;
+
+/** Maximum scheduled tasks per day in a rule-generated plan. */
+export const PLAN_MAX_TASKS_PER_DAY = 3;
+
+/** Maximum accepted plan title length. */
+export const MAX_PLAN_TITLE_CHARS = 200;
+
+/** Explains why raw platform tags are reported next to, never inside, the weakness report. */
+const RAW_TAG_PROVENANCE_NOTE =
+  'Raw platform tags are original, unverified provenance; they are not effective taxonomy tags and never count as accepted.';
 
 const CURSOR_PREFIX = 'workbench-problems.v1';
 
@@ -136,6 +208,64 @@ export interface WorkbenchRetrospectiveRequest {
   readonly taxonomyIds?: readonly string[];
   readonly solutionIds?: readonly string[];
   readonly note?: string | null;
+}
+
+/** One account's weakness statistics. Training mutations always need an explicit account. */
+export interface WorkbenchWeaknessRequest {
+  readonly accountId: string;
+}
+
+/** Build one rule-based draft plan from an explicit, real candidate pool. */
+export interface WorkbenchPlanPreviewRequest {
+  readonly accountId: string;
+  /** Stored problem keys to schedule; duplicates are collapsed, the first occurrence wins. */
+  readonly candidateProblemKeys: readonly string[];
+  readonly estimatedMinutes?: number | null;
+  readonly horizonDays?: number | null;
+  readonly minutesPerDay?: number | null;
+  readonly title?: string | null;
+  /** Show candidate tags/targets of problems this account has not solved. */
+  readonly reveal?: boolean;
+}
+
+export interface WorkbenchPlanListRequest {
+  readonly accountId: string;
+  readonly reveal?: boolean;
+}
+
+export interface WorkbenchGetPlanRequest {
+  readonly planId: string;
+  readonly accountId: string;
+  readonly reveal?: boolean;
+}
+
+/** Optimistic-concurrency request: `expectedHash` is the last returned full plan content hash. */
+export interface WorkbenchPlanCasRequest {
+  readonly planId: string;
+  readonly accountId: string;
+  readonly expectedHash: string;
+}
+
+export interface WorkbenchEditPlanTaskRequest extends WorkbenchPlanCasRequest {
+  readonly taskId: string;
+  /** Only the scheduling fields are accepted; identity, links and tags stay untouched. */
+  readonly patch: WorkbenchPlanTaskPatch;
+}
+
+export interface WorkbenchCheckOffTaskRequest extends WorkbenchPlanCasRequest {
+  readonly taskId: string;
+  readonly status: 'done' | 'skipped';
+}
+
+/** Everything one weakness read collects, before the pure domain reduction runs. */
+interface WeaknessEvidence {
+  readonly submissions: readonly Submission[];
+  readonly problems: readonly NormalizedProblem[];
+  readonly decisions: readonly TagDecision[];
+  readonly retrospectives: readonly Retrospective[];
+  readonly coverage: WorkbenchWeaknessCoverage;
+  readonly rawTags: readonly string[];
+  readonly problemsWithRawTags: number;
 }
 
 interface ListFilters {
@@ -230,7 +360,7 @@ export class WorkbenchService {
 
       // Solved status is derived from this account's own accepted submissions only; a missing
       // account context means no row is solved and no tag material is revealed by default.
-      const solvedKeys = account === null || page.items.length === 0 ? null : await this.solvedKeys(account.id, token);
+      const solvedKeys = account === null || page.items.length === 0 ? null : await this.solvedKeys(account, token);
       const items: WorkbenchProblemSummary[] = [];
       for (const problem of page.items) {
         const solved = solvedKeys?.has(problem.key) ?? false;
@@ -288,7 +418,7 @@ export class WorkbenchService {
       token.throwIfCancelled();
       const manualDecisions = await this.store.listManualDecisions(problemKey);
       token.throwIfCancelled();
-      const solved = account === null ? false : await this.isSolvedBy(account.id, problemKey, token);
+      const solved = account === null ? false : await this.isSolvedBy(account, problemKey, token);
       const retrospective =
         account === null ? null : await this.latestRetrospectiveOf(account.id, problemKey, token);
       // The head is the staleness authority and is read after every history: a projection that
@@ -538,6 +668,519 @@ export class WorkbenchService {
   }
 
   // -------------------------------------------------------------------------------------
+  // weakness
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Distinct-problem weakness statistics for one account.
+   *
+   * The whole read is one serialized transaction over bounded data: the account's submissions are
+   * walked once (<= {@link MAX_ACCOUNT_SUBMISSIONS} rows and <= {@link MAX_WEAKNESS_DISTINCT_PROBLEMS}
+   * distinct problems), every attempted problem's decisions are read together with its stored head
+   * so that only current AI decisions count, and the retrospective history is bounded as well. Any
+   * overflow is a typed refusal — statistics computed from a silently truncated history would
+   * describe a different sample. Raw platform tags come back separately as unverified provenance;
+   * they never enter the report. Accounts are never mixed: only the selected account's rows are read.
+   */
+  async weakness(request: WorkbenchWeaknessRequest, token: CancellationToken): Promise<WorkbenchWeaknessResult> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(request !== null && typeof request === 'object', 'invalid_input', 'weakness needs a request object', {});
+    const accountId = requireRequiredId('accountId', request.accountId);
+    return this.store.transaction(async (): Promise<WorkbenchWeaknessResult> => {
+      token.throwIfCancelled();
+      const account = await this.requireAccount(accountId, token);
+      const evidence = await this.collectWeaknessEvidence(account, token);
+      return {
+        report: this.weaknessReportOf(account, evidence),
+        coverage: evidence.coverage,
+        rawTagProvenance: {
+          problemsWithRawTags: evidence.problemsWithRawTags,
+          distinctRawTags: evidence.rawTags,
+          verified: false,
+          note: RAW_TAG_PROVENANCE_NOTE,
+        },
+      };
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // previewPlan
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Generate and store one rule-based draft plan from an explicit candidate pool.
+   *
+   * Candidates are looked up in the store — never taken from the request body — and must belong to
+   * the account's source instance; their effective tags are resolved at the current head, so stale
+   * AI decisions cannot steer the schedule. Generation is pure and model-free (`generateRulePlan`);
+   * an empty or unusable pool returns the domain's honest `insufficient_evidence` with starter
+   * recommendations and stores nothing. A successful draft is written in one transaction, and the
+   * returned `contentHash` is the full hash of the *stored* plan, which later mutations must present.
+   */
+  async previewPlan(request: WorkbenchPlanPreviewRequest, token: CancellationToken): Promise<WorkbenchPlanPreviewResult> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(request !== null && typeof request === 'object', 'invalid_input', 'previewPlan needs a request object', {});
+    const accountId = requireRequiredId('accountId', request.accountId);
+    const candidateProblemKeys = requireCandidateKeys(request.candidateProblemKeys);
+    const settings: WorkbenchPlanSettingsView = {
+      estimatedMinutes: boundedInt(
+        'estimatedMinutes',
+        request.estimatedMinutes,
+        DEFAULT_PLAN_ESTIMATED_MINUTES,
+        1,
+        MAX_PLAN_ESTIMATED_MINUTES,
+      ),
+      horizonDays: boundedInt('horizonDays', request.horizonDays, DEFAULT_PLAN_HORIZON_DAYS, 1, MAX_PLAN_HORIZON_DAYS),
+      minutesPerDay: boundedInt(
+        'minutesPerDay',
+        request.minutesPerDay,
+        DEFAULT_PLAN_MINUTES_PER_DAY,
+        1,
+        MAX_PLAN_MINUTES_PER_DAY,
+      ),
+    };
+    const reveal = optionalFlag('reveal', request.reveal);
+    const title = optionalPlanTitle(request.title);
+
+    return this.store.transaction(async (): Promise<WorkbenchPlanPreviewResult> => {
+      token.throwIfCancelled();
+      const account = await this.requireAccount(accountId, token);
+      const evidence = await this.collectWeaknessEvidence(account, token);
+      const report = this.weaknessReportOf(account, evidence);
+      const weakTagIds = new Set(report.ranking.map((tag) => tag.taxonomyId));
+
+      const candidates: TrainingCandidate[] = [];
+      for (const candidateKey of candidateProblemKeys) {
+        const problem = await this.store.getProblem(candidateKey);
+        token.throwIfCancelled();
+        if (problem === null) {
+          throw new DomainError('missing_reference', `candidate problem ${candidateKey} is not stored`, {
+            reason: 'unknown_candidate',
+            problemKey: candidateKey,
+          });
+        }
+        invariant(
+          problem.ref.sourceInstanceId === account.sourceInstanceId,
+          'invalid_input',
+          `candidate ${candidateKey} belongs to ${problem.ref.sourceInstanceId}, not to account ${account.id}`,
+          {
+            reason: 'candidate_source_mismatch',
+            problemKey: candidateKey,
+            accountId: account.id,
+            candidateSource: problem.ref.sourceInstanceId,
+            accountSource: account.sourceInstanceId,
+          },
+        );
+        const decisions = await this.store.listTagDecisions(candidateKey);
+        token.throwIfCancelled();
+        const head = await this.store.getCurrentSnapshotHead(problem.ref);
+        token.throwIfCancelled();
+        const taxonomyIds = effectiveCurrentTaxonomyIds(decisions, head);
+        candidates.push(
+          createTrainingCandidate({
+            candidateId: this.mintCandidateId(),
+            problemRef: problem.ref,
+            title: problem.title,
+            sourceUrl: problem.url,
+            estimatedMinutes: settings.estimatedMinutes,
+            taxonomyIds,
+            ratings: problem.ratings,
+            origin: taxonomyIds.some((taxonomyId) => weakTagIds.has(taxonomyId)) ? 'weakness' : 'unsolved_pool',
+          }),
+        );
+      }
+
+      // Permission and cancellation are re-checked immediately before the write: a plan must never
+      // be stored for an account that was removed or repointed while the preview was being built.
+      token.throwIfCancelled();
+      const confirmed = await this.store.getAccount(account.id);
+      token.throwIfCancelled();
+      invariant(
+        confirmed !== null && confirmed.sourceInstanceId === account.sourceInstanceId,
+        'invalid_transition',
+        `account ${account.id} changed before the plan was written`,
+        { reason: 'account_changed', accountId: account.id },
+      );
+
+      const generated = generateRulePlan({
+        candidates,
+        weaknessReports: [report],
+        settings: { horizonDays: settings.horizonDays, minutesPerDay: settings.minutesPerDay, maxTasksPerDay: PLAN_MAX_TASKS_PER_DAY },
+        now: this.now(),
+        accountId: account.id,
+        taxonomy: this.taxonomy,
+        title: title ?? undefined,
+      });
+      if (!generated.ok) {
+        return {
+          outcome: 'insufficient_evidence',
+          reason: 'insufficient_evidence',
+          evidence: planEvidenceView(generated.evidence),
+          beginnerRecommendations: generated.beginnerRecommendations.map(beginnerRecommendationView),
+          rejectedCandidates: generated.rejectedCandidates.map(rejectedCandidateView),
+          settings,
+        };
+      }
+      await this.store.savePlan(generated.plan);
+      token.throwIfCancelled();
+      const written = await this.rereadPlan(generated.plan.planId, generated.plan, token);
+      return {
+        outcome: 'draft',
+        plan: this.projectPlan(written, solvedKeysOf(evidence.submissions), reveal),
+        settings,
+        rejectedCandidates: generated.rejectedCandidates.map(rejectedCandidateView),
+      };
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // listPlans / getPlan / adoptPlan / editPlanTask / checkOffTask
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Plans of one account, projected with the same spoiler rule as the bank.
+   *
+   * The account's submission history is walked exactly once for the whole list; solved status is
+   * account-wide, so a per-plan walk would repeat the same bounded read.
+   */
+  async listPlans(request: WorkbenchPlanListRequest, token: CancellationToken): Promise<WorkbenchPlanListResult> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(request !== null && typeof request === 'object', 'invalid_input', 'listPlans needs a request object', {});
+    const accountId = requireRequiredId('accountId', request.accountId);
+    const reveal = optionalFlag('reveal', request.reveal);
+    return this.store.transaction(async (): Promise<WorkbenchPlanListResult> => {
+      token.throwIfCancelled();
+      const account = await this.requireAccount(accountId, token);
+      const solved = await this.solvedKeys(account, token);
+      const plans = await this.store.listPlans(account.id);
+      token.throwIfCancelled();
+      return { accountId: account.id, plans: plans.map((plan) => this.projectPlan(plan, solved, reveal)) };
+    });
+  }
+
+  /** One plan of one account, projected with the same spoiler rule as the bank. */
+  async getPlan(request: WorkbenchGetPlanRequest, token: CancellationToken): Promise<WorkbenchPlanView> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(request !== null && typeof request === 'object', 'invalid_input', 'getPlan needs a request object', {});
+    const planId = requireRequiredId('planId', request.planId);
+    const accountId = requireRequiredId('accountId', request.accountId);
+    const reveal = optionalFlag('reveal', request.reveal);
+    return this.store.transaction(async (): Promise<WorkbenchPlanView> => {
+      token.throwIfCancelled();
+      const account = await this.requireAccount(accountId, token);
+      const plan = await this.requireOwnedPlan(planId, account.id, token);
+      const solved = await this.solvedKeys(account, token);
+      return this.projectPlan(plan, solved, reveal);
+    });
+  }
+
+  /**
+   * Adopt a draft plan after the human confirmed its preview.
+   *
+   * `expectedHash` must equal the full content hash of the stored plan; the stored plan is re-read
+   * inside the transaction and compared before the domain transition runs, so a caller holding a
+   * stale screen gets a typed conflict and no write. The returned view is the fresh stored plan.
+   */
+  async adoptPlan(request: WorkbenchPlanCasRequest, token: CancellationToken): Promise<WorkbenchPlanView> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(request !== null && typeof request === 'object', 'invalid_input', 'adoptPlan needs a request object', {});
+    const planId = requireRequiredId('planId', request.planId);
+    const accountId = requireRequiredId('accountId', request.accountId);
+    const expectedHash = requirePlanHashInput(request.expectedHash);
+    return this.store.transaction(async (): Promise<WorkbenchPlanView> => {
+      token.throwIfCancelled();
+      const account = await this.requireAccount(accountId, token);
+      const stored = await this.requireOwnedPlan(planId, account.id, token);
+      requirePlanHash(stored, expectedHash, planId);
+      const updated = adoptTrainingPlan(stored, { adoptedAt: this.now() });
+      await this.store.savePlan(updated);
+      token.throwIfCancelled();
+      const written = await this.rereadPlan(planId, updated, token);
+      const solved = await this.solvedKeys(account, token);
+      return this.projectPlan(written, solved, false);
+    });
+  }
+
+  /**
+   * Reschedule one planned task (`day`, `minutes`, `kind` only).
+   *
+   * Identity, title, link, tags and rationale cannot be replaced by the client; the domain refuses
+   * a day/minute outside the plan's bounds, an overfilled day and a task that is already completed
+   * or skipped. As with adoption, the stored plan is re-read and hash-checked before the edit.
+   */
+  async editPlanTask(request: WorkbenchEditPlanTaskRequest, token: CancellationToken): Promise<WorkbenchPlanView> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(request !== null && typeof request === 'object', 'invalid_input', 'editPlanTask needs a request object', {});
+    const planId = requireRequiredId('planId', request.planId);
+    const accountId = requireRequiredId('accountId', request.accountId);
+    const expectedHash = requirePlanHashInput(request.expectedHash);
+    const taskId = requireRequiredId('taskId', request.taskId);
+    const patch = parseTaskPatch(request.patch);
+    return this.store.transaction(async (): Promise<WorkbenchPlanView> => {
+      token.throwIfCancelled();
+      const account = await this.requireAccount(accountId, token);
+      const stored = await this.requireOwnedPlan(planId, account.id, token);
+      requirePlanHash(stored, expectedHash, planId);
+      const updated = editTrainingTask(stored, taskId, patch, { at: this.now() });
+      await this.store.savePlan(updated);
+      token.throwIfCancelled();
+      const written = await this.rereadPlan(planId, updated, token);
+      const solved = await this.solvedKeys(account, token);
+      return this.projectPlan(written, solved, false);
+    });
+  }
+
+  /**
+   * Record that a task was done or skipped.
+   *
+   * This is a user record only: it creates no submission and claims no judge verdict, and only an
+   * adopted plan accepts one. The CAS check is identical to adoption and editing.
+   */
+  async checkOffTask(request: WorkbenchCheckOffTaskRequest, token: CancellationToken): Promise<WorkbenchPlanView> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(request !== null && typeof request === 'object', 'invalid_input', 'checkOffTask needs a request object', {});
+    const planId = requireRequiredId('planId', request.planId);
+    const accountId = requireRequiredId('accountId', request.accountId);
+    const expectedHash = requirePlanHashInput(request.expectedHash);
+    const taskId = requireRequiredId('taskId', request.taskId);
+    const status = request.status;
+    invariant(
+      status === 'done' || status === 'skipped',
+      'invalid_input',
+      `checkOff status must be done|skipped (got ${String(status)})`,
+      { status },
+    );
+    return this.store.transaction(async (): Promise<WorkbenchPlanView> => {
+      token.throwIfCancelled();
+      const account = await this.requireAccount(accountId, token);
+      const stored = await this.requireOwnedPlan(planId, account.id, token);
+      requirePlanHash(stored, expectedHash, planId);
+      const updated = checkOffTrainingTask(stored, taskId, { at: this.now(), status });
+      await this.store.savePlan(updated);
+      token.throwIfCancelled();
+      const written = await this.rereadPlan(planId, updated, token);
+      const solved = await this.solvedKeys(account, token);
+      return this.projectPlan(written, solved, false);
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Weakness & plan internals (always called inside the caller's transaction)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Collect every bounded input the weakness reduction needs.
+   *
+   * Decisions are read per attempted problem together with that problem's stored head, because an
+   * AI decision only counts while it targets the current head; the submission ref survives even
+   * when the problem metadata row is gone, so a missing problem is still counted as attempted and
+   * reported in the coverage instead of disappearing. Every collected row is additionally proved
+   * coherent with the selected account before it reaches the reduction: the submission walk refuses
+   * a row belonging to another account/source, and a *present* problem metadata or retrospective row
+   * that names another scope is refused instead of being counted for this account.
+   */
+  private async collectWeaknessEvidence(account: Account, token: CancellationToken): Promise<WeaknessEvidence> {
+    const submissions: Submission[] = [];
+    for await (const page of this.submissionPages(account, token)) {
+      submissions.push(...page);
+    }
+    const refByProblem = new Map<string, ProblemRef>();
+    for (const submission of submissions) {
+      if (!refByProblem.has(submission.key)) {
+        refByProblem.set(submission.key, submission.ref);
+      }
+    }
+    invariant(
+      refByProblem.size <= MAX_WEAKNESS_DISTINCT_PROBLEMS,
+      'invalid_input',
+      `account ${account.id} has more than ${MAX_WEAKNESS_DISTINCT_PROBLEMS} distinct attempted problems; statistics cannot be computed from a truncated history`,
+      {
+        reason: 'distinct_problem_overflow',
+        accountId: account.id,
+        distinct: refByProblem.size,
+        bound: MAX_WEAKNESS_DISTINCT_PROBLEMS,
+      },
+    );
+
+    const problems: NormalizedProblem[] = [];
+    const decisions: TagDecision[] = [];
+    const metadataMissingKeys: string[] = [];
+    const rawTags = new Set<string>();
+    let problemsWithRawTags = 0;
+    let decisionsRead = 0;
+    let staleAiDecisionsExcluded = 0;
+
+    for (const [key, ref] of [...refByProblem.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+      const problem = await this.store.getProblem(key);
+      token.throwIfCancelled();
+      if (problem === null) {
+        // Missing metadata is a different statement from incoherent metadata: the reference is the
+        // account's own (it came from a validated submission row) and simply has no stored row, so
+        // the problem stays counted as attempted and reported in the coverage.
+        metadataMissingKeys.push(key);
+      } else {
+        assertProblemMetadataCoherent(problem, key, account);
+        problems.push(problem);
+        if (problem.rawTags.length > 0) {
+          problemsWithRawTags += 1;
+        }
+        for (const rawTag of problem.rawTags) {
+          rawTags.add(rawTag.raw);
+        }
+      }
+      const head = await this.store.getCurrentSnapshotHead(ref);
+      token.throwIfCancelled();
+      const stored = await this.store.listTagDecisions(key);
+      token.throwIfCancelled();
+      decisionsRead += stored.length;
+      invariant(
+        decisionsRead <= MAX_WEAKNESS_DECISIONS,
+        'invalid_input',
+        `account ${account.id} has more than ${MAX_WEAKNESS_DECISIONS} stored tag decisions; statistics cannot be computed from a truncated history`,
+        { reason: 'decision_history_overflow', accountId: account.id, decisionsRead, bound: MAX_WEAKNESS_DECISIONS },
+      );
+      const kept = currentStoredDecisions(stored, head);
+      staleAiDecisionsExcluded += stored.length - kept.length;
+      decisions.push(...kept);
+    }
+
+    const retrospectives = await this.store.listRetrospectives(account.id);
+    token.throwIfCancelled();
+    invariant(
+      retrospectives.length <= MAX_WEAKNESS_RETROSPECTIVES,
+      'invalid_input',
+      `account ${account.id} has more than ${MAX_WEAKNESS_RETROSPECTIVES} stored retrospectives; statistics cannot be computed from a truncated history`,
+      {
+        reason: 'retrospective_history_overflow',
+        accountId: account.id,
+        retrospectives: retrospectives.length,
+        bound: MAX_WEAKNESS_RETROSPECTIVES,
+      },
+    );
+    for (const retrospective of retrospectives) {
+      assertRetrospectiveCoherent(retrospective, account);
+    }
+
+    return {
+      submissions,
+      problems,
+      decisions,
+      retrospectives,
+      coverage: {
+        submissionRows: submissions.length,
+        distinctProblems: refByProblem.size,
+        metadataPresent: problems.length,
+        metadataMissing: metadataMissingKeys.length,
+        metadataMissingKeys,
+        decisionsRead,
+        staleAiDecisionsExcluded,
+        retrospectivesRead: retrospectives.length,
+        submissionRowBound: MAX_ACCOUNT_SUBMISSIONS,
+        distinctProblemBound: MAX_WEAKNESS_DISTINCT_PROBLEMS,
+        decisionRowBound: MAX_WEAKNESS_DECISIONS,
+        retrospectiveRowBound: MAX_WEAKNESS_RETROSPECTIVES,
+      },
+      rawTags: [...rawTags].sort(),
+      problemsWithRawTags,
+    };
+  }
+
+  /** Pure domain reduction of the collected evidence; the minimum-sample gate lives in the domain. */
+  private weaknessReportOf(account: Account, evidence: WeaknessEvidence): AccountWeaknessReport {
+    const reports = computeWeaknessReports({
+      problems: evidence.problems,
+      submissions: evidence.submissions,
+      decisions: evidence.decisions,
+      retrospectives: evidence.retrospectives,
+      settings: { minDistinctProblems: WORKBENCH_MIN_WEAKNESS_SAMPLE, ratingDimension: null },
+      accountIds: [account.id],
+    });
+    const report = reportForAccount(reports, account.id);
+    invariant(report !== null, 'invalid_input', `no weakness report was produced for account ${account.id}`, {
+      accountId: account.id,
+    });
+    return report;
+  }
+
+  /** One plan of the selected account; a plan of another account is refused before it is projected. */
+  private async requireOwnedPlan(planId: string, accountId: string, token: CancellationToken): Promise<TrainingPlan> {
+    const plan = await this.store.getPlan(planId);
+    token.throwIfCancelled();
+    if (plan === null) {
+      throw new DomainError('missing_reference', `plan ${planId} is not stored`, { planId });
+    }
+    invariant(
+      plan.accountId === accountId,
+      'invalid_input',
+      `plan ${planId} does not belong to account ${accountId}`,
+      { reason: 'plan_account_mismatch', planId, accountId, planAccountId: plan.accountId },
+    );
+    return plan;
+  }
+
+  /** Read back what was written and prove it is the transition that was saved before projecting it. */
+  private async rereadPlan(planId: string, expected: TrainingPlan, token: CancellationToken): Promise<TrainingPlan> {
+    const written = await this.store.getPlan(planId);
+    token.throwIfCancelled();
+    invariant(written !== null, 'invalid_transition', `plan ${planId} was not stored`, { planId });
+    invariant(
+      planContentHash(written) === planContentHash(expected),
+      'invalid_transition',
+      `stored plan ${planId} does not match the transition that was saved`,
+      { planId },
+    );
+    return written;
+  }
+
+  /** One plan projected field by field; per-task tags follow each task problem's spoiler rule. */
+  private projectPlan(plan: TrainingPlan, solvedKeys: ReadonlySet<string>, reveal: boolean): WorkbenchPlanView {
+    const summary = summariseTrainingPlan(plan);
+    const view: WorkbenchPlanView = {
+      planId: plan.planId,
+      title: plan.title,
+      source: plan.source,
+      status: plan.status,
+      createdAt: plan.createdAt,
+      adoptedAt: plan.adoptedAt,
+      accountId: plan.accountId,
+      horizonDays: plan.horizonDays,
+      minutesPerDay: plan.minutesPerDay,
+      totalPlannedMinutes: summary.totalPlannedMinutes,
+      totalUnmetMinutes: summary.totalUnmetMinutes,
+      taskCount: summary.taskCount,
+      distinctCandidates: summary.distinctCandidates,
+      hasDuplicateCandidates: summary.hasDuplicateCandidates,
+      days: summary.days.map((day) => ({
+        day: day.day,
+        taskCount: day.taskCount,
+        minutes: day.minutes,
+        unmetMinutes: day.unmetMinutes,
+      })),
+      tasks: plan.tasks.map((task) => projectPlanTask(task, reveal || solvedKeys.has(task.problemKey))),
+      unmetMinutes: plan.unmetMinutes.map((entry) => ({ day: entry.day, minutes: entry.minutes })),
+      evidence: planEvidenceView(plan.evidence),
+      contentHash: planContentHash(plan),
+    };
+    if (!reveal) {
+      // The plan-wide target list aggregates per-task tags, so for withheld tasks it would leak
+      // their algorithms. It exists only in an explicit reveal; per-task fields follow the task.
+      return view;
+    }
+    return { ...view, targetedTagIds: [...summary.targetedTagIds] };
+  }
+
+  private mintCandidateId(): string {
+    return `candidate-${this.mintId()}`;
+  }
+
+  // -------------------------------------------------------------------------------------
   // Internal reads
   // -------------------------------------------------------------------------------------
 
@@ -621,9 +1264,9 @@ export class WorkbenchService {
   }
 
   /** Distinct problems this account solved, from its own accepted submissions (bounded walk). */
-  private async solvedKeys(accountId: string, token: CancellationToken): Promise<ReadonlySet<string>> {
+  private async solvedKeys(account: Account, token: CancellationToken): Promise<ReadonlySet<string>> {
     const solved = new Set<string>();
-    for await (const submissions of this.submissionPages(accountId, token)) {
+    for await (const submissions of this.submissionPages(account, token)) {
       for (const submission of submissions) {
         if (isAccepted(submission)) {
           solved.add(submission.key);
@@ -634,8 +1277,8 @@ export class WorkbenchService {
   }
 
   /** True when this account has an accepted submission for this problem (bounded walk). */
-  private async isSolvedBy(accountId: string, problemKey: string, token: CancellationToken): Promise<boolean> {
-    for await (const submissions of this.submissionPages(accountId, token)) {
+  private async isSolvedBy(account: Account, problemKey: string, token: CancellationToken): Promise<boolean> {
+    for await (const submissions of this.submissionPages(account, token)) {
       if (submissions.some((submission) => submission.key === problemKey && isAccepted(submission))) {
         return true;
       }
@@ -644,30 +1287,41 @@ export class WorkbenchService {
   }
 
   /**
-   * One bounded page walk over an account's submission history.
+   * One bounded page walk over one account's submission history.
    *
    * The running count is incremented and checked **before** a page is yielded and before a terminal
    * `null` cursor returns, so more than {@link MAX_ACCOUNT_SUBMISSIONS} stored submissions is a
    * typed refusal in every case — including a 50,001st row on the final page, which an
    * after-the-yield check used to wave through. A truncated history could hide the one AC that
    * decides whether a problem counts as solved.
+   *
+   * Every row is also proved to belong to `account` before its page is yielded: the store keeps a
+   * submission's key and ref consistent with each other, but it does not enforce that the row
+   * belongs to the account whose history was asked for, so a foreign row could otherwise let
+   * another account's (or another source instance's) AC decide this account's solved status and
+   * spoiler visibility. An incoherent row is a typed refusal, never a silent filter — dropping it
+   * would describe a different history. The account is the one the caller already loaded, so the
+   * walk performs no per-row lookup.
    */
   private async *submissionPages(
-    accountId: string,
+    account: Account,
     token: CancellationToken,
   ): AsyncGenerator<readonly Submission[], void, void> {
     let cursor: string | null = null;
     let scanned = 0;
     for (;;) {
-      const page = await this.store.listSubmissions(accountId, { limit: WORKBENCH_SUBMISSION_PAGE_SIZE, cursor });
+      const page = await this.store.listSubmissions(account.id, { limit: WORKBENCH_SUBMISSION_PAGE_SIZE, cursor });
       token.throwIfCancelled();
       scanned += page.items.length;
       invariant(
         scanned <= MAX_ACCOUNT_SUBMISSIONS,
         'invalid_input',
-        `account ${accountId} has more than ${MAX_ACCOUNT_SUBMISSIONS} stored submissions; solved status cannot be decided from a truncated history`,
-        { reason: 'submission_history_overflow', accountId, scanned, bound: MAX_ACCOUNT_SUBMISSIONS },
+        `account ${account.id} has more than ${MAX_ACCOUNT_SUBMISSIONS} stored submissions; solved status cannot be decided from a truncated history`,
+        { reason: 'submission_history_overflow', accountId: account.id, scanned, bound: MAX_ACCOUNT_SUBMISSIONS },
       );
+      for (const submission of page.items) {
+        assertSubmissionBelongsToAccount(submission, account);
+      }
       yield page.items;
       cursor = page.nextCursor;
       if (cursor === null) {
@@ -912,6 +1566,186 @@ function sourceMismatch(account: Account, sourceInstanceId: string): DomainError
   );
 }
 
+/**
+ * Re-derive the canonical key of one stored reference.
+ *
+ * Identity parsing belongs to the domain, so this composes {@link problemKey} instead of matching
+ * an id string with a local pattern. A reference the domain refuses is reported as bad input with
+ * the caller's own stable `reason`, so an incoherent row never escapes as a raw `invalid_id_part`.
+ */
+function canonicalKeyOfStoredRef(label: string, ref: ProblemRef, details: Record<string, unknown>): string {
+  try {
+    return problemKey(ref);
+  } catch (error) {
+    throw new DomainError('invalid_input', `${label} is not a canonical problem reference`, {
+      ...details,
+      cause: String(error),
+    });
+  }
+}
+
+/** Parse a stored retrospective's problem key through the domain helper, as typed bad input. */
+function parseStoredRetrospectiveRef(retrospective: Retrospective): ProblemRef {
+  try {
+    return parseProblemKey(retrospective.problemKey);
+  } catch (error) {
+    throw new DomainError(
+      'invalid_input',
+      `stored retrospective ${retrospective.retrospectiveId} carries a malformed problem key`,
+      {
+        reason: 'retrospective_key_mismatch',
+        retrospectiveId: retrospective.retrospectiveId,
+        problemKey: retrospective.problemKey,
+        cause: String(error),
+      },
+    );
+  }
+}
+
+/**
+ * Prove one stored submission row belongs to the account whose history is being walked.
+ *
+ * The store keeps a submission's `key` and `ref` consistent with each other, but a persisted row
+ * can still name another account or another source instance. Counting such a row would attribute a
+ * foreign AC — and with it the foreign problem's spoiler reveal — to the selected account, so the
+ * row is refused with a typed `invalid_input` rather than filtered out: a silently smaller history
+ * would describe a different account. The account is the one the caller already loaded, so this
+ * check needs no per-row lookup.
+ */
+function assertSubmissionBelongsToAccount(submission: Submission, account: Account): void {
+  invariant(
+    submission.accountId === account.id,
+    'invalid_input',
+    `stored submission ${submission.id} belongs to account ${submission.accountId}, not to ${account.id}`,
+    {
+      reason: 'submission_account_mismatch',
+      submissionId: submission.id,
+      accountId: account.id,
+      rowAccountId: submission.accountId,
+    },
+  );
+  invariant(
+    submission.ref.sourceInstanceId === account.sourceInstanceId,
+    'invalid_input',
+    `stored submission ${submission.id} belongs to ${submission.ref.sourceInstanceId}, not to account ${account.id}`,
+    {
+      reason: 'submission_source_mismatch',
+      submissionId: submission.id,
+      accountId: account.id,
+      accountSource: account.sourceInstanceId,
+      rowSource: submission.ref.sourceInstanceId,
+    },
+  );
+  const canonical = canonicalKeyOfStoredRef(`stored submission ${submission.id}`, submission.ref, {
+    reason: 'submission_key_mismatch',
+    submissionId: submission.id,
+    accountId: account.id,
+    rowKey: submission.key,
+  });
+  invariant(
+    canonical === submission.key,
+    'invalid_input',
+    `stored submission ${submission.id} carries key ${submission.key} but its reference names ${canonical}`,
+    {
+      reason: 'submission_key_mismatch',
+      submissionId: submission.id,
+      accountId: account.id,
+      rowKey: submission.key,
+      canonicalKey: canonical,
+    },
+  );
+}
+
+/**
+ * Prove one stored problem row really describes the problem the submission walk asked for.
+ *
+ * The row is the only source of a problem's tags and ratings in the weakness reduction, so an
+ * incoherent key/ref/source would let one problem's material count for another. `null` metadata is
+ * a different statement ("this attempted problem is not stored") and stays counted as attempted;
+ * only a *present* but incoherent row is refused. The reference is re-derived through the domain's
+ * {@link problemKey} so a non-canonical key is caught by identity parsing, not by a local pattern.
+ */
+function assertProblemMetadataCoherent(problem: NormalizedProblem, expectedKey: string, account: Account): void {
+  invariant(
+    problem.key === expectedKey,
+    'invalid_input',
+    `stored problem metadata for ${expectedKey} reports key ${problem.key}`,
+    { reason: 'problem_key_mismatch', accountId: account.id, expectedKey, storedKey: problem.key },
+  );
+  const canonical = canonicalKeyOfStoredRef(`stored problem metadata ${problem.key}`, problem.ref, {
+    reason: 'problem_key_mismatch',
+    accountId: account.id,
+    problemKey: problem.key,
+  });
+  invariant(
+    canonical === problem.key,
+    'invalid_input',
+    `stored problem metadata ${problem.key} does not match its own reference ${canonical}`,
+    { reason: 'problem_key_mismatch', accountId: account.id, problemKey: problem.key, canonicalKey: canonical },
+  );
+  invariant(
+    problem.ref.sourceInstanceId === account.sourceInstanceId,
+    'invalid_input',
+    `stored problem metadata ${problem.key} belongs to ${problem.ref.sourceInstanceId}, not to account ${account.id}`,
+    {
+      reason: 'problem_source_mismatch',
+      accountId: account.id,
+      accountSource: account.sourceInstanceId,
+      problemSource: problem.ref.sourceInstanceId,
+    },
+  );
+}
+
+/**
+ * Prove one stored retrospective belongs to the selected account and source instance.
+ *
+ * A retrospective for a same-source problem the account never submitted to is legitimate history
+ * (it may describe work outside the stored submission window), so a matching submission is never
+ * required; only account, source instance and canonical-key coherence are enforced.
+ */
+function assertRetrospectiveCoherent(retrospective: Retrospective, account: Account): void {
+  invariant(
+    retrospective.accountId === account.id,
+    'invalid_input',
+    `stored retrospective ${retrospective.retrospectiveId} belongs to account ${retrospective.accountId}, not to ${account.id}`,
+    {
+      reason: 'retrospective_account_mismatch',
+      retrospectiveId: retrospective.retrospectiveId,
+      accountId: account.id,
+      rowAccountId: retrospective.accountId,
+    },
+  );
+  const ref = parseStoredRetrospectiveRef(retrospective);
+  const canonical = canonicalKeyOfStoredRef(`stored retrospective ${retrospective.retrospectiveId}`, ref, {
+    reason: 'retrospective_key_mismatch',
+    retrospectiveId: retrospective.retrospectiveId,
+    problemKey: retrospective.problemKey,
+  });
+  invariant(
+    canonical === retrospective.problemKey,
+    'invalid_input',
+    `stored retrospective ${retrospective.retrospectiveId} carries key ${retrospective.problemKey} but its reference names ${canonical}`,
+    {
+      reason: 'retrospective_key_mismatch',
+      retrospectiveId: retrospective.retrospectiveId,
+      problemKey: retrospective.problemKey,
+      canonicalKey: canonical,
+    },
+  );
+  invariant(
+    ref.sourceInstanceId === account.sourceInstanceId,
+    'invalid_input',
+    `stored retrospective ${retrospective.retrospectiveId} belongs to ${ref.sourceInstanceId}, not to account ${account.id}`,
+    {
+      reason: 'retrospective_source_mismatch',
+      retrospectiveId: retrospective.retrospectiveId,
+      accountId: account.id,
+      accountSource: account.sourceInstanceId,
+      rowSource: ref.sourceInstanceId,
+    },
+  );
+}
+
 /** Fingerprint binding a cursor to the complete filter set that produced it. */
 function listFingerprint(filters: ListFilters): string {
   const accountId = filters.accountId === null ? { scope: 'none' } : { scope: 'account', id: filters.accountId };
@@ -1114,4 +1948,234 @@ function retrospectiveView(retrospective: Retrospective, visible: boolean): Work
     solutionIds: [...retrospective.solutionIds],
     note: retrospective.note,
   };
+}
+
+// ---------------------------------------------------------------------------------------
+// Plan & weakness helpers
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Full sha256 content hash of one stored plan.
+ *
+ * This is the optimistic-concurrency token every plan mutation requires; it is computed from the
+ * complete stored plan (never from a redacted DTO), so two different plan bodies can never share a
+ * token and a withheld field cannot change it.
+ */
+export function planContentHash(plan: TrainingPlan): string {
+  return contentHashOf(plan);
+}
+
+/** An expected plan hash must be a complete sha256 digest, never a prefix or an opaque screen id. */
+function requirePlanHashInput(value: string | null | undefined): string {
+  invariant(
+    typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value),
+    'invalid_input',
+    'expectedHash must be the full sha256 content hash of the stored plan',
+    { value },
+  );
+  return value;
+}
+
+/** Refuse a stale caller before any transition; the plan really is re-read inside the transaction. */
+function requirePlanHash(plan: TrainingPlan, expectedHash: string, planId: string): void {
+  const actualHash = planContentHash(plan);
+  invariant(
+    actualHash === expectedHash,
+    'invalid_transition',
+    `plan ${planId} changed since it was read; re-read it before saving`,
+    { reason: 'stale_plan_hash', planId, expectedHash, actualHash },
+  );
+}
+
+/** A required opaque id (plan/task/account): omitted or empty input is refused, never defaulted. */
+function requireRequiredId(name: string, value: string | null | undefined): string {
+  const id = optionalId(name, value);
+  invariant(id !== null, 'invalid_input', `${name} is required`, { name, value });
+  return id;
+}
+
+/** Optional bounded integer with an explicit default; a value outside the bound is refused. */
+function boundedInt(
+  name: string,
+  value: number | null | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+  invariant(
+    typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max,
+    'invalid_input',
+    `${name} must be an integer within ${min}..${max}`,
+    { name, value, min, max },
+  );
+  return value;
+}
+
+/**
+ * Distinct, non-empty stored problem keys; duplicates collapse to the first occurrence and the
+ * whole list is bounded before any lookup, so a huge array cannot force an unbounded scan.
+ */
+function requireCandidateKeys(value: readonly string[] | null | undefined): readonly string[] {
+  invariant(Array.isArray(value), 'invalid_input', 'candidateProblemKeys must be an array of problem keys', {
+    value,
+  });
+  invariant(
+    value.length <= MAX_PLAN_CANDIDATES,
+    'invalid_input',
+    `candidateProblemKeys must hold at most ${MAX_PLAN_CANDIDATES} keys`,
+    { reason: 'too_many_candidates', length: value.length, bound: MAX_PLAN_CANDIDATES },
+  );
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  for (const entry of value) {
+    const key = requireProblemKeyInput(entry);
+    try {
+      parseProblemKey(key);
+    } catch (error) {
+      // A key that is not canonical cannot name a stored problem; report it as bad input with a
+      // stable reason instead of leaking the identity parser's own code to the caller.
+      if (error instanceof DomainError && error.code === 'invalid_id_part') {
+        throw new DomainError('invalid_input', `candidate key ${key} is not a canonical problem key`, {
+          reason: 'malformed_candidate_key',
+          problemKey: key,
+          cause: String(error),
+        });
+      }
+      throw error;
+    }
+    if (!seen.has(key)) {
+      seen.add(key);
+      keys.push(key);
+    }
+  }
+  return keys;
+}
+
+/** Optional plan title: trimmed, bounded, and `null` when absent or blank. */
+function optionalPlanTitle(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  invariant(typeof value === 'string', 'invalid_input', 'title must be a string when present', { value });
+  const trimmed = value.trim();
+  invariant(
+    trimmed.length <= MAX_PLAN_TITLE_CHARS,
+    'invalid_input',
+    `title must be at most ${MAX_PLAN_TITLE_CHARS} characters`,
+    { length: trimmed.length },
+  );
+  return trimmed.length === 0 ? null : trimmed;
+}
+
+/**
+ * The only task fields a client may change: `day`, `minutes` and `kind`.
+ *
+ * Identity, title, link, tags and rationale are refused with an explicit reason instead of being
+ * ignored, so a UI cannot believe it renamed or repointed a task when it did not. The domain still
+ * validates the day/minute bounds, the daily budget and the task state.
+ */
+function parseTaskPatch(value: WorkbenchPlanTaskPatch | null | undefined): PlanTaskPatch {
+  invariant(
+    value !== null && value !== undefined && typeof value === 'object' && !Array.isArray(value),
+    'invalid_input',
+    'editPlanTask needs a patch object',
+    { value },
+  );
+  const record = value as Record<string, unknown>;
+  const unsupported = Object.keys(record).filter((key) => key !== 'day' && key !== 'minutes' && key !== 'kind');
+  invariant(
+    unsupported.length === 0,
+    'invalid_input',
+    `a task edit may only change day, minutes or kind (got ${unsupported.join(', ')})`,
+    { reason: 'unsupported_patch_field', fields: unsupported },
+  );
+  const patch: { day?: number; minutes?: number; kind?: TrainingTaskKind } = {};
+  if (record['day'] !== undefined) {
+    invariant(Number.isInteger(record['day']), 'invalid_input', 'day must be an integer', { day: record['day'] });
+    patch.day = record['day'] as number;
+  }
+  if (record['minutes'] !== undefined) {
+    invariant(
+      Number.isInteger(record['minutes']),
+      'invalid_input',
+      'minutes must be an integer',
+      { minutes: record['minutes'] },
+    );
+    patch.minutes = record['minutes'] as number;
+  }
+  if (record['kind'] !== undefined) {
+    invariant(
+      TRAINING_TASK_KINDS.includes(record['kind'] as TrainingTaskKind),
+      'invalid_input',
+      `unknown task kind ${String(record['kind'])}`,
+      { kind: record['kind'] },
+    );
+    patch.kind = record['kind'] as TrainingTaskKind;
+  }
+  invariant(
+    Object.keys(patch).length > 0,
+    'invalid_input',
+    'editPlanTask needs at least one of day, minutes or kind',
+    { reason: 'empty_patch' },
+  );
+  return patch;
+}
+
+/** One task: identity and links always, tags/rationale only when `visible`. */
+function projectPlanTask(task: TrainingTask, visible: boolean): WorkbenchPlanTaskView {
+  const view: WorkbenchPlanTaskView = {
+    taskId: task.taskId,
+    planId: task.planId,
+    day: task.day,
+    order: task.order,
+    candidateId: task.candidateId,
+    problemKey: task.problemKey,
+    title: task.title,
+    sourceUrl: task.sourceUrl,
+    minutes: task.minutes,
+    kind: task.kind,
+    status: task.status,
+    checkedAt: task.checkedAt,
+  };
+  if (!visible) {
+    return view;
+  }
+  return { ...view, taxonomyIds: [...task.taxonomyIds], rationale: task.rationale };
+}
+
+function planEvidenceView(evidence: TrainingEvidence): WorkbenchPlanEvidenceView {
+  return {
+    level: evidence.level,
+    reasons: [...evidence.reasons],
+    attemptedDistinctTotal: evidence.attemptedDistinctTotal,
+    sufficientTagIds: [...evidence.sufficientTagIds],
+  };
+}
+
+function rejectedCandidateView(candidate: RejectedCandidate): WorkbenchPlanRejectedCandidateView {
+  return { candidateId: candidate.candidateId, reason: candidate.reason, detail: candidate.detail };
+}
+
+function beginnerRecommendationView(recommendation: BeginnerRecommendation): WorkbenchPlanBeginnerRecommendationView {
+  return {
+    taxonomyId: recommendation.taxonomyId,
+    nameEn: recommendation.nameEn,
+    nameZh: recommendation.nameZh,
+    basis: recommendation.basis,
+    rationale: recommendation.rationale,
+  };
+}
+
+/** Distinct problems this account solved, from already-collected accepted submissions. */
+function solvedKeysOf(submissions: readonly Submission[]): ReadonlySet<string> {
+  const solved = new Set<string>();
+  for (const submission of submissions) {
+    if (isAccepted(submission)) {
+      solved.add(submission.key);
+    }
+  }
+  return solved;
 }
