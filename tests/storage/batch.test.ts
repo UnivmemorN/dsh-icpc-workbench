@@ -570,3 +570,7 @@ void test('temporal metadata is ordered and a legal resume still lands', async (
     assert.equal((await store.getModelCallAttempt('attempt-1'))?.status, 'settled');
   });
 });
+void test('zero analysis or reasoning quota is a valid persisted disabled role; concurrency still cannot be zero',()=>{
+ const world=makeWorld();const disabled=createAnalysisBatch({batchId:'disabled',jobs:world.batch.jobs,createdAt:fx.AT,limits:{maxAnalysisCalls:0,maxReasoningCalls:0,concurrency:1}});
+ assert.equal(disabled.limits.maxAnalysisCalls,0);assert.equal(disabled.limits.maxReasoningCalls,0);assert.throws(()=>validateAnalysisBatch({...disabled,limits:{...disabled.limits,concurrency:0}}));
+});

@@ -129,7 +129,7 @@ function streamPost(
     body: stream,
     duplex: 'half',
     ...(signal === undefined ? {} : { signal }),
-  });
+  } as RequestInit & { duplex: 'half' });
 }
 
 function bytesRequest(bytes: Uint8Array): Request {

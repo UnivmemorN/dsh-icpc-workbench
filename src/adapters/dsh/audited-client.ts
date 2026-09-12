@@ -201,7 +201,7 @@ export interface DshAuditedHost {
     }>;
   };
   readonly sessions: {
-    create(id: SessionId): Session;
+    create(id: SessionId): Session | Promise<Session>;
     flush(session: Session): Promise<boolean>;
   };
 }

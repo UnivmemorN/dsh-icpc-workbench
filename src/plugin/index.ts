@@ -1,7 +1,9 @@
 /** Host entry: independent data ownership and public, pinned Cordis service contracts. */
 import type { Context } from '@deepseek-ai/cordis';
 import type { HostConnectionFetch } from '@deepseek-ai/dsh-client-connection';
-import type {} from '@deepseek-ai/dsh-session';
+import type {SessionPersistence} from '@deepseek-ai/dsh-session-persistence';
+import {DurableAuditSessions} from '../adapters/dsh/durable-audit-sessions.js';
+import type {Session,SessionId} from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-llm';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -29,8 +31,10 @@ import { registerModelApi } from './model-api.js';
 import { registerBootstrapApi } from './bootstrap-api.js';
 import { disposeAll, rollback } from './lifecycle.js';
 export const name='icpc-workbench';
-export const inject=['connection','llm','sessions'];
+export const inject=['connection','llm','sessions','sessionPersistence'];
 export interface PublicHost extends DshAuditedHost {
+  readonly sessions:DshAuditedHost['sessions']&{prepare(id:SessionId):Session};
+  readonly sessionPersistence:Pick<SessionPersistence,'create'>;
   readonly connection:{readonly fetch:HostConnectionFetch}; readonly llm:DshAuditedHost['llm']&CatalogHost;
 }
 /** Explicit environment seam for offline lifecycle tests; YAML accepts only PluginConfig. */
@@ -54,12 +58,14 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
   await mkdir(dataDir,{recursive:true});
   const now=()=>new Date().toISOString(),uniqueId=(prefix:string)=>prefix+'-'+randomUUID();
   const store=new SqliteTrainingStore({path:join(dataDir,'training.sqlite'),now});
+  const auditSessions=new DurableAuditSessions(host.sessions,host.sessionPersistence);
+  const closeStorage=async()=>{try{await auditSessions.close();}finally{await store.close();}};
   let controller:ModelOperations|undefined;
   const disposers:(()=>Promise<void>)[]=[async()=>{
-    if(!controller){await store.close();return;}
+    if(!controller){await closeStorage();return;}
     const result=await controller.close();
-    if(result.outstanding.length){void controller.whenSettled().then(()=>store.close()).catch(reportFailure);}
-    else await store.close();
+    if(result.outstanding.length){void controller.whenSettled().then(closeStorage).catch(reportFailure);}
+    else await closeStorage();
   }];
   try {
     const sources=[codeforcesSourceInstance(),luoguSourceInstance()];
@@ -71,7 +77,7 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
     const adapters:PlatformAdapter[]=[new CodeforcesAdapter({sourceInstance:sources[0]!}),new LuoguAdapter({sourceInstance:sources[1]!})];
     const byId=new Map(adapters.map(a=>[a.sourceInstance.id,a]));
     const imports=new ImportService({store,now}),workbench=new WorkbenchService({store,taxonomy:createTaxonomyIndex(CURRENT_TAXONOMY),now,uniqueId:randomUUID});
-    const client=new DshAuditedModelClient(host,{now}),catalog=new ModelCatalog(host.llm);
+    const client=new DshAuditedModelClient({llm:host.llm,sessions:auditSessions},{now}),catalog=new ModelCatalog(host.llm);
     const coaching=new CoachingService({store,now,generator:new DshCoachingGenerator({client,now}),onInternalError:reportFailure});
     controller=new ModelOperations({store,coaching,now,uniqueId,validateModels:(s,t)=>catalog.validate(s,t),onInternalError:reportFailure,
       ...(environment.closeWaitMs===undefined?{}:{closeWaitMs:environment.closeWaitMs}),

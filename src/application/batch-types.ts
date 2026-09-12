@@ -269,8 +269,8 @@ export function validateAnalysisBatch(batch: AnalysisBatch): void {
     { status: batch.status },
   );
   requireCount('batch revision', batch.revision, 0);
-  requireLimit('batch maxAnalysisCalls', batch.limits?.maxAnalysisCalls);
-  requireLimit('batch maxReasoningCalls', batch.limits?.maxReasoningCalls);
+  requireLimit('batch maxAnalysisCalls', batch.limits?.maxAnalysisCalls, 0);
+  requireLimit('batch maxReasoningCalls', batch.limits?.maxReasoningCalls, 0);
   requireLimit('batch concurrency', batch.limits?.concurrency);
   requireCount('batch analysisCalls', batch.counters?.analysisCalls, 0);
   requireCount('batch reasoningCalls', batch.counters?.reasoningCalls, 0);
@@ -645,11 +645,11 @@ function requireCount(label: string, value: unknown, min: number): number {
   return value;
 }
 
-function requireLimit(label: string, value: unknown): number {
+function requireLimit(label: string, value: unknown, min=1): number {
   invariant(
-    typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= MAX_ANALYSIS_BATCH_LIMIT,
+    typeof value === 'number' && Number.isInteger(value) && value >= min && value <= MAX_ANALYSIS_BATCH_LIMIT,
     'invalid_input',
-    `${label} must be an explicit integer within 1..${MAX_ANALYSIS_BATCH_LIMIT}`,
+    `${label} must be an explicit integer within ${min}..${MAX_ANALYSIS_BATCH_LIMIT}`,
     { label, value },
   );
   return value;

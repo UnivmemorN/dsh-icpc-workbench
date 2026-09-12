@@ -1,0 +1,13 @@
+import {Panel,Notice,Empty,ErrorNotice,useRequest,useWorkbench,Stats,percent,tagName} from './common.js';
+export function Weakness(){
+ const {accountId,boot,navigate}=useWorkbench(),read=useRequest('weakness',accountId?{accountId}:null),data=read.data;
+ return <><div className="icpc-page-heading"><div><p className="icpc-eyebrow">LEARNING EVIDENCE</p><h1>用足够的样本看清薄弱项</h1><p>同一道题的多次提交只算一道；每个标签至少 5 道尝试题才进入排名。</p></div></div>
+ {!accountId?<Empty>请先选择账号，再导入该账号的提交记录。</Empty>:<><ErrorNotice error={read.error}/><button onClick={read.refresh}>刷新统计</button>{read.pending&&<p>正在计算本地记录…</p>}{data&&<>
+ <Stats items={[{label:'尝试过的不同题目',value:data.report.attemptedDistinctTotal},{label:'通过的不同题目',value:data.report.solvedDistinctTotal},{label:'有效标签覆盖率',value:percent(data.report.tagCoverageRatio)},{label:'有题目信息的记录',value:data.coverage.metadataPresent+' / '+data.coverage.distinctProblems}]}/>
+ <Panel title="需要优先练习的方向">{data.report.ranking.length===0?<Empty>当前还没有达到样本门槛的标签，暂不排列薄弱项。</Empty>:<div className="icpc-table-wrap"><table><thead><tr><th>方向</th><th>通过 / 尝试</th><th>通过率</th><th>平台原始难度</th></tr></thead><tbody>{data.report.ranking.map(t=><tr key={t.taxonomyId}><td>{tagName(t.taxonomyId,boot)}</td><td>{t.solvedDistinct} / {t.sampleSize}</td><td><meter min="0" max="1" value={t.solveRate}/><span> {percent(t.solveRate)}</span></td><td>{t.ratingSummary.map(r=>r.dimension+' 中位数 '+r.median+'（'+r.min+'–'+r.max+'，'+r.sampleSize+' 题）').join('；')||'未提供'}</td></tr>)}</tbody></table></div>}</Panel>
+ <Panel title="样本仍不足的方向">{data.report.insufficientEvidence.length===0?<Empty>暂无此类样本。</Empty>:<div className="icpc-tags">{data.report.insufficientEvidence.map(t=><span key={t.taxonomyId} className="icpc-tag">{tagName(t.taxonomyId,boot)} · {t.sampleSize} / {t.minimumSampleSize} 题</span>)}</div>}</Panel>
+ <Panel title="自己记录的完成方式"><Stats items={[{label:'独立完成',value:data.report.confirmedSkills.independent},{label:'提示辅助',value:data.report.confirmedSkills.assisted},{label:'参考题解',value:data.report.confirmedSkills.solutionUsed},{label:'复盘题数',value:data.report.confirmedSkills.total}]}/><p>这些记录来自你填写的复盘。通过一道题不会自动确认掌握它的所有解法。</p><div className="icpc-tags">{data.report.confirmedSkills.taxonomyIds.map(id=><span key={id} className="icpc-tag">{tagName(id,boot)}</span>)}</div></Panel>
+ <Notice>提交 {data.coverage.submissionRows} 条；缺失题目元数据 {data.coverage.metadataMissing} 题；已排除过期 AI 标签 {data.coverage.staleAiDecisionsExcluded} 条。不同平台难度保持原始刻度。</Notice><div className="icpc-actions"><button onClick={()=>navigate('bank')}>补充记录与选择候选题</button><button className="icpc-primary" onClick={()=>navigate('plans')}>制定训练计划</button></div>
+ </>}</>}
+ </>;
+}

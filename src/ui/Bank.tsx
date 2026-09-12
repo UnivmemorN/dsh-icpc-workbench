@@ -1,0 +1,21 @@
+import{useState}from'react';
+import{Panel,Empty,Notice,ErrorNotice,useWorkbench,useRequest,tagName}from'./common.js';
+import{ImportPanel}from'./Imports.js';import{ProblemView}from'./Problem.js';
+export function Bank({reviewOnly=false}:{reviewOnly?:boolean}){
+ const {boot,accountId,problemKey,navigate,selectedKeys,setSelectedKeys}=useWorkbench();
+ const account=boot.accounts.find(a=>a.id===accountId),[sourceId,setSourceId]=useState(account?.sourceInstanceId??boot.sources[0]?.id??''),[query,setQuery]=useState(''),[search,setSearch]=useState(''),[reveal,setReveal]=useState(false),[attempted,setAttempted]=useState(false),[cursor,setCursor]=useState<string|null>(null),[previous,setPrevious]=useState<(string|null)[]>([]);
+ const read=useRequest('problem.list',{sourceInstanceId:sourceId,accountId,...(search.trim()?{query:search.trim()}:{}),limit:25,cursor,reveal,onlyAttempted:attempted,needsReviewOnly:reviewOnly});
+ const reset=()=>{setCursor(null);setPrevious([]);};
+ function toggle(key:string){setSelectedKeys(selectedKeys.includes(key)?selectedKeys.filter(k=>k!==key):[...selectedKeys,key]);}
+ return <><div className="icpc-page-heading"><div><p className="icpc-eyebrow">{reviewOnly?'REVIEW':'PROBLEM BANK'}</p><h1>{reviewOnly?'核对标签与真实解法':'让每一道题都有完整来历'}</h1><p>保留平台标签、题解证据和人工判断，材料更新会使旧分析失效。</p></div></div>
+ <div className="icpc-toolbar"><label>来源<select value={sourceId} onChange={e=>{setSourceId(e.target.value);reset();navigate('bank','');}}>{boot.sources.map(s=><option key={s.id} value={s.id} disabled={Boolean(account&&s.id!==account.sourceInstanceId)}>{s.displayName}</option>)}</select></label><label>搜索题号或标题<input value={query} onChange={e=>setQuery(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){setSearch(query);reset();}}}/></label><button onClick={()=>{setSearch(query);reset();}}>搜索</button><button onClick={read.refresh} disabled={read.pending}>刷新</button></div>
+ <div className="icpc-toolbar"><label className="icpc-check"><input type="checkbox" checked={attempted} disabled={!accountId} onChange={e=>{setAttempted(e.target.checked);reset();}}/>仅看该账号尝试过的题</label><label className="icpc-check"><input type="checkbox" checked={reveal} onChange={e=>setReveal(e.target.checked)}/>显示列表中的算法标签</label></div>
+ <ImportPanel sourceId={sourceId} onChange={read.refresh}/>
+ <Panel title={reviewOnly?'当前快照待审核题目':'本地题库'} tools={<span className="icpc-muted">每页 25 题</span>}><ErrorNotice error={read.error}/>
+ {read.pending&&<p className="icpc-muted">正在读取题库…</p>}{read.data?.items.length===0&&<Empty>当前筛选下没有题目。可以同步公开目录，或使用手工导入。</Empty>}
+ {read.data&&read.data.items.length>0&&<div className="icpc-table-wrap"><table><thead><tr><th>选择</th><th>题目</th><th>平台难度</th><th>状态 / 标签</th></tr></thead><tbody>{read.data.items.map(p=><tr key={p.problemKey}><td><input type="checkbox" aria-label={'选择 '+p.externalKey} checked={selectedKeys.includes(p.problemKey)} disabled={!selectedKeys.includes(p.problemKey)&&selectedKeys.length>=100} onChange={()=>toggle(p.problemKey)}/></td><td><button onClick={()=>navigate('bank',p.problemKey)}>{p.externalKey} · {p.title}</button></td><td>{p.rawRatings.map(r=>r.dimension+': '+(r.raw??r.value)).join(' / ')||'未提供'}</td><td>{p.solvedByAccount?'已通过':'未确认通过'}{p.pendingReview&&<span className="icpc-tag icpc-warning">待审核</span>}{p.effectiveTaxonomyIds?.map(id=><span key={id} className="icpc-tag">{tagName(id,boot)}</span>)}</td></tr>)}</tbody></table></div>}
+ <div className="icpc-actions"><button disabled={!previous.length||read.pending} onClick={()=>{setCursor(previous.at(-1)??null);setPrevious(previous.slice(0,-1));}}>上一页</button><button disabled={!read.data?.nextCursor||read.pending} onClick={()=>{setPrevious([...previous,cursor]);setCursor(read.data!.nextCursor);}}>下一页</button><span className="icpc-muted">已选择 {selectedKeys.length} / 100 题</span><button disabled={!selectedKeys.length} onClick={()=>setSelectedKeys([])}>清空选择</button><button className="icpc-primary" disabled={!selectedKeys.length} onClick={()=>navigate('review')}>准备标签分析</button><button disabled={!accountId||!selectedKeys.length} onClick={()=>navigate('plans')}>作为计划候选题</button></div>
+ </Panel>
+ {problemKey?<ProblemView key={problemKey+'|'+accountId} problemKey={problemKey} onChange={read.refresh}/>:<Notice>点击题目查看题面；未完成题目的标签与题解保持隐藏，直到你明确选择查看。</Notice>}
+ </>;
+}

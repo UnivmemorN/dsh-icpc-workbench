@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, appendFileSync, mkdirSync, openSync, close
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { priceUsage } from './usage.mjs';
+import { priceUsage, totalConservativeCny } from './usage.mjs';
 import { taskContext } from './worker-context.mjs';
 const root = resolve(import.meta.dirname, '..');
 const install = resolve(process.env.DSH_INSTALL_ROOT ?? 'D:/DeepSeek Harness/source');
@@ -27,7 +27,7 @@ const runId = task.id + '-' + randomUUID().slice(0,8);
 const log = join(local, runId+'.jsonl');
 const report = {id:runId, task:task.id, startedAt:new Date().toISOString(), model:'deepseek-flash', effort:'max', maxOutputTokens, missingUsageReserveCny, requests:0, settlements:0, inputTokens:0, outputTokens:0, cacheReadTokens:0, conservativeCny:0, missingUsage:0, status:'starting'};
 ledger.runs.push(report);
-const flush = () => { ledger.conservativeCny = ledger.runs.reduce((s,r)=>s+r.conservativeCny,0); writeFileSync(ledgerFile, JSON.stringify(ledger,null,2)+'\n'); writeFileSync(join(local,'latest.json'),JSON.stringify(report,null,2)+'\n'); };
+const flush = () => { ledger.conservativeCny = totalConservativeCny(ledger); writeFileSync(ledgerFile, JSON.stringify(ledger,null,2)+'\n'); writeFileSync(join(local,'latest.json'),JSON.stringify(report,null,2)+'\n'); };
 const load = p => import(pathToFileURL(join(install,p)).href);
 const { DeepSeekHarness } = await load('packages/sdk/client/lib/index.js');
 const { lastAssistantStreamChunk, joinAssistantStreamText } = await load('packages/llm/llm/lib/index.js');

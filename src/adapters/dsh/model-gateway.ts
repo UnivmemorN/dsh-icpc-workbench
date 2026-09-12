@@ -76,6 +76,7 @@ export const ANALYZE_SYSTEM_PROMPT = [
   '- Propose algorithm/technique tags actually demonstrated by the cited solution text. Never propose platform, contest, year, difficulty or problem-name tags.',
   '- Prefer the most specific tag that names the method used; do not list every ancestor of a tag. A general tag is acceptable only when no child of it names the method.',
   '- Cite evidence for every suggestion: at least one excerpt of 12 or more characters copied verbatim from the named solution. Whitespace and letter case may differ; the words must occur in that solution.',
+  '- Within each suggestion cite each (sourceId, solutionId) pair at most once. Choose one continuous representative excerpt for that solution, not several separate quotes. At most 8 evidence entries per suggestion; rationale at most 2000 characters and note at most 500.',
   '- Do not repeat a taxonomy id. When distinct solutions demonstrate the same method, cite both in one suggestion.',
   '- Raw tags the problem already carries are context, not the answer: suggest what the material supports, including tags missing from that list.',
   '- If the material supports no tag, answer {"suggestions":[]}.',

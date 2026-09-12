@@ -50,8 +50,8 @@ export const REQUIRED_HOST_API = [
   'llm.listProviders',
   'llm.listModels',
   'llm.resolveModelInfo',
-  'sessions.create',
-  'sessions.flush',
+  'sessions.prepare',
+  'sessionPersistence.create',
 ] as const;
 
 /** One verified host API path. */
@@ -371,7 +371,7 @@ function verifyHostApi(services: unknown): readonly RequiredHostApi[] {
   if (missing.length > 0) {
     throw new CompatibilityError(
       'incomplete_host_api',
-      `the mounted dsh host does not expose ${missing.join(', ')}; this plugin needs the public ${BASELINE_DSH_PACKAGE}@${BASELINE_DSH_VERSION} API (connection.fetch.register, llm.stream, llm.listProviders, llm.listModels, llm.resolveModelInfo, sessions.create, sessions.flush). Install the pinned baseline or update the plugin.`,
+      `the mounted dsh host does not expose ${missing.join(', ')}; this plugin needs the public ${BASELINE_DSH_PACKAGE}@${BASELINE_DSH_VERSION} API (connection.fetch.register, llm.stream, llm.listProviders, llm.listModels, llm.resolveModelInfo, sessions.prepare, sessionPersistence.create). Install the pinned baseline or update the plugin.`,
       { missing },
     );
   }

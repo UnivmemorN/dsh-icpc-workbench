@@ -356,7 +356,7 @@ void test('a valid analysis answer is adopted with local identity and the exact 
   const payload = promptPayload(dispatched);
   assert.deepEqual(Object.keys(payload), ['task', 'promptVersion', 'problem', 'taxonomy', 'editorial']);
   assert.equal(payload.task, 'analyze_missing_algorithm_tags');
-  assert.equal(payload.promptVersion, 'analysis-v1|taxonomy:test.1');
+  assert.equal(payload.promptVersion, 'analysis-v2|taxonomy:test.1');
   const editorial = payload.editorial as { solutions: readonly { text: string }[] };
   assert.equal(editorial.solutions[0]?.text, SEGMENT_SOLUTION);
   assert.equal(editorial.solutions[1]?.text, GREEDY_SOLUTION);
@@ -367,7 +367,7 @@ void test('a valid analysis answer is adopted with local identity and the exact 
   assert.equal(audit.role, 'analysis');
   assert.equal(audit.snapshotId, SNAPSHOT.snapshotId);
   assert.match(audit.attemptId, /^direct-attempt\|/);
-  assert.equal(audit.promptVersion, 'analysis-v1|taxonomy:test.1');
+  assert.equal(audit.promptVersion, 'analysis-v2|taxonomy:test.1');
   assert.equal((audit.options as unknown as { reasoningEffort: string }).reasoningEffort, 'max');
 });
 

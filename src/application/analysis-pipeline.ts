@@ -100,7 +100,7 @@ import {
  * (`<version>|taxonomy:<version>`); see `AnalysisPipeline.promptVersionFor`.
  */
 export const DEFAULT_PROMPT_VERSIONS: Readonly<Record<ModelCallRole, string>> = {
-  analysis: 'analysis-v1',
+  analysis: 'analysis-v2',
   verification: 'verification-v1',
   reasoning: 'reasoning-v1',
 };

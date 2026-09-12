@@ -75,7 +75,8 @@ function hostServices(): Record<string, unknown> {
       listModels(): void {},
       resolveModelInfo(): void {},
     },
-    sessions: { create(): void {}, flush(): void {} },
+    sessions: { prepare(): void {}, create(): void {}, flush(): void {} },
+    sessionPersistence: { create(): void {} },
   };
 }
 
@@ -383,7 +384,7 @@ void test('every required public host function must be present', async (t) => {
   assert.deepEqual(partialRefusal.details['missing'], ['llm.resolveModelInfo']);
 
   const notAFunction = hostServices();
-  (notAFunction['sessions'] as Record<string, unknown>)['flush'] = 'yes';
+  (notAFunction['sessions'] as Record<string, unknown>)['prepare'] = 'yes';
   await expectRefusal(
     'incomplete_host_api',
     checkHostCompatibility({ nodeVersion: 'v24.15.0', launcherPath: launcher, services: notAFunction }),

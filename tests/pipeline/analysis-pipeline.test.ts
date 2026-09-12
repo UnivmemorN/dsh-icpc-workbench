@@ -1607,7 +1607,7 @@ void test('a settled analysis pass is only reused under the same provider and pr
       (attempt) => attempt.role === 'analysis',
     );
     assert.equal(analysisAttempt?.provider, 'fake-provider');
-    assert.equal(analysisAttempt?.promptVersion, 'analysis-v1|taxonomy:test-v1');
+    assert.equal(analysisAttempt?.promptVersion, 'analysis-v2|taxonomy:test-v1');
 
     // A different provider must not reuse a pass that was paid for under another provider.
     const otherProvider = new FakeGateway(

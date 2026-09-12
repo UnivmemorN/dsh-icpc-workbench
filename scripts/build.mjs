@@ -21,3 +21,20 @@ if(diagnostics.length){
   console.error(ts.formatDiagnosticsWithColorAndContext(diagnostics,{getCurrentDirectory:()=>root,getCanonicalFileName:x=>x,getNewLine:()=> '\n'}));
   process.exitCode=1;
 }else console.log('Built independent ESM package in dist.');
+
+if (!diagnostics.length) {
+  const {rollup}=await import('@rollup/wasm-node');
+  const {writeFileSync}=await import('node:fs');
+  const {fileURLToPath}=await import('node:url');
+  const shared=new Set(['react','react/jsx-runtime','react-dom/client','@deepseek-ai/cordis']);
+  const bundle=await rollup({input:resolve(out,'ui/index.js'),external:id=>shared.has(id),
+    plugins:[{name:'pure-package-resolution',resolveId(id){return id.startsWith('@noble/hashes/')?fileURLToPath(import.meta.resolve(id)):null;}}],
+    onwarn(warning,defaultHandler){if(warning.code==='UNRESOLVED_IMPORT')throw Error(warning.message);defaultHandler(warning);}});
+  try {
+    const {output}=await bundle.generate({format:'cjs',exports:'named'});
+    const code=output.find(item=>item.type==='chunk')?.code;
+    if(!code)throw Error('Client bundle missing');
+    writeFileSync(resolve(out,'client.js'),`/* dsh-icpc-workbench — MIT */\nwindow.__ModuleLoader__.load({id:'dsh-icpc-workbench',factory:(require)=>{const module={exports:{}};const exports=module.exports;\n${code}\nreturn module.exports;}});\n`);
+    console.log('Built classic dsh browser factory with shared React.');
+  } finally {await bundle.close();}
+}
