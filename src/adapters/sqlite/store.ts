@@ -19,6 +19,9 @@
  *   a stale `expectedRevision` before writing anything and never lets counters or a terminal
  *   state go backwards. A model-call attempt is inserted `reserved` before dispatch and only
  *   moves forward (`reserved → uncertain | settled`); a settled row can never be rewritten.
+ * - **Settings are one CAS-guarded singleton row.** The value is validated and detached on the
+ *   way in and re-validated on the way out; a save only advances the stored revision when its
+ *   `expectedRevision` matches, so a stale caller rejects before any write.
  * - **The head only moves forward.** `saveSnapshot` refuses to install an older version than
  *   the stored head, so an analysis of a newer snapshot can never be reverted by a late
  *   write of an old one.
@@ -56,6 +59,12 @@ import {
   type TrainingPlan,
 } from '../../domain/index.js';
 import type { Page, PageRequest, ProblemQuery, StoreCapabilities, TrainingStore } from '../../application/ports.js';
+import {
+  validateWorkbenchSettings,
+  type SettingsStore,
+  type WorkbenchSettings,
+  type WorkbenchSettingsRecord,
+} from '../../application/workbench-settings.js';
 import {
   ANALYSIS_BATCH_STATUSES,
   MODEL_CALL_STATUSES,
@@ -112,13 +121,15 @@ import {
 import {
   SCHEMA_VERSION_EMPTY,
   SCHEMA_VERSION_V1,
+  SCHEMA_VERSION_V2,
   STORE_MARKER,
   STORE_SCHEMA_VERSION,
   backupFileName,
   configureConnection,
   detectSchemaState,
-  initializeSchemaV2,
-  migrateSchemaV1ToV2,
+  initializeSchemaV3,
+  migrateSchemaV1ToV3,
+  migrateSchemaV2ToV3,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -155,7 +166,7 @@ function requireId(label: string, value: string): string {
   return value;
 }
 
-export class SqliteTrainingStore implements TrainingStore {
+export class SqliteTrainingStore implements TrainingStore, SettingsStore {
   readonly path: string;
 
   private readonly connection: DatabaseSync;
@@ -229,9 +240,10 @@ export class SqliteTrainingStore implements TrainingStore {
       transactional: true,
       notes: [
         `node:sqlite DatabaseSync; schema marker ${STORE_MARKER}; one serialized connection`,
-        'Databases from a newer schema are rejected before any write; v0 and v1 databases are migrated after a verified consistent backup',
+        'Databases from a newer schema are rejected before any write; v0, v1 and v2 databases are migrated after a verified consistent backup',
         'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
         'Batches are revision-guarded with monotonic counters; model-call attempts move reserved -> uncertain|settled and settled rows are immutable',
+        'Workbench settings are a singleton row saved under revision CAS; the v3 coaching_attempts table exists empty and has no access methods yet',
       ],
     };
   }
@@ -973,6 +985,42 @@ export class SqliteTrainingStore implements TrainingStore {
   }
 
   // -------------------------------------------------------------------------------------
+  // Workbench settings (SettingsStore)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * The singleton settings row, or `null` before the first save.
+   *
+   * The stored body is re-validated on read, so a hand-edited or truncated row is reported as
+   * `corrupt_row` instead of being handed out as a valid configuration.
+   */
+  async getWorkbenchSettings(): Promise<WorkbenchSettingsRecord | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT revision, body FROM workbench_settings WHERE id = 1');
+      if (row === null) {
+        return null;
+      }
+      const revision = intColumn(row, 'revision');
+      const parsed = parseBody<unknown>('workbench_settings.body', textColumn(row, 'body'));
+      try {
+        return { revision, value: validateWorkbenchSettings(parsed) };
+      } catch (error) {
+        throw new StorageError('corrupt_row', 'stored workbench settings are not a valid configuration', {
+          revision,
+          cause: String(error),
+        });
+      }
+    });
+  }
+
+  /** Save under revision CAS; see {@link SettingsStore.saveWorkbenchSettings}. */
+  async saveWorkbenchSettings(value: WorkbenchSettings, expectedRevision: number | null): Promise<number> {
+    this.assertOpen();
+    return this.withWrite(() => this.writeWorkbenchSettings(value, expectedRevision));
+  }
+
+  // -------------------------------------------------------------------------------------
   // Write helpers (always called inside a serialized write scope)
   // -------------------------------------------------------------------------------------
 
@@ -1363,6 +1411,51 @@ export class SqliteTrainingStore implements TrainingStore {
     );
   }
 
+  /**
+   * Create or update the singleton settings row under revision CAS.
+   *
+   * Validation and canonical encoding happen first, so an invalid value is never written and an
+   * undeclared member cannot reach the body. A create stores revision 1; an update requires the
+   * stored revision and rejects a stale one before any write. Body and revision move together in
+   * one statement, so no reader sees a new body under an old revision.
+   */
+  private writeWorkbenchSettings(value: WorkbenchSettings, expectedRevision: number | null): number {
+    const body = canonicalJson(validateWorkbenchSettings(value));
+    invariant(
+      expectedRevision === null || (Number.isInteger(expectedRevision) && expectedRevision >= 1),
+      'invalid_input',
+      'expectedRevision must be null (create) or an integer >= 1 (update)',
+      { expectedRevision },
+    );
+    const existing = this.find('SELECT revision FROM workbench_settings WHERE id = 1');
+    if (existing === null) {
+      invariant(
+        expectedRevision === null,
+        'invalid_transition',
+        'workbench settings do not exist; a create must pass expectedRevision null',
+        { expectedRevision },
+      );
+      this.write('INSERT INTO workbench_settings (id, revision, body) VALUES (1, 1, ?)', [body]);
+      return 1;
+    }
+    const storedRevision = intColumn(existing, 'revision');
+    invariant(
+      expectedRevision !== null,
+      'duplicate_id',
+      `workbench settings already exist at revision ${storedRevision}`,
+      { storedRevision },
+    );
+    invariant(
+      expectedRevision === storedRevision,
+      'invalid_transition',
+      `workbench settings are at revision ${storedRevision}, not ${expectedRevision}; re-read before saving`,
+      { expectedRevision, storedRevision, reason: 'stale_revision' },
+    );
+    const next = storedRevision + 1;
+    this.write('UPDATE workbench_settings SET revision = ?, body = ? WHERE id = 1', [next, body]);
+    return next;
+  }
+
   // -------------------------------------------------------------------------------------
   // Read helpers
   // -------------------------------------------------------------------------------------
@@ -1481,31 +1574,35 @@ export class SqliteTrainingStore implements TrainingStore {
    *
    * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
    *    switched into another journal mode or otherwise touched.
-   * 2. A supported older database (v0 or v1) is backed up **before** `configureConnection`, so
-   *    the backup is the database as it was found and switching the journal mode is not part
+   * 2. A supported older database (v0, v1 or v2) is backed up **before** `configureConnection`,
+   *    so the backup is the database as it was found and switching the journal mode is not part
    *    of the pre-migration state. The copy is verified before migration starts.
-   * 3. Migration adds tables only: `initializeSchemaV2` applies v1+v2 in one transaction for an
-   *    empty or metadata-only database, `migrateSchemaV1ToV2` adds v2 to a real v1 store while
-   *    keeping every row.
+   * 3. Migration adds tables only and runs in one transaction: `initializeSchemaV3` applies
+   *    v1+v2+v3 for an empty or metadata-only database, `migrateSchemaV1ToV3` applies v2+v3 to a
+   *    real v1 store and `migrateSchemaV2ToV3` adds v3 to a v2 store; every row is kept and
+   *    exactly one pre-migration backup is taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
    *    succeeded, so a failed migration leaves the original file — including its original
    *    journal mode — untouched.
    */
   private openSchema(inMemory: boolean): void {
     const state = detectSchemaState(this.connection);
-    if (state === 'legacy_v0' || state === 'v1') {
+    if (state === 'legacy_v0' || state === 'v1' || state === 'v2') {
       // Keep a consistent copy of the database as found before any migration writes to it.
-      const from = state === 'legacy_v0' ? SCHEMA_VERSION_EMPTY : SCHEMA_VERSION_V1;
+      const from =
+        state === 'legacy_v0' ? SCHEMA_VERSION_EMPTY : state === 'v1' ? SCHEMA_VERSION_V1 : SCHEMA_VERSION_V2;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
-      this.verifyBackup(target, from, from === SCHEMA_VERSION_V1);
+      this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        if (state === 'v1') {
-          migrateSchemaV1ToV2(this.connection);
+        if (state === 'v2') {
+          migrateSchemaV2ToV3(this.connection);
+        } else if (state === 'v1') {
+          migrateSchemaV1ToV3(this.connection);
         } else {
-          initializeSchemaV2(this.connection);
+          initializeSchemaV3(this.connection);
         }
       } catch (error) {
         if (error instanceof StorageError) {

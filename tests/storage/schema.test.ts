@@ -15,15 +15,18 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import {
+  SCHEMA_VERSION_V2,
   SqliteTrainingStore,
   StorageError,
   STORE_MARKER,
   STORE_SCHEMA_VERSION,
   STORE_TABLES_V1,
   STORE_TABLES_V2,
+  STORE_TABLES_V3,
 } from '../../src/adapters/sqlite/index.js';
-import { applySchemaV1 } from '../../src/adapters/sqlite/schema.js';
+import { applySchemaV1, initializeSchemaV2, migrateSchemaV1ToV2 } from '../../src/adapters/sqlite/schema.js';
 import { createAnalysisBatch } from '../../src/application/batch-types.js';
+import { defaultWorkbenchSettings } from '../../src/application/workbench-settings.js';
 import {
   canonicalJson,
   type AnalysisJobState,
@@ -156,6 +159,71 @@ function seedV1World(path: string): V1World {
   return { scope, snapshot, job, manual };
 }
 
+interface V2World {
+  readonly scope: fx.Scope;
+  readonly batch: ReturnType<typeof createAnalysisBatch>;
+}
+
+/**
+ * Build a real schema-v2 database with rows using the frozen v1+v2 DDL.
+ *
+ * `initializeSchemaV2` must keep producing exactly the v2 shape (no v3 tables), so this is a
+ * genuine older database rather than a v3 file carrying a lower version number.
+ */
+function seedV2World(path: string): V2World {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'bob', '2B');
+  const snapshot = fx.makeSnapshot(scope.problem);
+  const job = fx.makeJob(scope.problem, snapshot);
+  const batch = createAnalysisBatch({
+    batchId: 'batch-in-v2',
+    jobs: [{ jobId: job.jobId, snapshotId: snapshot.snapshotId }],
+    createdAt: fx.AT,
+  });
+  const db = new DatabaseSync(path);
+  try {
+    initializeSchemaV2(db);
+    db.prepare(
+      `INSERT INTO problems (key, source_instance_id, domain, external_key, title, fetched_at, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      scope.problem.key,
+      scope.problem.ref.sourceInstanceId,
+      scope.problem.ref.domain,
+      scope.problem.ref.externalKey,
+      scope.problem.title,
+      scope.problem.fetchedAt,
+      canonicalJson(scope.problem),
+    );
+    db.prepare(
+      `INSERT INTO analysis_batches (batch_id, status, revision, created_at, updated_at, lease_owner,
+         lease_expires_at, analysis_calls, reasoning_calls, retries, job_count, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      batch.batchId,
+      batch.status,
+      1,
+      batch.createdAt,
+      batch.updatedAt,
+      batch.owner,
+      batch.leaseExpiresAt,
+      batch.counters.analysisCalls,
+      batch.counters.reasoningCalls,
+      batch.counters.retries,
+      batch.jobs.length,
+      canonicalJson({ ...batch, revision: 1 }),
+    );
+  } finally {
+    db.close();
+  }
+  assert.equal(rawScalar(path, 'PRAGMA user_version'), SCHEMA_VERSION_V2, 'the fixture is a schema-v2 database');
+  assert.equal(
+    rawScalar(path, `SELECT count(*) FROM sqlite_master WHERE name IN ('workbench_settings', 'coaching_attempts')`),
+    0,
+    'a v2 database has no v3 tables',
+  );
+  return { scope, batch };
+}
+
 void test('a fresh path is initialized with the marker, the current schema and its parent directory', async () => {
   const paths = fx.tempDatabase();
   const nested = join(paths.dir, 'data', 'nested', 'store.sqlite');
@@ -170,6 +238,7 @@ void test('a fresh path is initialized with the marker, the current schema and i
   for (const table of [
     'accounts',
     'analyses',
+    'coaching_attempts',
     'jobs',
     'manual_decisions',
     'manual_revisions',
@@ -183,9 +252,12 @@ void test('a fresh path is initialized with the marker, the current schema and i
     'submissions',
     'sync_checkpoints',
     'tag_decisions',
+    'workbench_settings',
   ]) {
     assert.ok(state.tables.includes(table), `schema is missing ${table}`);
   }
+  assert.equal(rawScalar(nested, 'SELECT count(*) FROM coaching_attempts'), 0, 'the reserved coaching table starts empty');
+  assert.equal(rawScalar(nested, 'SELECT count(*) FROM workbench_settings'), 0, 'settings are written only by a save');
   fx.removeDirectory(paths.dir);
 });
 
@@ -269,7 +341,7 @@ void test('a supported v0 database is backed up before it is migrated', async ()
   fx.removeDirectory(paths.dir);
 });
 
-void test('a v1 database is copied, then migrated to v2 with every row kept', async () => {
+void test('a v1 database is copied, then migrated to v3 with every row kept', async () => {
   const paths = fx.tempDatabase();
   const world = seedV1World(paths.path);
   const before = fingerprint(paths.path);
@@ -288,6 +360,11 @@ void test('a v1 database is copied, then migrated to v2 with every row kept', as
       createdAt: fx.LATER,
     });
     assert.equal(await store.saveBatch(batch, null), 1, 'the added v2 tables are usable on the migrated file');
+    assert.equal(
+      await store.saveWorkbenchSettings(defaultWorkbenchSettings(), null),
+      1,
+      'the v3 settings table is usable too',
+    );
   } finally {
     await store.close();
   }
@@ -296,13 +373,19 @@ void test('a v1 database is copied, then migrated to v2 with every row kept', as
   assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION);
   assert.equal(migrated.marker, STORE_MARKER);
   assert.equal(migrated.integrity, 'ok');
-  for (const table of STORE_TABLES_V2) {
+  for (const table of STORE_TABLES_V3) {
     assert.ok(migrated.tables.includes(table), `migrated schema is missing ${table}`);
   }
   assert.equal(
     rawScalar(paths.path, 'PRAGMA journal_mode'),
     'wal',
     'the migrated database is configured after a successful migration',
+  );
+  assert.equal(rawScalar(paths.path, 'SELECT revision FROM workbench_settings'), 1);
+  assert.equal(
+    rawScalar(paths.path, 'SELECT count(*) FROM coaching_attempts'),
+    0,
+    'the reserved coaching table stays empty',
   );
 
   const backupNames = readdirSync(paths.dir).filter((name) => name.includes('.backup-v1-') && name.endsWith('.sqlite'));
@@ -366,6 +449,157 @@ void test('a v1 migration that cannot finish leaves the v1 tables and the pre-mi
   assert.equal(backup.marker, STORE_MARKER);
   assert.equal(backup.integrity, 'ok');
   assert.deepEqual(backup.tables, [...STORE_TABLES_V1].sort());
+  assert.equal(rawScalar(backupPath, 'SELECT body FROM problems'), canonicalJson(world.scope.problem));
+  fx.removeDirectory(paths.dir);
+});
+
+void test('historical v2 helpers keep writing exactly schema v2', () => {
+  const paths = fx.tempDatabase();
+  const initializedPath = join(paths.dir, 'initialized.sqlite');
+  let db = new DatabaseSync(initializedPath);
+  try {
+    initializeSchemaV2(db);
+  } finally {
+    db.close();
+  }
+  assert.equal(rawScalar(initializedPath, 'PRAGMA user_version'), SCHEMA_VERSION_V2, 'initializeSchemaV2 stops at 2');
+  assert.equal(
+    rawScalar(
+      initializedPath,
+      `SELECT count(*) FROM sqlite_master WHERE name IN ('workbench_settings', 'coaching_attempts')`,
+    ),
+    0,
+  );
+
+  const migratedPath = join(paths.dir, 'migrated.sqlite');
+  seedV1World(migratedPath);
+  db = new DatabaseSync(migratedPath);
+  try {
+    migrateSchemaV1ToV2(db);
+  } finally {
+    db.close();
+  }
+  assert.equal(rawScalar(migratedPath, 'PRAGMA user_version'), SCHEMA_VERSION_V2, 'migrateSchemaV1ToV2 stops at 2');
+  assert.equal(
+    rawScalar(migratedPath, 'SELECT count(*) FROM problems'),
+    1,
+    'the v1 rows survive the historical migration',
+  );
+  assert.equal(
+    rawScalar(
+      migratedPath,
+      `SELECT count(*) FROM sqlite_master WHERE name IN ('workbench_settings', 'coaching_attempts')`,
+    ),
+    0,
+  );
+  fx.removeDirectory(paths.dir);
+});
+
+void test('a v2 database is copied, then migrated to v3 with every row kept', async () => {
+  const paths = fx.tempDatabase();
+  const world = seedV2World(paths.path);
+  const expectedBatch = { ...world.batch, revision: 1 };
+  const before = fingerprint(paths.path);
+  assert.equal(before.userVersion, SCHEMA_VERSION_V2);
+  assert.deepEqual(before.tables, [...STORE_TABLES_V2].sort(), 'the fixture is exactly a v2 store');
+
+  const store = new SqliteTrainingStore({ path: paths.path, now: () => fx.LATER });
+  try {
+    assert.deepEqual(await store.getProblem(world.scope.problem.key), world.scope.problem, 'the problem body survived');
+    assert.deepEqual(await store.getBatch(world.batch.batchId), expectedBatch, 'the batch body survived');
+    assert.equal(
+      await store.saveWorkbenchSettings(defaultWorkbenchSettings(), null),
+      1,
+      'the v3 tables are usable on the migrated file',
+    );
+  } finally {
+    await store.close();
+  }
+
+  const migrated = fingerprint(paths.path);
+  assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION);
+  assert.equal(migrated.marker, STORE_MARKER);
+  assert.equal(migrated.integrity, 'ok');
+  for (const table of STORE_TABLES_V3) {
+    assert.ok(migrated.tables.includes(table), `migrated schema is missing ${table}`);
+  }
+  assert.equal(
+    rawScalar(paths.path, 'PRAGMA journal_mode'),
+    'wal',
+    'the migrated database is configured after a successful migration',
+  );
+  assert.equal(rawScalar(paths.path, 'SELECT body FROM problems'), canonicalJson(world.scope.problem));
+  assert.equal(rawScalar(paths.path, 'SELECT body FROM analysis_batches'), canonicalJson(expectedBatch));
+  assert.equal(rawScalar(paths.path, 'SELECT revision FROM workbench_settings'), 1);
+  assert.equal(
+    rawScalar(paths.path, 'SELECT count(*) FROM coaching_attempts'),
+    0,
+    'the reserved coaching table is created empty',
+  );
+
+  const backupNames = readdirSync(paths.dir).filter((name) => name.includes('.backup-v2-') && name.endsWith('.sqlite'));
+  assert.equal(backupNames.length, 1, 'exactly one pre-migration copy of the v2 database is kept');
+  const [backupName] = backupNames;
+  assert.ok(backupName);
+  const backupPath = join(paths.dir, backupName);
+  const backup = fingerprint(backupPath);
+  assert.equal(backup.userVersion, SCHEMA_VERSION_V2, 'the copy is the pre-migration v2 database');
+  assert.equal(backup.marker, STORE_MARKER);
+  assert.equal(backup.integrity, 'ok');
+  assert.deepEqual(backup.tables, [...STORE_TABLES_V2].sort());
+  assert.equal(rawScalar(backupPath, 'PRAGMA journal_mode'), 'delete', 'the copy predates the WAL switch');
+  assert.equal(rawScalar(backupPath, 'SELECT body FROM problems'), canonicalJson(world.scope.problem));
+  assert.equal(rawScalar(backupPath, 'SELECT body FROM analysis_batches'), canonicalJson(expectedBatch));
+  assert.equal(
+    rawScalar(
+      backupPath,
+      `SELECT count(*) FROM sqlite_master WHERE name IN ('workbench_settings', 'coaching_attempts')`,
+    ),
+    0,
+    'the copy contains no v3 tables',
+  );
+  fx.removeDirectory(paths.dir);
+});
+
+void test('a v3 migration that cannot finish leaves the v2 tables and the pre-migration copy readable', () => {
+  const paths = fx.tempDatabase();
+  const world = seedV2World(paths.path);
+  // A view named `coaching_attempts` makes the second v3 DDL statement, after the settings table was created of the migration fail.
+  rawExec(paths.path, ['CREATE VIEW coaching_attempts AS SELECT 1 AS id']);
+  assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');
+
+  assert.throws(
+    () => new SqliteTrainingStore({ path: paths.path }),
+    (error) => error instanceof StorageError && error.code === 'migration_failed',
+  );
+
+  const after = fingerprint(paths.path);
+  assert.equal(after.userVersion, SCHEMA_VERSION_V2, 'the failed migration was rolled back to v2');
+  assert.equal(after.marker, STORE_MARKER, 'the original metadata is intact');
+  assert.equal(after.integrity, 'ok');
+  assert.deepEqual(after.tables, [...STORE_TABLES_V2].sort(), 'no v3 table replaced the conflicting view');
+  assert.equal(
+    rawScalar(paths.path, 'PRAGMA journal_mode'),
+    'delete',
+    'configuration only happens after a successful migration, so the original journal mode is kept',
+  );
+  assert.equal(rawScalar(paths.path, 'SELECT body FROM problems'), canonicalJson(world.scope.problem));
+  assert.equal(
+    rawScalar(paths.path, `SELECT count(*) FROM sqlite_master WHERE type = 'view' AND name = 'coaching_attempts'`),
+    1,
+    'the conflicting object is still there, not silently dropped',
+  );
+
+  const backupNames = readdirSync(paths.dir).filter((name) => name.includes('.backup-v2-') && name.endsWith('.sqlite'));
+  assert.equal(backupNames.length, 1, 'the pre-migration copy survives the failed migration');
+  const [backupName] = backupNames;
+  assert.ok(backupName);
+  const backupPath = join(paths.dir, backupName);
+  const backup = fingerprint(backupPath);
+  assert.equal(backup.userVersion, SCHEMA_VERSION_V2);
+  assert.equal(backup.marker, STORE_MARKER);
+  assert.equal(backup.integrity, 'ok');
+  assert.deepEqual(backup.tables, [...STORE_TABLES_V2].sort());
   assert.equal(rawScalar(backupPath, 'SELECT body FROM problems'), canonicalJson(world.scope.problem));
   fx.removeDirectory(paths.dir);
 });
