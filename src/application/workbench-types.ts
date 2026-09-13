@@ -10,6 +10,7 @@
  * which is a different statement from absence.
  */
 import type {
+  AbilityAssessment,
   AccountWeaknessReport,
   AnalysisStatus,
   CandidateRejectionReason,
@@ -255,6 +256,23 @@ export interface WorkbenchFailureView {
   readonly retryable: boolean;
 }
 
+/**
+ * Completeness check recorded on one analysis.
+ *
+ * `null` on the analysis view means the stored result carries no record at all (a legacy row,
+ * or a reasoning-only/failed/cancelled run): that is *unchecked*, not "checked and clean".
+ * `state` distinguishes a check that still matches the stored head and the current audit
+ * version from one that has been superseded (newer snapshot or newer audit version).
+ */
+export interface WorkbenchCompletenessView {
+  readonly version: string;
+  readonly taxonomyVersion: string;
+  readonly snapshotId: string;
+  readonly snapshotVersion: number;
+  readonly checkedAt: string;
+  readonly state: 'current' | 'outdated';
+}
+
 /** One stored analysis with an explicit current-vs-stale indicator. */
 export interface WorkbenchAnalysisView {
   readonly analysisId: string;
@@ -270,6 +288,8 @@ export interface WorkbenchAnalysisView {
   readonly reasoningDrafts: readonly WorkbenchReasoningDraftView[];
   readonly failure: WorkbenchFailureView | null;
   readonly usage: ModelUsage | null;
+  /** Recorded completeness check, or `null` when this result is unchecked. */
+  readonly completeness: WorkbenchCompletenessView | null;
 }
 
 /** One manual accept/reject, in recorded order. */
@@ -490,6 +510,13 @@ export interface WorkbenchWeaknessResult {
    * channels, and an accepted submission alone confirms no method.
    */
   readonly knowledge: KnowledgeEvidenceReport;
+  /**
+   * Versioned local ability assessment over the same evidence (Sprint 11a): a transparent
+   * Codeforces training-difficulty band with its sample, coverage and Chinese caveats. It never
+   * claims an official rating, calls no model or platform, and reports `unknown` instead of a zero
+   * band when the sample is insufficient.
+   */
+  readonly ability: AbilityAssessment;
   /** Every distinct accepted problem over its own raw platform dimensions (provisional). */
   readonly solvedDistribution: WorkbenchSolvedDistributionView;
   /** Unverified platform-label reference; descriptive only, never formal weakness evidence. */

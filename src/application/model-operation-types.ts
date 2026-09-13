@@ -32,7 +32,17 @@ import type {
 } from './batch-types.js';
 import type { CoachingHistoryResult, CoachingStatusResult } from './coaching-service.js';
 import type { CoachingLevel, CoachingStatus } from './coaching-types.js';
+import type {
+  PlanAttemptRequest,
+  PlanHistoryRequest,
+  PlanPrepareRequest,
+  PlanPrepareResult,
+  PlanRunRequest,
+  PlanningAttemptView,
+} from './planning-service.js';
+import type { PlanAttemptStatus } from './planning-types.js';
 import type { WorkbenchSettings } from './workbench-settings.js';
+import type { WorkbenchPlanView } from './workbench-types.js';
 
 // ---------------------------------------------------------------------------------------
 // Bounds
@@ -103,6 +113,12 @@ export type ModelOperationErrorCode =
   | 'model_invalid'
   | 'history_overflow'
   | 'cancelled'
+  /**
+   * The operation is intentionally not installed in this host composition. AI planning is optional
+   * only so an old isolated controller fixture still composes; host composition always installs it,
+   * and a UI that receives this code must render "unavailable" instead of retrying.
+   */
+  | 'unavailable'
   | 'internal';
 
 /**
@@ -167,6 +183,15 @@ export interface ModelBatchPrepareRequest {
   readonly problemKeys: readonly string[];
   /** Job/snapshot bound of the prepared batch; defaults to {@link DEFAULT_MODEL_BATCH_MAX_JOBS}. */
   readonly maxJobs?: number;
+  /**
+   * Explicit rerun request; defaults to `false`.
+   *
+   * `false` is the ordinary "补齐尚未通过完整性检查的题目" mode: a snapshot is skipped only while
+   * its stored success carries a *current* completeness check for the current snapshot and
+   * taxonomy. `true` creates a new run identity even for an already checked result, keeping the
+   * old job, analysis and decision history immutable while the rerun corrects them.
+   */
+  readonly reanalyze?: boolean;
 }
 
 export interface ModelBatchRunRequest {
@@ -218,6 +243,35 @@ export interface ModelBatchJobSummary {
   readonly snapshotId: string;
   readonly status: AnalysisJobStatus;
   readonly analysisId: string | null;
+  /** Why it was skipped: its stored success carries the current completeness check. */
+  readonly completeness: 'current';
+}
+
+/** A finished job that this prepare superseded with a new run identity. */
+export interface ModelBatchRerunView {
+  readonly jobId: string;
+  readonly snapshotId: string;
+  readonly previousJobId: string;
+  readonly previousStatus: AnalysisJobStatus;
+  /**
+   * `legacy_unchecked` (stored before/without the current check), `cancelled_run` (the old
+   * cancelled run stays immutable) or `reanalyze_requested` (explicit force rerun).
+   */
+  readonly reason: 'legacy_unchecked' | 'cancelled_run' | 'reanalyze_requested';
+}
+
+/**
+ * One selected problem that cannot be analysed yet because it has no material snapshot.
+ *
+ * It is reported explicitly instead of silently dropping it or rejecting the whole selection:
+ * no job is created and no model call is made for it, and the UI can offer the refresh action.
+ * A metadata-only snapshot is deliberately **not** fabricated, because an empty snapshot would
+ * claim that material was captured when nothing was.
+ */
+export interface ModelBatchBlockedProblemView {
+  readonly problemKey: string;
+  readonly reason: 'material_missing';
+  readonly action: 'refresh_materials';
 }
 
 /**
@@ -259,6 +313,10 @@ export interface ModelBatchPrepareResult {
   readonly availability: ModelBatchAvailabilitySummary;
   readonly jobs: readonly ModelBatchPreparedJobView[];
   readonly alreadyDone: readonly ModelBatchJobSummary[];
+  /** Finished jobs this prepare replaced with a fresh run identity; old history is untouched. */
+  readonly reruns: readonly ModelBatchRerunView[];
+  /** Selected problems with no material snapshot; never silently dropped, never paid for. */
+  readonly blocked: readonly ModelBatchBlockedProblemView[];
 }
 
 /** Acknowledgement of one accepted background batch start; the run itself is owned by the controller. */
@@ -367,7 +425,7 @@ export interface ModelBatchListResult {
 }
 
 /** Owned background work this plugin instance is running, or last ran, for one key. */
-export const MODEL_OPERATION_NAMES = ['batch.run', 'batch.resume', 'coaching.ask'] as const;
+export const MODEL_OPERATION_NAMES = ['batch.run', 'batch.resume', 'coaching.ask', 'plan.aiRun'] as const;
 export type ModelOperationName = (typeof MODEL_OPERATION_NAMES)[number];
 
 export interface ModelOperationStatusView {
@@ -482,6 +540,121 @@ export interface ModelCoachingCancelResult {
   readonly requestId: string;
   readonly cancelled: boolean;
   readonly status: 'unknown' | CoachingStatus;
+}
+
+// ---------------------------------------------------------------------------------------
+// AI planning (Sprint 11d)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * `plan.aiPrepare`: the free, durable AI plan preparation.
+ *
+ * The request is the accepted planning-service request verbatim, so the HTTP contract cannot drift
+ * from the service it drives: `candidateProblemKeys` absent/`null` means the bounded automatic
+ * unsolved pool, an explicit (possibly empty) list means exactly that selection, and the scheduling
+ * settings are optional approved bounds. The service owns the strict validation of every member;
+ * the HTTP layer adds only its closed-key and bound checks on top.
+ */
+export type ModelPlanPrepareRequest = PlanPrepareRequest;
+/** Free preparation answer: the durable preparation view, or the service's typed refusal. */
+export type ModelPlanPrepareResult = PlanPrepareResult;
+
+/** `plan.aiRun`: the one paid call of an existing preparation, guarded by the stored revision. */
+export type ModelPlanRunRequest = Omit<PlanRunRequest, 'expectedSettingsRevision'> & { readonly expectedSettingsRevision: number };
+
+/** `plan.aiStatus`: one account-scoped status read; `reveal` asks for the candidate tags. */
+export type ModelPlanStatusRequest = PlanAttemptRequest & { readonly reveal?: boolean };
+/** `plan.aiCancel`: one account-scoped cancel/abandon of an attempt. */
+export type ModelPlanCancelRequest = PlanAttemptRequest;
+/** `plan.aiHistory`: one account-scoped, bounded, newest-first page of attempt metadata. */
+export type ModelPlanHistoryRequest = PlanHistoryRequest;
+
+/**
+ * Metadata of one AI planning run this controller instance owns.
+ *
+ * It never carries a preparation, a candidate pool, a model answer or a refusal message: only the
+ * owned operation identity, its lifecycle, the captured settings revision and the stable code of a
+ * background failure or typed dispatch refusal. `errorCode` is `null` while the run is still
+ * running or when it completed normally; `retryable` is only meaningful together with a refusal.
+ */
+export interface ModelPlanOperationView {
+  readonly operationId: string;
+  readonly operation: 'plan.aiRun';
+  readonly state: 'running' | 'settled';
+  readonly startedAt: string;
+  readonly settledAt: string | null;
+  /** Stored settings revision the paid run was validated and executed against. */
+  readonly settingsRevision: number | null;
+  readonly errorCode: string | null;
+  readonly retryable: boolean | null;
+}
+
+/**
+ * `plan.aiRun` acknowledgement.
+ *
+ * `operation` is this instance's owned run (the start it acknowledged, or its retained settled
+ * record). `attempt` is the durable attempt as read when the request was answered: the `prepared`
+ * row of an accepted start, or the terminal/reserved row of an idempotent repeat. Both are
+ * metadata-only; the stored plan is reachable through `plan.aiStatus` and its spoiler projection.
+ */
+export interface ModelPlanRunResult {
+  readonly requestId: string;
+  readonly accountId: string;
+  readonly operation: ModelPlanOperationView | null;
+  readonly attempt: PlanningAttemptView | null;
+  readonly verification: 'unverified_ai';
+}
+
+/**
+ * `plan.aiStatus` answer.
+ *
+ * An attempt of another account answers exactly like an unknown id, so a caller can neither spoof
+ * an account nor learn whether somebody else's request id exists. `operation` is attached only when
+ * the caller's account is exactly the one this instance's run was started for. `plan` is the
+ * workbench's own spoiler-safe projection of the stored plan (`WorkbenchPlanView`) and is `null`
+ * while the attempt has no stored plan; the raw stored row never travels through this answer.
+ */
+export type ModelPlanStatusResult =
+  | {
+      readonly status: 'unknown';
+      readonly requestId: string;
+      readonly accountId: string;
+      readonly attempt: null;
+      readonly operation: ModelPlanOperationView | null;
+      readonly plan: null;
+      readonly verification: 'unverified_ai';
+    }
+  | {
+      readonly status: 'found';
+      readonly requestId: string;
+      readonly accountId: string;
+      readonly attempt: PlanningAttemptView;
+      readonly operation: ModelPlanOperationView | null;
+      readonly plan: WorkbenchPlanView | null;
+      readonly verification: 'unverified_ai';
+    };
+
+/**
+ * `plan.aiCancel` answer.
+ *
+ * `cancelled: true` means this instance cancelled its own live run; `cancelled: false` with a
+ * durable `cancelled` status means the free preparation was abandoned by the service. A reserved
+ * attempt is never rewritten or refunded here: its real usage is recorded by the settlement path
+ * the token cancellation triggers, so `status: 'reserved'` is the honest answer.
+ */
+export interface ModelPlanCancelResult {
+  readonly requestId: string;
+  readonly accountId: string;
+  readonly cancelled: boolean;
+  readonly status: 'unknown' | PlanAttemptStatus;
+  readonly operation: ModelPlanOperationView | null;
+  readonly verification: 'unverified_ai';
+}
+
+/** `plan.aiHistory` answer: one bounded page of attempt metadata, newest first, never a plan body. */
+export interface ModelPlanHistoryResult {
+  readonly items: readonly PlanningAttemptView[];
+  readonly total: number;
 }
 
 // ---------------------------------------------------------------------------------------

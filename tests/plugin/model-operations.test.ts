@@ -412,10 +412,15 @@ void test('prepare resolves current snapshots into spoiler-free metadata and ref
       bench.controller.prepareBatch({ problemKeys: [fx.keyOf(fx.makeRef(ready.instance, '9999Z'))] }, TOKEN),
       failure('not_found'),
     );
-    await assert.rejects(
-      bench.controller.prepareBatch({ problemKeys: [neverFrozen.key] }, TOKEN),
-      failure('conflict'),
-    );
+    // A problem without any material snapshot is an explicit blocked entry, not a rejection of
+    // the whole selection: no job is created and no model call can reach it.
+    const blockedOnly = await bench.controller.prepareBatch({ problemKeys: [neverFrozen.key] }, TOKEN);
+    assert.equal(blockedOnly.batchId, null);
+    assert.deepEqual(blockedOnly.jobs, []);
+    assert.deepEqual(blockedOnly.blocked, [
+      { problemKey: neverFrozen.key, reason: 'material_missing', action: 'refresh_materials' },
+    ]);
+    assert.deepEqual(blockedOnly.upperBoundCalls, { analysisCalls: 0, reasoningCalls: 0 });
   } finally {
     await bench.close();
   }
@@ -455,7 +460,12 @@ void test('the call upper bound is the batch quota and covers retries, not one p
           }
         : okAnalyze(snapshot, { callId: 'call-analysis' });
     };
-    bench.gateway.verifyHandler = async (request) => okVerify(request.suggestions, snapshot);
+    bench.gateway.verifyHandler = async (request) => {
+      // The completeness-aware answer: an explicit (empty) omissions list makes this run a
+      // checked one, so the finished job is genuinely skipped by the next prepare.
+      const answer = await okVerify(request.suggestions, snapshot);
+      return answer.ok ? { ...answer, value: { ...answer.value, missingSuggestions: [] } } : answer;
+    };
 
     const prepared = await bench.controller.prepareBatch({ problemKeys: [world.problem.key] }, TOKEN);
     const batchId = batchIdOf(prepared);

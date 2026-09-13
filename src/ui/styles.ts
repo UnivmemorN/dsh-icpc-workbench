@@ -88,4 +88,21 @@ export const styles=`
 .icpc-tag-mapping td > span{display:block;overflow-wrap:anywhere}
 .icpc-tag-mapping td .icpc-tag-mapping-refs{display:flex;flex-direction:column;gap:3px;margin-top:4px}
 .icpc-tag-mapping td .icpc-tag-mapping-refs a{display:inline-block;font-size:12px;overflow-wrap:anywhere}
+.icpc-plan-check{flex-direction:row;align-items:center;gap:6px}
+.icpc-plan-check input{width:auto}
+.icpc-plan-invalid{margin:8px 0 0;font-size:12px;font-weight:600;color:#b05532}
+.icpc-plan-prepared{margin-top:14px;padding-top:12px;border-top:1px solid var(--icpc-line);min-width:0}
+.icpc-plan-meta{display:flex;flex-wrap:wrap;gap:6px 18px;margin:8px 0;font-size:12px;color:var(--icpc-muted);min-width:0;overflow-wrap:anywhere}
+.icpc-plan-usage{font-variant-numeric:tabular-nums}
+.icpc-plan-actions{display:flex;flex-wrap:wrap;gap:6px}
+.icpc-plan-candidates{max-width:100%}
+.icpc-plan-candidates td{vertical-align:top;overflow-wrap:anywhere}
+.icpc-plan-candidates td:first-child{min-width:190px}
+.icpc-plan-candidates td span{display:block;font-size:12px}
+.icpc-plan-history{max-width:100%}
+.icpc-plan-history td{vertical-align:top;overflow-wrap:anywhere}
+.icpc-plan-history td span{display:block;font-size:12px}
+.icpc-plan-history td.icpc-plan-usage{white-space:nowrap}
+@media(max-width:640px){.icpc-plan-history td.icpc-plan-usage{white-space:normal}.icpc-plan-candidates td:first-child{min-width:0}}
+@media(prefers-color-scheme:dark){.icpc-plan-invalid{color:#e9a184}}
 `;

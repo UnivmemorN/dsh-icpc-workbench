@@ -221,8 +221,11 @@ export function decisionIsEffective(decision: Pick<TagDecision, 'status'>): bool
  *
  * A human decision always outranks model/rule output — a re-analysis must never undo an
  * explicit accept/reject — and among decisions of equal standing the later `decidedAt`
- * wins. Decisions are an append-only history, so the list order is irrelevant; a tie on
- * timestamp is resolved in favour of the later entry, keeping the result deterministic.
+ * wins. Decisions are an append-only history, so the list order is irrelevant; an equal
+ * timestamp (the clock repeated) keeps the later list entry. The candidate's *status* never
+ * outranks the current one: a withdrawal is only newer when it was really decided later, and
+ * the pipeline guarantees that a checked run is logically newer than every decision it
+ * supersedes (see `logicalAdoptionInstant`), so ordering stays a fact rather than a guess.
  */
 function decisionSupersedes(current: TagDecision, candidate: TagDecision): boolean {
   const currentManual = current.origin === 'manual';

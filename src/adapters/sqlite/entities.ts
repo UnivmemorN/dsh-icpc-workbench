@@ -216,6 +216,33 @@ export const COACHING_ATTEMPT_FIELDS: readonly string[] = [
   'error',
 ];
 
+/**
+ * Declared fields of one AI planning attempt. `requested_at`/`expires_at`/`finished_at`/`plan_id`
+ * have their own indexed columns (lease recovery, quota window, plan lookup) and the canonical body
+ * stays the source of truth for reads.
+ */
+export const PLAN_ATTEMPT_FIELDS: readonly string[] = [
+  'id',
+  'accountId',
+  'sourceInstanceId',
+  'status',
+  'requestedAt',
+  'expiresAt',
+  'finishedAt',
+  'provider',
+  'model',
+  'promptVersion',
+  'settingsRevision',
+  'inputHash',
+  'preparation',
+  'hostSessionId',
+  'hostCallId',
+  'usage',
+  'planId',
+  'planHash',
+  'error',
+];
+
 /** Fields that take part in a snapshot's *identity* (observation timestamps excluded). */
 const PROBLEM_IDENTITY_FIELDS: readonly string[] = ['ref', 'key', 'title', 'url', 'statement', 'ratings', 'rawTags'];
 const SOURCE_IDENTITY_FIELDS: readonly string[] = [
@@ -446,7 +473,7 @@ export function jobCounters(state: Pick<AnalysisJobState, 'attempts' | 'counters
 // Cursor codec
 // ---------------------------------------------------------------------------------------
 
-export type CursorKind = 'problem' | 'submission' | 'coaching';
+export type CursorKind = 'problem' | 'submission' | 'coaching' | 'plan';
 
 const CURSOR_PAYLOAD = /^[A-Za-z0-9_-]+$/u;
 

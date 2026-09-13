@@ -292,6 +292,13 @@ export interface AnalyzeRequest {
 export interface VerifyRequest {
   readonly snapshot: ProblemSnapshot;
   readonly taxonomy: Taxonomy;
+  /**
+   * Suggestions to verify; **may be empty**.
+   *
+   * An empty list still requires the call: the independent pass must scan the full material
+   * for omissions even when the analysis proposed nothing, and that answer is what makes the
+   * run a completeness check.
+   */
   readonly suggestions: readonly AiTagSuggestion[];
   readonly token: CancellationToken;
   readonly limits: ModelLimits;
@@ -320,6 +327,16 @@ export interface AnalyzeOutcome {
 
 export interface VerifyOutcome {
   readonly verifications: readonly SuggestionVerification[];
+  /**
+   * Omissions the verifier found in the material: taxonomy methods the editorial really uses
+   * but the analysis pass never proposed.
+   *
+   * Present only when the call ran under the completeness-aware verification prompt; a legacy
+   * outcome omits the member entirely, so replaying an old answer can never be mistaken for an
+   * omissions answer. A present (possibly empty) array **is** the omissions answer — an empty
+   * analysis still requires the verification call, and it counts against the call budget.
+   */
+  readonly missingSuggestions?: readonly AiTagSuggestion[];
 }
 
 export interface ReasonOutcome {

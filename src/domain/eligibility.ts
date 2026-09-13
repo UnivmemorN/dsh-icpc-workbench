@@ -27,6 +27,8 @@ import { findSolution, findSource } from './snapshot.js';
 import type { TaxonomyIndex } from './taxonomy/types.js';
 import {
   createTagDecision,
+  currentDecisionPerTag,
+  decisionIsEffective,
   manualDecisionsForProblem,
   type AiTagSuggestion,
   type DecisionReason,
@@ -57,6 +59,15 @@ export interface EvaluateSuggestionContext {
   readonly currentHead: SnapshotHead | null;
   readonly manualDecisions: readonly ManualTagDecision[];
   readonly settings: EligibilitySettings;
+  /**
+   * Decisions already stored for this problem, in the store's own order.
+   *
+   * They are consulted only by a *checked* analysis (one carrying a completeness record): an
+   * effective non-manual AI tag that the new check no longer supports is then explicitly
+   * withdrawn with a current `needs_review` decision. Failed, cancelled and reasoning-only
+   * runs must not pass this context, so they can never withdraw the last valid adoption.
+   */
+  readonly previousDecisions?: readonly TagDecision[];
 }
 
 export type EligibilityDecision =
@@ -325,11 +336,68 @@ export function resolveTagDecisions(context: EvaluateSuggestionContext): Resolve
     );
   }
 
+  decisions.push(...withdrawnAdoptions(context, decisions, manualByTag));
+
   return deepFreeze({
     stale,
     outcomes,
     decisions,
   });
+}
+
+/**
+ * Withdraw old automatic adoptions that the current, checked analysis no longer supports.
+ *
+ * The store's decision history only ever *adds* rows, and the effective view is the current
+ * decision per (problem, tag). Merely omitting an old tag from a new result therefore leaves
+ * it wrongly effective; a completed check that dropped it must record a current
+ * `needs_review` decision (`stale_analysis`). Rules:
+ *
+ * - only a checked analysis may withdraw (a completeness record must be present), so failed,
+ *   cancelled and reasoning-only runs never undo the last valid adoption;
+ * - manual accept/reject always wins: a tag with any manual decision is left untouched;
+ * - a tag the new analysis already decided (adopted, rejected or sent to review) needs no
+ *   withdrawal — that fresh decision is the correction;
+ * - original raw platform tags are never touched: this only ever appends decisions.
+ */
+function withdrawnAdoptions(
+  context: EvaluateSuggestionContext,
+  fresh: readonly TagDecision[],
+  manualByTag: ReadonlyMap<string, ManualTagDecision>,
+): TagDecision[] {
+  const previous = context.previousDecisions ?? [];
+  if (previous.length === 0 || context.analysis.completeness === undefined) {
+    return [];
+  }
+  if (analysisIsStale(context.analysis, context.currentHead)) {
+    return [];
+  }
+  const decidedTags = new Set(fresh.map((decision) => decision.taxonomyId));
+  const withdrawn: TagDecision[] = [];
+  for (const [taxonomyId, decision] of currentDecisionPerTag(previous)) {
+    if (decision.origin !== 'ai' || !decisionIsEffective(decision)) {
+      continue;
+    }
+    if (manualByTag.has(taxonomyId) || decidedTags.has(taxonomyId)) {
+      continue;
+    }
+    withdrawn.push(
+      createTagDecision({
+        problemKey: context.analysis.problemKey,
+        taxonomyId,
+        status: 'needs_review',
+        origin: 'ai',
+        analysisId: context.analysis.analysisId,
+        suggestionId: null,
+        snapshotId: context.analysis.snapshotId,
+        snapshotVersion: context.analysis.snapshotVersion,
+        decidedAt: context.analysis.createdAt,
+        reasons: ['stale_analysis'],
+        evidence: [],
+      }),
+    );
+  }
+  return withdrawn.sort((left, right) => left.taxonomyId.localeCompare(right.taxonomyId));
 }
 
 /** Outcomes a human must look at (needs review or was rejected), in stable order. */

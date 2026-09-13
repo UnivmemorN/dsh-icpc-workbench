@@ -29,7 +29,7 @@ function fixture() {
 test('host composition keeps activation free, persists settings/accounts and creates a restorable backup',async()=>{
  const f=fixture();let runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.calls(),0);assert.equal(f.routes.size,35); // 34 stage-06 routes + the additive problem.mergedBrowse route (stage 08b)
+  assert.equal(f.calls(),0);assert.equal(f.routes.size,40); // 34 stage-06 routes + problem.mergedBrowse (stage 08b) + the 5 AI-planning routes (stage 11d)
   const boot=await f.call('bootstrap');assert.equal(boot.status,200);assert.equal(boot.body.value.settings.revision,1);assert.equal(boot.body.value.sources.length,2);assert.equal(boot.body.value.hydro.implemented,false);assert.equal(boot.body.value.hostVersion,'0.1.5-rc.2');
   assert.equal(f.calls(),0);
   const account=await f.call('account.create',{platform:'codeforces',handle:'Tourist'});assert.equal(account.status,200);
@@ -78,4 +78,38 @@ test('catalog timeout and cancellation remain bounded when host ignores abort',a
 });
 test('harness home defaults and tilde expansion match the baseline path policy',()=>{
  const home=join(process.cwd(),'example-home');assert.equal(resolveHarnessHome('  ',home),join(home,'.dsh'));assert.equal(resolveHarnessHome('~',home),home);assert.equal(resolveHarnessHome('~/custom',home),join(home,'custom'));assert.equal(resolveHarnessHome('~\\custom',home),join(home,'custom'));
+});
+test('host activation recovers an expired AI plan reservation before any route serves a start',async()=>{
+ const f=fixture();
+ const scope=fx.makeScope('codeforces','codeforces.com','alice','1A');
+ // Seed the plugin data directory directly: one source instance, one account and two unsolved
+ // problems are all a free AI preparation needs, and no model call is involved anywhere below.
+ mkdirSync(f.dataDir,{recursive:true});
+ const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>fx.AT});
+ await seed.upsertSourceInstances([scope.instance]);
+ await seed.upsertAccounts([scope.account]);
+ await seed.upsertProblems([scope.problem,fx.makeProblem(fx.makeRef(scope.instance,'2B'))]);
+ await seed.close();
+ let runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+ try {
+  const prepared=await f.call('plan.aiPrepare',{requestId:'restart-1',accountId:scope.account.id});
+  assert.equal(prepared.status,200);assert.equal(prepared.body.value.outcome,'prepared');
+  assert.equal(f.calls(),0);
+  await runtime.dispose();
+  // The durable state a process that died mid-reservation leaves behind: a `reserved` attempt whose
+  // lease is already in the past relative to the real clock activation reads.
+  const admin=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>new Date().toISOString()});
+  const row=await admin.getPlanAttempt('restart-1');assert.ok(row);
+  const nowMs=Date.now();
+  await admin.savePlanAttempt({...row,status:'reserved',requestedAt:new Date(nowMs-120_000).toISOString(),expiresAt:new Date(nowMs-60_000).toISOString()});
+  await admin.close();
+  runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+  const status=await f.call('plan.aiStatus',{requestId:'restart-1',accountId:scope.account.id});
+  assert.equal(status.status,200);
+  assert.equal(status.body.value.status,'found');
+  assert.equal(status.body.value.attempt.status,'uncertain'); // recovered on startup, never live
+  assert.equal(status.body.value.operation,null); // the new controller instance owns no run for it
+  assert.equal(status.body.value.plan,null);
+  assert.equal(f.calls(),0);
+ }finally{await runtime.dispose();f.remove();}
 });

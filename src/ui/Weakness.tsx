@@ -1,19 +1,25 @@
 import { useEffect, useState } from 'react';
 import { Panel, Notice, Empty, ErrorNotice, useRequest, useWorkbench, Stats, tagName } from './common.js';
+import { Ability } from './Ability.js';
+import { abilityStatValue } from './ability-view.js';
 import { Knowledge } from './Knowledge.js';
 import { SolvedDistribution, shareText } from './SolvedDistribution.js';
 
-/** Three explicit readings of the same evidence: per technique node, raw platform labels vs. reviewed analysis. */
-type WeaknessView = 'knowledge' | 'platform' | 'verified';
+/**
+ * Four explicit readings of the same evidence: the local ability heuristic, per technique node,
+ * raw platform labels and the reviewed analysis.
+ */
+type WeaknessView = 'ability' | 'knowledge' | 'platform' | 'verified';
 
 /**
  * Weakness page. The reading order is deliberate: heading → summary Stats → view switch (with the
  * collapsed coverage diagnosis beside it) → the selected content → the full solved-problem
- * histogram. The default view reads the same evidence per technique node ("what do my own records
- * actually show for this technique?"); the platform reference and the reviewed analysis keep their
- * previous behavior, so the ranking that answers "where am I weak" stays one click away and the
- * histogram remains below. Provisional numbers never replace formal evidence, and the view switch is
- * local and costs no request.
+ * histogram. The default view is the ability assessment, because "which training difficulty does my
+ * history support?" is the first question the evidence should answer; it is a transparent local
+ * heuristic with its own sample and caveats, never an official rating. The knowledge view (same
+ * evidence per technique node), the platform reference and the reviewed analysis keep their previous
+ * content one click away, so the ranking that answers "where am I weak" is never lost. Provisional
+ * numbers never replace formal evidence, and the view switch is local and costs no request.
  */
 export function Weakness() {
   const { accountId, boot, navigate } = useWorkbench();
@@ -26,9 +32,10 @@ export function Weakness() {
   const attempted = data?.report.attemptedDistinctTotal ?? 0;
   const platformTagged = data?.platformTagStats.attemptedTaggedDistinct ?? 0;
   const formalTagged = data?.report.taggedAttemptedDistinct ?? 0;
-  // The knowledge view is the landing view: it reuses this read and explains the evidence per
-  // technique node; the two previous views stay one click away with unchanged content.
-  const view: WeaknessView = picked ?? 'knowledge';
+  // The ability assessment is the landing view: it reuses this read and gives the transparent
+  // training-difficulty reference; the three previous views stay one click away with unchanged
+  // content.
+  const view: WeaknessView = picked ?? 'ability';
   const tagless = Math.max(0, (data?.coverage.metadataPresent ?? 0) - platformTagged);
   const diagnosis: string[] = [];
   if (data) {
@@ -68,6 +75,7 @@ export function Weakness() {
           <h1>知识点与薄弱项</h1>
           <p>
             同一道题的多次提交只算一道；每个标签至少 5 道尝试题才进入已复核排名。平台原始标签只作参考，不算已接受标签。
+            能力评估是本地启发式的训练难度参考（非官方 rating）：样本不足时显示“未知”，不会给出 0 分或“新手”结论。
           </p>
         </div>
       </div>
@@ -82,6 +90,7 @@ export function Weakness() {
             <>
               <Stats
                 items={[
+                  { label: '能力评估（训练难度参考）', value: abilityStatValue(data.ability) },
                   { label: '尝试过的不同题目', value: attempted },
                   { label: '已通过题目', value: data.report.solvedDistinctTotal },
                   { label: '已复核标签覆盖（占尝试题）', value: `${formalTagged} / ${attempted}` },
@@ -89,6 +98,9 @@ export function Weakness() {
                 ]}
               />
               <div className="icpc-viewswitch" role="group" aria-label="统计视图">
+                <button type="button" aria-pressed={view === 'ability'} onClick={() => setPicked('ability')}>
+                  能力评估（训练难度参考）
+                </button>
                 <button type="button" aria-pressed={view === 'knowledge'} onClick={() => setPicked('knowledge')}>
                   知识点掌握情况
                 </button>
@@ -156,12 +168,14 @@ export function Weakness() {
                   <button onClick={() => navigate('review')}>去标签审核</button>
                 </div>
               </details>
-              {view === 'knowledge' ? (
+              {view === 'ability' ? (
+                <Ability ability={data.ability} />
+              ) : view === 'knowledge' ? (
                 <Knowledge knowledge={data.knowledge} coverage={data.coverage} />
               ) : view === 'platform' ? (
                 <Panel title="平台标签参考（未复核）">
                   <Notice>
-                    这些标签是平台原始数据，未经复核，也不是已接受的标签。原始标签可能不完整、口径不同或与训练方向不一致，据此判断薄弱项可能失真；它们不会进入训练计划，也不改变“已复核分析”。
+                    这些标签是平台原始数据，未经复核，也不是已接受的标签。原始标签可能不完整、口径不同或与训练方向不一致，据此判断薄弱项可能失真；它们不会成为正式标签，也不改变“已复核分析”。AI 计划只会在候选题里把它们当作临时参考一并发送，而且需要显式开启剧透才会显示。
                   </Notice>
                   {platformTags.length === 0 ? (
                     <Empty>

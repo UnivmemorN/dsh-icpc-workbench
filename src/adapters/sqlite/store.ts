@@ -127,6 +127,16 @@ import {
   type SyncCheckpointRef,
   type SyncResource,
 } from '../../application/storage-types.js';
+import {
+  PLAN_ATTEMPT_STATUSES,
+  validatePlanAttempt,
+  validatePlanAttemptTransition,
+  type PlanAttempt,
+  type PlanAttemptCountQuery,
+  type PlanAttemptQuery,
+  type PlanAttemptStatus,
+  type PlanningStore,
+} from '../../application/planning-types.js';
 import { FifoMutex, TransactionScopes, type TransactionScope } from './concurrency.js';
 import { StorageError } from './errors.js';
 import {
@@ -138,6 +148,7 @@ import {
   MANUAL_DECISION_FIELDS,
   MODEL_CALL_ATTEMPT_FIELDS,
   PLAN_FIELDS,
+  PLAN_ATTEMPT_FIELDS,
   PROBLEM_FIELDS,
   RETROSPECTIVE_FIELDS,
   SNAPSHOT_FIELDS,
@@ -164,14 +175,16 @@ import {
   SCHEMA_VERSION_EMPTY,
   SCHEMA_VERSION_V1,
   SCHEMA_VERSION_V2,
+  SCHEMA_VERSION_V3,
   STORE_MARKER,
   STORE_SCHEMA_VERSION,
   backupFileName,
   configureConnection,
   detectSchemaState,
-  initializeSchemaV3,
-  migrateSchemaV1ToV3,
-  migrateSchemaV2ToV3,
+  initializeSchemaV4,
+  migrateSchemaV1ToV4,
+  migrateSchemaV2ToV4,
+  migrateSchemaV3ToV4,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -221,7 +234,7 @@ function requireId(label: string, value: string): string {
   return value;
 }
 
-export class SqliteTrainingStore implements TrainingStore, SettingsStore, CoachingStore {
+export class SqliteTrainingStore implements TrainingStore, SettingsStore, CoachingStore, PlanningStore {
   readonly path: string;
 
   private readonly connection: DatabaseSync;
@@ -296,11 +309,12 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
       transactional: true,
       notes: [
         `node:sqlite DatabaseSync; schema marker ${STORE_MARKER}; one serialized connection`,
-        'Databases from a newer schema are rejected before any write; v0, v1 and v2 databases are migrated after a verified consistent backup',
+        'Databases from a newer schema are rejected before any write; v0, v1, v2 and v3 databases are migrated after a verified consistent backup',
         'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
         'Batches are revision-guarded with monotonic counters; model-call attempts move reserved -> uncertain|settled and settled rows are immutable',
         'Workbench settings are a singleton row saved under revision CAS',
         'Coaching attempts are indexed audits: reserved -> uncertain|settled, settled rows immutable, bodies re-validated on read, bounded cursor pages over a three-valued account scope, global count',
+        'AI planning attempts are indexed audits of their own: prepared (free, never charged) -> reserved (single in-flight call, lease recovery) | cancelled, reserved -> settled|uncertain, terminal rows immutable, bodies re-validated on read, account-scoped cursor pages and a global rolling-window count',
       ],
     };
   }
@@ -1070,7 +1084,12 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
     this.assertOpen();
     return this.withWrite(() => {
       requireProblemKey(result.problemKey);
-      const body = bodyOf(result, ANALYSIS_FIELDS);
+      // The optional completeness record is appended only when the result actually carries it,
+      // so a legacy body keeps its original bytes — and therefore its immutability identity.
+      const body = bodyOf(
+        result,
+        result.completeness === undefined ? ANALYSIS_FIELDS : [...ANALYSIS_FIELDS, 'completeness'],
+      );
       const existing = this.find('SELECT body FROM analyses WHERE analysis_id = ?', [result.analysisId]);
       if (existing !== null) {
         requireSameBody('analysis', result.analysisId, textColumn(existing, 'body'), body);
@@ -1520,6 +1539,124 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
       }
       const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
       const row = this.find(`SELECT COUNT(*) AS total FROM coaching_attempts${where}`, params);
+      return row === null ? 0 : intColumn(row, 'total');
+    });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // AI planning attempts (PlanningStore)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * One attempt by id, or `null`.
+   *
+   * The stored canonical body is the record and is re-validated on read, so a hand-edited or
+   * otherwise malformed body is reported as `corrupt_row` instead of being cast to an attempt.
+   */
+  async getPlanAttempt(id: string): Promise<PlanAttempt | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM plan_attempts WHERE id = ?', [requireId('planning attempt id', id)]);
+      return row === null ? null : this.readPlanAttempt(row);
+    });
+  }
+
+  /** Insert a prepared attempt or advance it; see {@link PlanningStore.savePlanAttempt}. */
+  async savePlanAttempt(attempt: PlanAttempt): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => this.writePlanAttempt(attempt));
+  }
+
+  /**
+   * One page of attempts in deterministic `requestedAt, id` order.
+   *
+   * The ordering defaults to ascending — the historical order every quota/recovery walk relies on —
+   * and `order: 'desc'` answers the "latest attempt first" history read through the same
+   * `plan_attempts_by_requested` index. Continuation is keyset-based, never `OFFSET`, and the opaque
+   * cursor is bound to the effective filter set (account scope, status, inclusive `since` **and**
+   * ordering): a cursor produced by another query is rejected instead of silently paging a
+   * different history. Every returned body is re-validated like {@link getPlanAttempt}.
+   */
+  async listPlanAttempts(query: PlanAttemptQuery): Promise<Page<PlanAttempt>> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const limit = pageLimit(query.limit);
+      const filters = planFilters(query);
+      const fingerprint = planFingerprint(filters);
+      const cursor = query.cursor === null ? null : decodePlanCursor(query.cursor, fingerprint);
+      const descending = filters.order === 'desc';
+      const clauses: string[] = [];
+      const params: SqlValue[] = [];
+      if (filters.accountId !== null) {
+        clauses.push('account_id = ?');
+        params.push(filters.accountId);
+      }
+      if (filters.status !== null) {
+        clauses.push('status = ?');
+        params.push(filters.status);
+      }
+      if (filters.since !== null) {
+        clauses.push('requested_at >= ?');
+        params.push(filters.since);
+      }
+      if (cursor !== null) {
+        // Keyset continuation on the selected order: strictly after the last key in that direction.
+        clauses.push(
+          descending
+            ? '(requested_at < ? OR (requested_at = ? AND id < ?))'
+            : '(requested_at > ? OR (requested_at = ? AND id > ?))',
+        );
+        params.push(cursor.requestedAt, cursor.requestedAt, cursor.id);
+      }
+      const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+      // Only the boolean direction, never caller text, reaches the statement.
+      const direction = descending ? 'DESC' : 'ASC';
+      const rows = this.all(
+        `SELECT body FROM plan_attempts${where} ORDER BY requested_at ${direction}, id ${direction} LIMIT ?`,
+        [...params, limit + 1],
+      );
+      const items = rows.slice(0, limit).map((row) => this.readPlanAttempt(row));
+      const last = items.at(-1);
+      return {
+        items,
+        nextCursor:
+          rows.length > limit && last !== undefined
+            ? encodeCursor('plan', JSON.stringify({ f: fingerprint, t: last.requestedAt, i: last.id }))
+            : null,
+        fetchedAt: this.clock(),
+      };
+    });
+  }
+
+  /**
+   * Count attempts for the plugin-wide rolling planning quota.
+   *
+   * A single `COUNT(*)` resolves through the v4 indexes, so the total never loads attempt bodies
+   * and never becomes a per-account loophole: there is no account scope here on purpose. The
+   * caller supplies the charged statuses, so a free `prepared` row can never be counted as a call.
+   */
+  async countPlanAttempts(query: PlanAttemptCountQuery): Promise<number> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const clauses: string[] = [];
+      const params: SqlValue[] = [];
+      if (query.since !== undefined && query.since !== null) {
+        clauses.push('requested_at >= ?');
+        params.push(assertIsoTimestamp('planning since', query.since));
+      }
+      if (query.statuses !== undefined && query.statuses !== null) {
+        const statuses = query.statuses.map((status) => requirePlanStatus(status));
+        invariant(
+          statuses.length > 0,
+          'invalid_input',
+          'a planning count with an empty status list matches nothing by construction; omit the filter instead',
+          { reason: 'empty_status_list' },
+        );
+        clauses.push(`status IN (${statuses.map(() => '?').join(', ')})`);
+        params.push(...statuses);
+      }
+      const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+      const row = this.find(`SELECT COUNT(*) AS total FROM plan_attempts${where}`, params);
       return row === null ? 0 : intColumn(row, 'total');
     });
   }
@@ -2032,6 +2169,82 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
     }
   }
 
+  /**
+   * Insert one prepared planning attempt, or advance an existing one.
+   *
+   * A new attempt must be `prepared`: the free preparation is what the paid call is bound to, so a
+   * dispatched or settled call can never be recorded first (and a duplicate id cannot overwrite a
+   * charged attempt). An identical re-save is a no-op so recovery may replay a record. Identity
+   * columns are written once; later saves only move `status`/the lease and the body, and the
+   * application validator refuses a rewritten preparation, an extended lease, a rewritten terminal
+   * row or a cleared/reassigned host correlation.
+   */
+  private writePlanAttempt(value: PlanAttempt): void {
+    const attempt = validatePlanAttempt(value);
+    const body = bodyOf(attempt, PLAN_ATTEMPT_FIELDS);
+    const existing = this.find('SELECT body FROM plan_attempts WHERE id = ?', [attempt.id]);
+    if (existing === null) {
+      invariant(
+        attempt.status === 'prepared',
+        'invalid_transition',
+        `planning attempt ${attempt.id} must be inserted as prepared before any paid call`,
+        { id: attempt.id, status: attempt.status },
+      );
+      this.write(
+        `INSERT INTO plan_attempts (id, account_id, source_instance_id, status, requested_at, expires_at, finished_at, plan_id, body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          attempt.id,
+          attempt.accountId,
+          attempt.sourceInstanceId,
+          attempt.status,
+          attempt.requestedAt,
+          attempt.expiresAt,
+          attempt.finishedAt,
+          attempt.planId,
+          body,
+        ],
+      );
+      return;
+    }
+    if (textColumn(existing, 'body') === body) {
+      return;
+    }
+    const stored = this.readPlanAttempt(existing);
+    validatePlanAttemptTransition(stored, attempt);
+    this.write(
+      `UPDATE plan_attempts SET status = ?, requested_at = ?, expires_at = ?, finished_at = ?, plan_id = ?, body = ?
+       WHERE id = ?`,
+      [
+        attempt.status,
+        attempt.requestedAt,
+        attempt.expiresAt,
+        attempt.finishedAt,
+        attempt.planId,
+        body,
+        attempt.id,
+      ],
+    );
+  }
+
+  /**
+   * Decode one planning attempt from its stored canonical body.
+   *
+   * Planning rows are re-validated on read like coaching rows: a body that parses as JSON but is
+   * not a well-formed attempt (hand-edited, or written by a buggy build) is reported as
+   * `corrupt_row` instead of being cast into the domain.
+   */
+  private readPlanAttempt(row: Row): PlanAttempt {
+    const parsed = parseBody<unknown>('plan_attempts.body', textColumn(row, 'body'));
+    try {
+      return validatePlanAttempt(parsed);
+    } catch (error) {
+      throw new StorageError('corrupt_row', 'stored planning attempt is not a valid attempt', {
+        cause: String(error),
+      });
+    }
+  }
+
   private readJob(jobId: string): AnalysisJobState | null {
     const row = this.find('SELECT body FROM jobs WHERE job_id = ?', [jobId]);
     return row === null ? null : entityFromRow<AnalysisJobState>('jobs.body', row);
@@ -2221,35 +2434,43 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
    *
    * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
    *    switched into another journal mode or otherwise touched.
-   * 2. A supported older database (v0, v1 or v2) is backed up **before** `configureConnection`,
+   * 2. A supported older database (v0, v1, v2 or v3) is backed up **before** `configureConnection`,
    *    so the backup is the database as it was found and switching the journal mode is not part
    *    of the pre-migration state. The copy is verified before migration starts.
-   * 3. Migration adds tables only and runs in one transaction: `initializeSchemaV3` applies
-   *    v1+v2+v3 for an empty or metadata-only database, `migrateSchemaV1ToV3` applies v2+v3 to a
-   *    real v1 store and `migrateSchemaV2ToV3` adds v3 to a v2 store; every row is kept and
-   *    exactly one pre-migration backup is taken.
+   * 3. Migration adds tables only and runs in one transaction: `initializeSchemaV4` applies
+   *    v1+v2+v3+v4 for an empty or metadata-only database, `migrateSchemaV1ToV4` applies v2+v3+v4 to
+   *    a real v1 store, `migrateSchemaV2ToV4` adds v3+v4 to a v2 store and `migrateSchemaV3ToV4`
+   *    adds v4 to a v3 store; every row is kept and exactly one pre-migration backup is taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
    *    succeeded, so a failed migration leaves the original file — including its original
    *    journal mode — untouched.
    */
   private openSchema(inMemory: boolean): void {
     const state = detectSchemaState(this.connection);
-    if (state === 'legacy_v0' || state === 'v1' || state === 'v2') {
+    if (state === 'legacy_v0' || state === 'v1' || state === 'v2' || state === 'v3') {
       // Keep a consistent copy of the database as found before any migration writes to it.
       const from =
-        state === 'legacy_v0' ? SCHEMA_VERSION_EMPTY : state === 'v1' ? SCHEMA_VERSION_V1 : SCHEMA_VERSION_V2;
+        state === 'legacy_v0'
+          ? SCHEMA_VERSION_EMPTY
+          : state === 'v1'
+            ? SCHEMA_VERSION_V1
+            : state === 'v2'
+              ? SCHEMA_VERSION_V2
+              : SCHEMA_VERSION_V3;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
       this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        if (state === 'v2') {
-          migrateSchemaV2ToV3(this.connection);
+        if (state === 'v3') {
+          migrateSchemaV3ToV4(this.connection);
+        } else if (state === 'v2') {
+          migrateSchemaV2ToV4(this.connection);
         } else if (state === 'v1') {
-          migrateSchemaV1ToV3(this.connection);
+          migrateSchemaV1ToV4(this.connection);
         } else {
-          initializeSchemaV3(this.connection);
+          initializeSchemaV4(this.connection);
         }
       } catch (error) {
         if (error instanceof StorageError) {
@@ -2684,6 +2905,121 @@ function requireSyncResource(resource: SyncResource): SyncResource {
 }
 
 // ---------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------
+// Planning query helpers
+// ---------------------------------------------------------------------------------------
+
+/** Normalized planning filter set; `accountId: null` means "no account restriction". */
+interface PlanFilters {
+  readonly accountId: string | null;
+  readonly status: PlanAttemptStatus | null;
+  readonly since: string | null;
+  readonly order: 'asc' | 'desc';
+}
+
+function planFilters(query: PlanAttemptQuery): PlanFilters {
+  return {
+    accountId:
+      query.accountId === undefined || query.accountId === null
+        ? null
+        : requireId('planning account id', query.accountId),
+    status: query.status === undefined || query.status === null ? null : requirePlanStatus(query.status),
+    since: query.since === undefined || query.since === null ? null : assertIsoTimestamp('planning since', query.since),
+    order: planOrder(query.order),
+  };
+}
+
+/** Cursor order of one planning page: omitted/`null` keeps the historical ascending order. */
+function planOrder(value: 'asc' | 'desc' | null | undefined): 'asc' | 'desc' {
+  if (value === undefined || value === null || value === 'asc') {
+    return 'asc';
+  }
+  invariant(value === 'desc', 'invalid_input', `unknown planning order ${String(value)}`, {
+    reason: 'invalid_planning_order',
+    order: value,
+  });
+  return 'desc';
+}
+
+function requirePlanStatus(status: PlanAttemptStatus): PlanAttemptStatus {
+  invariant(
+    PLAN_ATTEMPT_STATUSES.includes(status),
+    'invalid_input',
+    `unknown planning status ${String(status)}`,
+    { status },
+  );
+  return status;
+}
+
+/**
+ * Fingerprint binding a planning cursor to the complete filter set that produced it.
+ *
+ * The ordering is part of the binding: an ascending quota/recovery walk and a descending history
+ * read page through different key orders, so a cursor minted by one must never continue the other.
+ */
+function planFingerprint(filters: PlanFilters): string {
+  return contentHashOf({
+    accountId: filters.accountId,
+    status: filters.status,
+    since: filters.since,
+    order: filters.order,
+  }).slice(0, 32);
+}
+
+/**
+ * Decode a planning cursor and refuse one produced under different filters.
+ *
+ * The payload is the last returned `(requestedAt, id)` plus the filter fingerprint, so continuing a
+ * page is keyset-based and can never silently page a different query.
+ */
+function decodePlanCursor(cursor: string, fingerprint: string): { requestedAt: string; id: string } {
+  const payload = decodeCursor('plan', cursor);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch (error) {
+    throw new DomainError('invalid_input', 'planning cursor payload is not valid JSON', {
+      cause: String(error),
+    });
+  }
+  invariant(
+    parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed),
+    'invalid_input',
+    'planning cursor payload must be an object',
+    {},
+  );
+  const record = parsed as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  invariant(
+    keys.length === 3 && keys[0] === 'f' && keys[1] === 'i' && keys[2] === 't',
+    'invalid_input',
+    'planning cursor payload has an unexpected shape',
+    { keys },
+  );
+  const fingerprintValue = record['f'];
+  const requestedAt = record['t'];
+  const id = record['i'];
+  invariant(
+    typeof fingerprintValue === 'string' && typeof requestedAt === 'string' && typeof id === 'string' && id.length > 0,
+    'invalid_input',
+    'planning cursor payload fields must be strings',
+    {},
+  );
+  invariant(
+    fingerprintValue === fingerprint,
+    'invalid_input',
+    'planning cursor belongs to a different filter set; re-read the first page',
+    { reason: 'cursor_filter_mismatch' },
+  );
+  invariant(
+    Number.isFinite(Date.parse(requestedAt)),
+    'invalid_input',
+    'planning cursor timestamp is not parseable',
+    { cursor },
+  );
+  return { requestedAt, id };
+}
+
 // Coaching query helpers
 // ---------------------------------------------------------------------------------------
 

@@ -27,10 +27,13 @@ import {
   DomainError,
   TRAINING_TASK_KINDS,
   adoptPlan as adoptTrainingPlan,
+  aggregateAbilityForPlanning,
   analysisIsStale,
   assertIsoTimestamp,
   assertKnownTag,
   checkOffTask as checkOffTrainingTask,
+  completenessIsCurrent,
+  computeAbilityAssessment,
   computeKnowledgeEvidence,
   computeTrainingStatistics,
   computeWeaknessReports,
@@ -47,6 +50,7 @@ import {
   isAccepted,
   latestRetrospectiveByProblem,
   manualDecisionsForProblem,
+  mergedGroupKeyOf,
   parseProblemKey,
   previewPlan as summariseTrainingPlan,
   problemKey,
@@ -54,6 +58,7 @@ import {
   verificationFor,
   type Account,
   type AccountWeaknessReport,
+  COMPLETENESS_AUDIT_VERSION,
   type AnalysisResult,
   type BeginnerRecommendation,
   type CancellationToken,
@@ -90,6 +95,17 @@ import {
   type TrainingStore,
 } from './ports.js';
 import { STORAGE_PAGE_LIMITS } from './storage-types.js';
+import {
+  MAX_PLANNING_CANDIDATES,
+  planPreparationEvidenceHash,
+  type PlanAttemptCandidate,
+  type PlanAttemptExclusions,
+  type PlanAttemptPreparation,
+  type PlanPreparationBundle,
+  type PlanPreparationRequest,
+  type PlanRevalidationResult,
+  type PlanStalenessReason,
+} from './planning-types.js';
 import type {
   WorkbenchAnalysisView,
   WorkbenchEditorialSourceView,
@@ -173,6 +189,15 @@ export const DEFAULT_PLAN_ESTIMATED_MINUTES = 30;
 
 /** Maximum scheduled tasks per day in a rule-generated plan. */
 export const PLAN_MAX_TASKS_PER_DAY = 3;
+
+/**
+ * Pages of the unsolved bank one AI plan preparation may walk.
+ *
+ * A preparation asks for at most {@link MAX_PLANNING_CANDIDATES} candidates, so one page normally
+ * suffices; the extra pages only absorb canonical-duplicate collapses. The bound makes the walk
+ * finite even against a store that keeps answering the same page.
+ */
+export const MAX_PLAN_CANDIDATE_PAGES = 5;
 
 /** Maximum accepted plan title length. */
 export const MAX_PLAN_TITLE_CHARS = 200;
@@ -645,7 +670,7 @@ export class WorkbenchService {
         ...detail,
         rawTags: problem.rawTags.map((tag) => tag.raw),
         effectiveTaxonomyIds: effectiveCurrentTaxonomyIds(decisions, head),
-        analyses: analyses.map((analysis) => analysisView(analysis, head)),
+        analyses: analyses.map((analysis) => analysisView(analysis, head, this.taxonomy.taxonomy.version)),
         manualDecisions: manualDecisions.map(manualDecisionView),
         currentTagDecisions: currentTagDecisionViews(decisions, head),
       };
@@ -880,6 +905,10 @@ export class WorkbenchService {
    * `knowledge` (Stage 09a) is the third additive projection over that same read: per-taxonomy-node
    * learning evidence whose raw, verified and retrospective channels stay distinguishable. It adds no
    * store read and leaves the formal report untouched.
+   *
+   * `ability` (Sprint 11a) is the fourth additive projection over that same read: a versioned local
+   * training-difficulty heuristic whose sample, coverage and Chinese caveats travel with the number.
+   * It adds no store read either, calls no model, and never claims an official Codeforces rating.
    */
   async weakness(request: WorkbenchWeaknessRequest, token: CancellationToken): Promise<WorkbenchWeaknessResult> {
     requireToken(token);
@@ -918,9 +947,22 @@ export class WorkbenchService {
         retrospectives: evidence.retrospectives,
         minimumIndependentProblems: WORKBENCH_MIN_WEAKNESS_SAMPLE,
       });
+      // The ability assessment is a fourth pure projection over the very same evidence and the
+      // injected clock. It adds no store, platform or model read and never claims an official
+      // rating: its Codeforces training band is a versioned local heuristic with explicit caveats.
+      const ability = computeAbilityAssessment({
+        accountId: account.id,
+        sourceInstanceId: account.sourceInstanceId,
+        platform: source.platform,
+        problems: evidence.problems,
+        submissions: evidence.submissions,
+        retrospectives: evidence.retrospectives,
+        now: this.now(),
+      });
       return {
         report: this.weaknessReportOf(account, evidence),
         knowledge,
+        ability,
         solvedDistribution: solvedDistributionView(statistics.solvedDistribution),
         platformTagStats: platformTagStatsView(statistics.platformTagStats),
         coverage: evidence.coverage,
@@ -1202,8 +1244,556 @@ export class WorkbenchService {
   }
 
   // -------------------------------------------------------------------------------------
+  // AI plan preparation (Sprint 11c)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Free, durable preparation input of one AI training plan.
+   *
+   * This is the application-facing method the planning service injects as its
+   * `PlanningDataPort.prepare`: it collects, in one serialized read transaction, the account's own
+   * evidence (submissions, retrospectives, decisions), the aggregate weakness report, the
+   * identifier-free 11a ability aggregate and a bounded pool of **real** candidate problems of the
+   * account's own source instance. Nothing is written by this call, no model is contacted, and no
+   * problem, title, rating or link is ever invented: every candidate is a stored problem row.
+   *
+   * The pool defaults to the account's own native AC exclusions (`status: 'unconfirmed'`), collapses
+   * canonical duplicate identities (a Codeforces problem and its Luogu mirror are one training
+   * candidate), and stays inside the selected source instance, so no foreign account or source can
+   * enter a plan. Raw platform labels travel with a candidate as explicitly provisional provenance;
+   * they never become effective tags.
+   *
+   * When the request carries an explicit `candidateProblemKeys` selection, exactly those stored
+   * problems are read instead of the automatic pool: an unknown key is a `missing_reference`, a key
+   * of another source instance is refused, the ones this account already accepted are excluded and
+   * counted, and the list is never truncated. The requested scope is stored on the preparation, so
+   * a re-prepare under the same request id with a different selection is a typed conflict.
+   */
+  async preparePlanInput(request: PlanPreparationRequest, token: CancellationToken): Promise<PlanPreparationBundle> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(
+      request !== null && typeof request === 'object',
+      'invalid_input',
+      'plan preparation needs a request object',
+      {},
+    );
+    // One transaction for the whole preparation: submissions, retrospectives, decisions, effective
+    // tags, solved status and the candidate pool are a single serialized read, so the ability
+    // summary and the candidates that travel with it always describe the same store state.
+    return this.store.transaction(async (): Promise<PlanPreparationBundle> => {
+      token.throwIfCancelled();
+      const account = await this.requireAccount(request.accountId, token);
+      const source = await this.store.getSourceInstance(account.sourceInstanceId);
+      token.throwIfCancelled();
+      invariant(
+        source !== null,
+        'invalid_input',
+        `account ${account.id} names source instance ${account.sourceInstanceId}, which is not stored`,
+        { reason: 'source_instance_missing', accountId: account.id, sourceInstanceId: account.sourceInstanceId },
+      );
+      const evidence = await this.collectWeaknessEvidence(account, token);
+      const report = this.weaknessReportOf(account, evidence);
+      const ability = aggregateAbilityForPlanning(
+        computeAbilityAssessment({
+          accountId: account.id,
+          sourceInstanceId: account.sourceInstanceId,
+          platform: source.platform,
+          problems: evidence.problems,
+          submissions: evidence.submissions,
+          retrospectives: evidence.retrospectives,
+          now: request.preparedAt,
+        }),
+      );
+      const weakTagIds = report.ranking.map((tag) => tag.taxonomyId);
+      const requestedCandidateKeys = request.candidateProblemKeys ?? null;
+      const pool = await this.readPlanCandidatePool(
+        account,
+        request.candidateLimit,
+        request.settings.estimatedMinutes,
+        weakTagIds,
+        evidence,
+        requestedCandidateKeys,
+        token,
+      );
+      const preparation: PlanAttemptPreparation = {
+        preparedAt: request.preparedAt,
+        accountId: account.id,
+        sourceInstanceId: account.sourceInstanceId,
+        requestedCandidateKeys,
+        settings: request.settings,
+        candidates: pool.candidates,
+        exclusions: pool.exclusions,
+        weakness: {
+          attemptedDistinctTotal: report.attemptedDistinctTotal,
+          sufficientTagIds: [...weakTagIds].sort(),
+          ranking: report.ranking.map((tag) => ({ taxonomyId: tag.taxonomyId, solveRate: tag.solveRate })),
+        },
+        ability,
+        evidenceHash: '',
+      };
+      token.throwIfCancelled();
+      return {
+        preparation: { ...preparation, evidenceHash: planPreparationEvidenceHash(preparation) },
+        candidates: pool.trainingCandidates,
+      };
+    });
+  }
+
+  /**
+   * Prove a stored preparation still describes the store, and rebuild its candidates.
+   *
+   * Called by the planning service inside its reservation and settlement transactions, so this
+   * method is read-only and never opens a transaction of its own (the store rejects a nested one).
+   * Every check is a typed `stale_preparation` finding instead of a silently repaired plan: the
+   * account, its source instance, every candidate's stored metadata, own AC state and effective
+   * tags, and the aggregate weakness and ability evidence must still match the preparation. The
+   * returned candidates are rebuilt through the domain factory with the **same** candidate ids, so
+   * the model's answer can only ever name a candidate the user actually saw.
+   */
+  async revalidatePlanInput(
+    preparation: PlanAttemptPreparation,
+    token: CancellationToken,
+  ): Promise<PlanRevalidationResult> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(
+      preparation !== null && typeof preparation === 'object',
+      'invalid_input',
+      'plan revalidation needs a stored preparation',
+      {},
+    );
+    const account = await this.store.getAccount(preparation.accountId);
+    token.throwIfCancelled();
+    if (account === null) {
+      return stalePreparation('account_missing', `account ${preparation.accountId} is no longer stored`, null);
+    }
+    if (account.sourceInstanceId !== preparation.sourceInstanceId) {
+      return stalePreparation(
+        'account_changed',
+        `account ${account.id} now belongs to ${account.sourceInstanceId}, not to ${preparation.sourceInstanceId}`,
+        null,
+      );
+    }
+    const source = await this.store.getSourceInstance(account.sourceInstanceId);
+    token.throwIfCancelled();
+    if (source === null) {
+      return stalePreparation(
+        'source_missing',
+        `source instance ${account.sourceInstanceId} is no longer stored`,
+        null,
+      );
+    }
+    const evidence = await this.collectWeaknessEvidence(account, token);
+    const report = this.weaknessReportOf(account, evidence);
+    const weakTagIds = report.ranking.map((tag) => tag.taxonomyId);
+    if (
+      contentHashOf({
+        attemptedDistinctTotal: report.attemptedDistinctTotal,
+        sufficientTagIds: [...weakTagIds].sort(),
+        ranking: report.ranking.map((tag) => ({ taxonomyId: tag.taxonomyId, solveRate: tag.solveRate })),
+      }) !== contentHashOf(preparation.weakness)
+    ) {
+      return stalePreparation('weakness_changed', `the weakness evidence of account ${account.id} changed`, null);
+    }
+    // The ability assessment is recomputed at the CURRENT injected instant on purpose: the
+    // identifier-free aggregate carries no observation timestamp, so a moved clock alone cannot
+    // make it differ, while a submission or retrospective recorded after the preparation on a
+    // problem that is not itself a candidate (an already attempted, untagged problem whose first AC
+    // arrives, for example) does change it. Recomputing at `preparedAt` would hide exactly those
+    // rows behind the future-submission filter; recomputing at `now()` makes them a real staleness
+    // finding. Evidence that merely aged out of the rolling 90-day window is a real change too and
+    // is deliberately not ignored.
+    const ability = aggregateAbilityForPlanning(
+      computeAbilityAssessment({
+        accountId: account.id,
+        sourceInstanceId: account.sourceInstanceId,
+        platform: source.platform,
+        problems: evidence.problems,
+        submissions: evidence.submissions,
+        retrospectives: evidence.retrospectives,
+        now: this.now(),
+      }),
+    );
+    if (contentHashOf(ability) !== contentHashOf(preparation.ability)) {
+      return stalePreparation('ability_changed', `the ability evidence of account ${account.id} changed`, null);
+    }
+
+    // An explicit selection is part of the scope this plan was prepared under. A selected problem
+    // that was excluded as already solved never became a candidate, so it is re-proved here to
+    // still exist in the same source instance: a deleted or repointed row must not leave the stored
+    // scope silently incomplete.
+    if (preparation.requestedCandidateKeys !== null) {
+      const inPool = new Set(preparation.candidates.map((candidate) => candidate.problemKey));
+      for (const selectedKey of preparation.requestedCandidateKeys) {
+        if (inPool.has(selectedKey)) {
+          continue;
+        }
+        const selected = await this.store.getProblem(selectedKey);
+        token.throwIfCancelled();
+        if (selected === null) {
+          return stalePreparation(
+            'candidate_missing',
+            `selected problem ${selectedKey} is no longer stored`,
+            selectedKey,
+          );
+        }
+        if (selected.ref.sourceInstanceId !== preparation.sourceInstanceId) {
+          return stalePreparation(
+            'scope_changed',
+            `selected problem ${selectedKey} now belongs to ${selected.ref.sourceInstanceId}, not to ${preparation.sourceInstanceId}`,
+            selectedKey,
+          );
+        }
+      }
+    }
+
+    const candidates: TrainingCandidate[] = [];
+    for (const stored of preparation.candidates) {
+      const problem = await this.store.getProblem(stored.problemKey);
+      token.throwIfCancelled();
+      if (problem === null) {
+        return stalePreparation(
+          'candidate_missing',
+          `candidate problem ${stored.problemKey} is no longer stored`,
+          stored.problemKey,
+        );
+      }
+      if (
+        problem.key !== stored.problemKey ||
+        problem.ref.externalKey !== stored.externalKey ||
+        problem.title !== stored.title ||
+        problem.url !== stored.url ||
+        contentHashOf(problem.ratings) !== contentHashOf(stored.ratings) ||
+        contentHashOf(problem.rawTags.map((tag) => tag.raw)) !== contentHashOf(stored.provisionalRawTags)
+      ) {
+        return stalePreparation(
+          'candidate_metadata_changed',
+          `candidate problem ${stored.problemKey} metadata changed since the plan was prepared`,
+          stored.problemKey,
+        );
+      }
+      const solved = await this.isSolvedBy(account, stored.problemKey, token);
+      if (solved) {
+        return stalePreparation(
+          'candidate_solved',
+          `candidate problem ${stored.problemKey} was accepted by this account since the plan was prepared`,
+          stored.problemKey,
+        );
+      }
+      const taxonomyIds = await this.tagMaterialOf(problem, token);
+      if (contentHashOf([...taxonomyIds]) !== contentHashOf([...stored.effectiveTaxonomyIds])) {
+        return stalePreparation(
+          'candidate_tags_changed',
+          `effective tags of candidate problem ${stored.problemKey} changed since the plan was prepared`,
+          stored.problemKey,
+        );
+      }
+      candidates.push(
+        createTrainingCandidate({
+          candidateId: stored.candidateId,
+          problemRef: problem.ref,
+          title: problem.title,
+          sourceUrl: problem.url,
+          estimatedMinutes: stored.estimatedMinutes,
+          taxonomyIds,
+          ratings: problem.ratings,
+          origin: stored.origin,
+        }),
+      );
+    }
+    token.throwIfCancelled();
+    return { ok: true, candidates };
+  }
+
+  /**
+   * Persist one already-validated model plan and return its id plus full content hash.
+   *
+   * The planning service calls this from inside its settlement transaction, so this method joins
+   * that transaction instead of opening one: the plan row and the settled attempt then commit or
+   * roll back together, and a plan can never exist without the audit row that paid for it. The
+   * stored plan is read back and its full content hash compared before the hash is reported, so a
+   * caller can never record a hash of something that was not written.
+   */
+  async saveModelPlan(
+    plan: TrainingPlan,
+    attemptId: string,
+    token: CancellationToken,
+  ): Promise<{ readonly planId: string; readonly planHash: string }> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(
+      plan !== null && typeof plan === 'object',
+      'invalid_input',
+      'a model plan save needs a validated plan',
+      { attemptId },
+    );
+    invariant(
+      plan.source === 'model',
+      'invalid_input',
+      'only a model-sourced plan can be saved by the AI planning path',
+      { attemptId, planId: plan.planId, source: plan.source },
+    );
+    await this.store.savePlan(plan);
+    token.throwIfCancelled();
+    const written = await this.store.getPlan(plan.planId);
+    token.throwIfCancelled();
+    invariant(
+      written !== null,
+      'invalid_transition',
+      `plan ${plan.planId} of AI planning attempt ${attemptId} was not stored`,
+      { planId: plan.planId, attemptId },
+    );
+    const hash = planContentHash(written);
+    invariant(
+      hash === planContentHash(plan),
+      'invalid_transition',
+      `stored plan ${plan.planId} does not match the validated plan of attempt ${attemptId}`,
+      { planId: plan.planId, attemptId },
+    );
+    return { planId: written.planId, planHash: hash };
+  }
+
+  // -------------------------------------------------------------------------------------
   // Weakness & plan internals (always called inside the caller's transaction)
   // -------------------------------------------------------------------------------------
+
+  /**
+   * The bounded real candidate pool of one AI plan preparation.
+   *
+   * The read is an unsolved-filtered numbered bank page of the account's **own** source instance,
+   * so an accepted problem never enters the pool and no foreign source instance is ever consulted.
+   * A candidate is collapsed when its canonical merged group was already taken, which is what keeps
+   * a Codeforces problem and its Luogu mirror from becoming two training tasks; the effective tags
+   * of every kept candidate are resolved at its stored head, so stale AI decisions cannot steer a
+   * plan. Every row is re-proved coherent with the requested scope before it is projected — a store
+   * claim that contradicts the account is refused instead of silently dropped.
+   */
+  private async readPlanCandidatePool(
+    account: Account,
+    limit: number,
+    estimatedMinutes: number,
+    weakTagIds: readonly string[],
+    evidence: WeaknessEvidence,
+    selection: readonly string[] | null,
+    token: CancellationToken,
+  ): Promise<{
+    readonly candidates: readonly PlanAttemptCandidate[];
+    readonly trainingCandidates: readonly TrainingCandidate[];
+    readonly exclusions: PlanAttemptExclusions;
+  }> {
+    if (selection !== null) {
+      return this.readSelectedCandidatePool(account, selection, limit, estimatedMinutes, weakTagIds, evidence, token);
+    }
+    const solved = solvedKeysOf(evidence.submissions);
+    const pageSize = Math.min(limit, MAX_BROWSE_PAGE_SIZE);
+    const candidates: PlanAttemptCandidate[] = [];
+    const training: TrainingCandidate[] = [];
+    const groups = new Set<string>();
+    let duplicateExcluded = 0;
+    let considered = 0;
+    let page = 1;
+    let totalPages = 1;
+    while (candidates.length < limit && page <= totalPages && page <= MAX_PLAN_CANDIDATE_PAGES) {
+      const browsed = await this.store.browseProblems({
+        sourceInstanceId: account.sourceInstanceId,
+        accountId: account.id,
+        status: 'unconfirmed',
+        onlyAttempted: false,
+        query: null,
+        needsReviewOnly: false,
+        sort: 'default',
+        ratingDimension: null,
+        page,
+        limit: pageSize,
+      });
+      token.throwIfCancelled();
+      totalPages = Math.max(1, browsed.totalPages);
+      if (browsed.items.length === 0) {
+        break;
+      }
+      for (const row of browsed.items) {
+        if (candidates.length >= limit) {
+          break;
+        }
+        considered += 1;
+        assertBrowsedProblemCoherent(row.problem, account.sourceInstanceId);
+        assertSolvedProjectionCoherent(row.problem, row.solvedByAccount, account);
+        invariant(
+          !row.solvedByAccount && !solved.has(row.problem.key),
+          'invalid_input',
+          `browsed problem ${row.problem.key} is reported unsolved although this account has an accepted submission for it`,
+          { reason: 'pool_filter_inconsistent', problemKey: row.problem.key, accountId: account.id },
+        );
+        const groupKey = mergedGroupKeyOf(row.problem.ref);
+        if (groups.has(groupKey)) {
+          duplicateExcluded += 1;
+          continue;
+        }
+        groups.add(groupKey);
+        const taxonomyIds = await this.tagMaterialOf(row.problem, token);
+        const candidateId = this.mintCandidateId();
+        const origin = taxonomyIds.some((taxonomyId) => weakTagIds.includes(taxonomyId))
+          ? ('weakness' as const)
+          : ('unsolved_pool' as const);
+        candidates.push({
+          candidateId,
+          problemKey: row.problem.key,
+          externalKey: row.problem.ref.externalKey,
+          title: row.problem.title,
+          url: row.problem.url,
+          estimatedMinutes,
+          effectiveTaxonomyIds: [...taxonomyIds],
+          provisionalRawTags: row.problem.rawTags.map((tag) => tag.raw),
+          ratings: row.problem.ratings.map(ratingView),
+          origin,
+        });
+        training.push(
+          createTrainingCandidate({
+            candidateId,
+            problemRef: row.problem.ref,
+            title: row.problem.title,
+            sourceUrl: row.problem.url,
+            estimatedMinutes,
+            taxonomyIds,
+            ratings: row.problem.ratings,
+            origin,
+          }),
+        );
+      }
+      page += 1;
+    }
+    token.throwIfCancelled();
+    return {
+      candidates,
+      trainingCandidates: training,
+      exclusions: {
+        nativeSolvedExcluded: solved.size,
+        duplicateExcluded,
+        // The pool read is scoped to the account's own source instance, so a foreign row is never
+        // seen; the field stays so a future multi-source pool must state its own number.
+        foreignExcluded: 0,
+        candidateLimit: limit,
+        considered,
+      },
+    };
+  }
+
+  /**
+   * The explicit candidate pool of one AI plan preparation.
+   *
+   * Exactly the selected stored problems, in the caller's order: an unknown key is a typed
+   * `missing_reference` and a key of another source instance is refused, so a selection can never
+   * be silently replaced or borrowed from elsewhere. A selected problem this account already
+   * accepted is excluded and counted in `nativeSolvedExcluded` — it cannot become training work —
+   * and the list is never truncated, which is why a `candidateLimit` below the selection is refused
+   * instead of applied. Canonical duplicates are deliberately **not** collapsed here: a caller who
+   * named both a problem and its mirror asked for both, and dropping one would silently change the
+   * selection the model is shown.
+   */
+  private async readSelectedCandidatePool(
+    account: Account,
+    selection: readonly string[],
+    limit: number,
+    estimatedMinutes: number,
+    weakTagIds: readonly string[],
+    evidence: WeaknessEvidence,
+    token: CancellationToken,
+  ): Promise<{
+    readonly candidates: readonly PlanAttemptCandidate[];
+    readonly trainingCandidates: readonly TrainingCandidate[];
+    readonly exclusions: PlanAttemptExclusions;
+  }> {
+    invariant(
+      selection.length <= MAX_PLANNING_CANDIDATES,
+      'invalid_input',
+      `an explicit candidate selection holds at most ${MAX_PLANNING_CANDIDATES} problems`,
+      { reason: 'too_many_candidates', length: selection.length, bound: MAX_PLANNING_CANDIDATES },
+    );
+    invariant(
+      selection.length <= limit,
+      'invalid_input',
+      `an explicit selection of ${selection.length} candidate problems exceeds candidateLimit ${limit}; an explicit selection is never truncated`,
+      { reason: 'candidate_limit_below_selection', selection: selection.length, candidateLimit: limit },
+    );
+    const solved = solvedKeysOf(evidence.submissions);
+    const candidates: PlanAttemptCandidate[] = [];
+    const training: TrainingCandidate[] = [];
+    let nativeSolvedExcluded = 0;
+    for (const key of selection) {
+      const problem = await this.store.getProblem(key);
+      token.throwIfCancelled();
+      if (problem === null) {
+        throw new DomainError('missing_reference', `selected candidate problem ${key} is not stored`, {
+          reason: 'unknown_candidate',
+          problemKey: key,
+          accountId: account.id,
+        });
+      }
+      // A selected problem of another source instance is refused before anything is projected; a
+      // foreign row can never be borrowed into this account's plan.
+      invariant(
+        problem.ref.sourceInstanceId === account.sourceInstanceId,
+        'invalid_input',
+        `selected candidate ${key} belongs to ${problem.ref.sourceInstanceId}, not to account ${account.id} of ${account.sourceInstanceId}`,
+        {
+          reason: 'candidate_source_mismatch',
+          problemKey: key,
+          accountId: account.id,
+          candidateSource: problem.ref.sourceInstanceId,
+          accountSource: account.sourceInstanceId,
+        },
+      );
+      // Coherence (canonical key and own source instance) is re-proved before anything is
+      // projected, so a foreign or incoherent stored row is refused instead of entering a plan.
+      assertProblemMetadataCoherent(problem, key, account);
+      if (solved.has(key)) {
+        nativeSolvedExcluded += 1;
+        continue;
+      }
+      const taxonomyIds = await this.tagMaterialOf(problem, token);
+      const candidateId = this.mintCandidateId();
+      const origin = taxonomyIds.some((taxonomyId) => weakTagIds.includes(taxonomyId))
+        ? ('weakness' as const)
+        : ('unsolved_pool' as const);
+      candidates.push({
+        candidateId,
+        problemKey: problem.key,
+        externalKey: problem.ref.externalKey,
+        title: problem.title,
+        url: problem.url,
+        estimatedMinutes,
+        effectiveTaxonomyIds: [...taxonomyIds],
+        provisionalRawTags: problem.rawTags.map((tag) => tag.raw),
+        ratings: problem.ratings.map(ratingView),
+        origin,
+      });
+      training.push(
+        createTrainingCandidate({
+          candidateId,
+          problemRef: problem.ref,
+          title: problem.title,
+          sourceUrl: problem.url,
+          estimatedMinutes,
+          taxonomyIds,
+          ratings: problem.ratings,
+          origin,
+        }),
+      );
+    }
+    token.throwIfCancelled();
+    return {
+      candidates,
+      trainingCandidates: training,
+      exclusions: {
+        nativeSolvedExcluded,
+        duplicateExcluded: 0,
+        foreignExcluded: 0,
+        candidateLimit: limit,
+        considered: selection.length,
+      },
+    };
+  }
 
   /**
    * Collect every bounded input the weakness reduction needs.
@@ -1374,7 +1964,9 @@ export class WorkbenchService {
     const summary = summariseTrainingPlan(plan);
     const view: WorkbenchPlanView = {
       planId: plan.planId,
-      title: plan.title,
+      // A model may name the solution algorithm in its title, even when task tags are withheld.
+      title: plan.source === 'model' && !reveal && plan.tasks.some(task => !solvedKeys.has(task.problemKey))
+        ? 'AI 训练计划' : plan.title,
       source: plan.source,
       status: plan.status,
       createdAt: plan.createdAt,
@@ -1970,6 +2562,11 @@ function latestDecidedAt(decisions: readonly ManualTagDecision[]): string | null
   );
 }
 
+/** Source mismatch is the same typed failure whether it is found on a read or on a plan candidate. */
+function stalePreparation(reason: PlanStalenessReason, detail: string, problemKey: string | null): PlanRevalidationResult {
+  return { ok: false, staleness: { reason, detail, problemKey } };
+}
+
 function sourceMismatch(account: Account, sourceInstanceId: string): DomainError {
   return new DomainError(
     'invalid_input',
@@ -2304,9 +2901,29 @@ function draftViews(analysis: AnalysisResult): readonly WorkbenchReasoningDraftV
   }));
 }
 
-/** One analysis with an explicit current-vs-stale indicator against the stored head. */
-function analysisView(analysis: AnalysisResult, head: SnapshotHead | null): WorkbenchAnalysisView {
+/**
+ * One analysis with an explicit current-vs-stale indicator against the stored head.
+ *
+ * The completeness *state* is the answer to "does this result satisfy the current check for the
+ * snapshot and taxonomy the reader is looking at right now?" — so it is `current` only when the
+ * analysis completed, is not stale against the head, was produced under the reader's taxonomy
+ * version, and its completeness metadata matches the current audit version, the same taxonomy
+ * version and the analysis's own snapshot. Anything else is `outdated`, never silently treated as
+ * a passed check: a result checked under another taxonomy or version stays readable history.
+ */
+function analysisView(analysis: AnalysisResult, head: SnapshotHead | null, taxonomyVersion: string): WorkbenchAnalysisView {
   const stale = analysisIsStale(analysis, head);
+  const completenessCurrent =
+    analysis.completeness !== undefined &&
+    !stale &&
+    analysis.status === 'completed' &&
+    analysis.taxonomyVersion === taxonomyVersion &&
+    completenessIsCurrent(analysis.completeness, {
+      version: COMPLETENESS_AUDIT_VERSION,
+      taxonomyVersion,
+      snapshotId: analysis.snapshotId,
+      snapshotVersion: analysis.snapshotVersion,
+    });
   return {
     analysisId: analysis.analysisId,
     snapshotId: analysis.snapshotId,
@@ -2323,6 +2940,20 @@ function analysisView(analysis: AnalysisResult, head: SnapshotHead | null): Work
         ? null
         : { code: analysis.failure.code, message: analysis.failure.message, retryable: analysis.failure.retryable },
     usage: analysis.usage,
+    // Unchecked stays `null` on purpose: a legacy result, a reasoning-only draft or a failed
+    // run must never look like a passed completeness check. The audit version is exposed so
+    // the UI can distinguish "checked under the current version" from "older check".
+    completeness:
+      analysis.completeness === undefined
+        ? null
+        : {
+            version: analysis.completeness.version,
+            taxonomyVersion: analysis.completeness.taxonomyVersion,
+            snapshotId: analysis.completeness.snapshotId,
+            snapshotVersion: analysis.completeness.snapshotVersion,
+            checkedAt: analysis.completeness.checkedAt,
+            state: completenessCurrent ? 'current' : 'outdated',
+          },
   };
 }
 

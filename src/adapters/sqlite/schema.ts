@@ -10,15 +10,16 @@
  * - **v0** means "no store tables yet": an empty file is initialized transactionally, a file
  *   with our marker table but no data tables is migrated after a consistent backup, and any
  *   other v0 layout is rejected instead of being migrated.
- * - **v1** and **v2** (this build's previous versions) are recognized exactly — marker plus
- *   {@link STORE_TABLES_V1}/{@link STORE_TABLES_V2} — copied consistently and then migrated to
- *   the current version in one transaction that only adds tables. Existing rows are retained.
+ * - **v1**, **v2** and **v3** (this build's previous versions) are recognized exactly — marker
+ *   plus their own table set — copied consistently and then migrated to the current version in one
+ *   transaction that only adds tables. Existing rows are retained.
  * - A failure while initializing or migrating rolls back, so the original file stays readable.
  *
- * Historical DDL is frozen: {@link SCHEMA_DDL_V1}/{@link applySchemaV1} and
- * {@link SCHEMA_DDL_V2}/{@link applySchemaV2} keep creating exactly their own version's tables,
- * so a fixture built with them is a real older database. The current version adds
- * {@link SCHEMA_DDL_V3} on top.
+ * Historical DDL is frozen: {@link SCHEMA_DDL_V1}/{@link applySchemaV1},
+ * {@link SCHEMA_DDL_V2}/{@link applySchemaV2} and {@link SCHEMA_DDL_V3}/{@link applySchemaV3} keep
+ * creating exactly their own version's tables **and write exactly their own literal
+ * `user_version`**, so a fixture built with them is a real older database and the migration under
+ * test is the real one. The current version adds {@link SCHEMA_DDL_V4} on top.
  *
  * All metadata the adapter writes are immutable JSON bodies plus indexed identity columns.
  */
@@ -29,7 +30,7 @@ import { StorageError } from './errors.js';
 export const STORE_MARKER = 'dsh-icpc-workbench/training-store';
 
 /** Schema version this build reads and writes. */
-export const STORE_SCHEMA_VERSION = 3;
+export const STORE_SCHEMA_VERSION = 4;
 
 /** Version of an uninitialized or pre-store database. */
 export const SCHEMA_VERSION_EMPTY = 0;
@@ -39,6 +40,9 @@ export const SCHEMA_VERSION_V1 = 1;
 
 /** Version of the second store schema this build recognizes and migrates from. */
 export const SCHEMA_VERSION_V2 = 2;
+
+/** Version of the third store schema this build recognizes and migrates from. */
+export const SCHEMA_VERSION_V3 = 3;
 
 export const META_TABLE = 'store_meta';
 export const META_MARKER_KEY = 'store_marker';
@@ -75,6 +79,9 @@ export const STORE_TABLES_V3: readonly string[] = [
   'workbench_settings',
   'coaching_attempts',
 ];
+
+/** Tables a schema-v4 database must have: the v3 set plus the durable AI planning attempts. */
+export const STORE_TABLES_V4: readonly string[] = [...STORE_TABLES_V3, 'plan_attempts'];
 
 /**
  * Schema v1 — frozen historical DDL.
@@ -310,12 +317,38 @@ export const SCHEMA_DDL_V3: readonly string[] = [
 ];
 
 /**
+ * Schema v4 — durable AI training-plan attempts.
+ *
+ * One row is the audit of one AI planning request: `prepared` rows are the free, durable
+ * preparation (no dispatch happened), `reserved` rows are the single in-flight paid call with its
+ * recovery deadline, and `settled`/`uncertain` rows are terminal. Identity columns exist for the
+ * account scope, the rolling-24h quota count and lease recovery; the canonical JSON body stays the
+ * source of truth for reads (immutable preparation, model identity, usage and the stored plan).
+ */
+export const SCHEMA_DDL_V4: readonly string[] = [
+  `CREATE TABLE plan_attempts (
+     id TEXT PRIMARY KEY NOT NULL,
+     account_id TEXT NOT NULL,
+     source_instance_id TEXT NOT NULL,
+     status TEXT NOT NULL,
+     requested_at TEXT NOT NULL,
+     expires_at TEXT NOT NULL,
+     finished_at TEXT,
+     plan_id TEXT,
+     body TEXT NOT NULL
+   )`,
+  `CREATE INDEX plan_attempts_by_requested ON plan_attempts (requested_at, id)`,
+  `CREATE INDEX plan_attempts_by_status ON plan_attempts (status, expires_at, id)`,
+  `CREATE INDEX plan_attempts_by_account ON plan_attempts (account_id, requested_at, id)`,
+];
+
+/**
  * What a database file looks like before this build touches it.
  *
- * `v1`/`v2` are recognizable older stores that must be copied and migrated; `current` is this
- * build's own version. Anything else is refused.
+ * `v1`/`v2`/`v3` are recognizable older stores that must be copied and migrated; `current` is
+ * this build's own version. Anything else is refused.
  */
-export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'current';
+export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'v3' | 'current';
 
 function pragmaRow(db: DatabaseSync, sql: string): Record<string, unknown> | undefined {
   return db.prepare(sql).get() as Record<string, unknown> | undefined;
@@ -373,8 +406,13 @@ export function detectSchemaState(db: DatabaseSync): SchemaState {
   const tables = tableNames(db);
   if (version === STORE_SCHEMA_VERSION) {
     requireStoreMarker(db, version);
-    requireTables(tables, STORE_TABLES_V3, version);
+    requireTables(tables, STORE_TABLES_V4, version);
     return 'current';
+  }
+  if (version === SCHEMA_VERSION_V3) {
+    requireStoreMarker(db, version);
+    requireTables(tables, STORE_TABLES_V3, version);
+    return 'v3';
   }
   if (version === SCHEMA_VERSION_V2) {
     requireStoreMarker(db, version);
@@ -448,13 +486,27 @@ export function applySchemaV2(db: DatabaseSync): void {
 }
 
 /**
- * Apply the v3 additions and move `user_version` to this build's current version.
+ * Apply the v3 additions and move `user_version` to **v3**.
  *
- * Additive only: the two new tables and their indexes are created. `workbench_settings` starts
- * empty (the store writes revision 1 on the first save) and `coaching_attempts` stays empty.
+ * Frozen historical helper: v3 is no longer this build's current version, so it must keep writing
+ * 3. Additive only: the two v3 tables and their indexes are created. `workbench_settings` starts
+ * empty (the store writes revision 1 on the first save) and `coaching_attempts` is created empty.
  */
 export function applySchemaV3(db: DatabaseSync): void {
   for (const statement of SCHEMA_DDL_V3) {
+    db.exec(statement);
+  }
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION_V3}`);
+}
+
+/**
+ * Apply the v4 additions and move `user_version` to this build's current version.
+ *
+ * Additive only: `plan_attempts` and its indexes are created empty. No existing table is
+ * rewritten and no existing row is touched.
+ */
+export function applySchemaV4(db: DatabaseSync): void {
+  for (const statement of SCHEMA_DDL_V4) {
     db.exec(statement);
   }
   db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
@@ -463,8 +515,57 @@ export function applySchemaV3(db: DatabaseSync): void {
 /**
  * Initialize an empty or metadata-only (v0) database straight to the current version.
  *
- * The v1, v2 and v3 DDL runs in the **same** transaction, so a metadata-only database never
- * exists in an intermediate v1/v2 state that a later open would have to migrate.
+ * The v1, v2, v3 and v4 DDL runs in the **same** transaction, so a metadata-only database never
+ * exists in an intermediate v1/v2/v3 state that a later open would have to migrate.
+ */
+export function initializeSchemaV4(db: DatabaseSync): void {
+  inTransaction(
+    db,
+    () => {
+      applySchemaV1(db);
+      applySchemaV2(db);
+      applySchemaV3(db);
+      applySchemaV4(db);
+    },
+    'schema initialization',
+  );
+}
+
+/** Migrate a recognized v1 database to the current version: one transaction, additive only. */
+export function migrateSchemaV1ToV4(db: DatabaseSync): void {
+  inTransaction(
+    db,
+    () => {
+      applySchemaV2(db);
+      applySchemaV3(db);
+      applySchemaV4(db);
+    },
+    'schema migration',
+  );
+}
+
+/** Migrate a recognized v2 database to the current version: one transaction, additive only. */
+export function migrateSchemaV2ToV4(db: DatabaseSync): void {
+  inTransaction(
+    db,
+    () => {
+      applySchemaV3(db);
+      applySchemaV4(db);
+    },
+    'schema migration',
+  );
+}
+
+/** Migrate a recognized v3 database to the current version: one transaction, additive only. */
+export function migrateSchemaV3ToV4(db: DatabaseSync): void {
+  inTransaction(db, () => applySchemaV4(db), 'schema migration');
+}
+
+/**
+ * Initialize an empty database to v3 inside one transaction (historical helper).
+ *
+ * Kept so tests and tooling can build a genuine v3 database: `applySchemaV3` keeps writing
+ * version 3, and the store migrates such a file to the current version on open.
  */
 export function initializeSchemaV3(db: DatabaseSync): void {
   inTransaction(
@@ -478,7 +579,12 @@ export function initializeSchemaV3(db: DatabaseSync): void {
   );
 }
 
-/** Migrate a recognized v1 database to the current version: one transaction, additive only. */
+/**
+ * Migrate a recognized v1 database to v3 (historical helper): one transaction, additive only.
+ *
+ * v3 is a real older version this build still recognizes, so this helper keeps ending at v3
+ * instead of jumping to the current version.
+ */
 export function migrateSchemaV1ToV3(db: DatabaseSync): void {
   inTransaction(
     db,
@@ -490,7 +596,7 @@ export function migrateSchemaV1ToV3(db: DatabaseSync): void {
   );
 }
 
-/** Migrate a recognized v2 database to the current version: one transaction, additive only. */
+/** Migrate a recognized v2 database to v3 (historical helper): one transaction, additive only. */
 export function migrateSchemaV2ToV3(db: DatabaseSync): void {
   inTransaction(db, () => applySchemaV3(db), 'schema migration');
 }

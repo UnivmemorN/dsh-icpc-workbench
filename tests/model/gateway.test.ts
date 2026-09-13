@@ -356,7 +356,7 @@ void test('a valid analysis answer is adopted with local identity and the exact 
   const payload = promptPayload(dispatched);
   assert.deepEqual(Object.keys(payload), ['task', 'promptVersion', 'problem', 'taxonomy', 'editorial']);
   assert.equal(payload.task, 'analyze_missing_algorithm_tags');
-  assert.equal(payload.promptVersion, 'analysis-v2|taxonomy:test.1');
+  assert.equal(payload.promptVersion, 'analysis-v3|taxonomy:test.1');
   const editorial = payload.editorial as { solutions: readonly { text: string }[] };
   assert.equal(editorial.solutions[0]?.text, SEGMENT_SOLUTION);
   assert.equal(editorial.solutions[1]?.text, GREEDY_SOLUTION);
@@ -367,7 +367,7 @@ void test('a valid analysis answer is adopted with local identity and the exact 
   assert.equal(audit.role, 'analysis');
   assert.equal(audit.snapshotId, SNAPSHOT.snapshotId);
   assert.match(audit.attemptId, /^direct-attempt\|/);
-  assert.equal(audit.promptVersion, 'analysis-v2|taxonomy:test.1');
+  assert.equal(audit.promptVersion, 'analysis-v3|taxonomy:test.1');
   assert.equal((audit.options as unknown as { reasoningEffort: string }).reasoningEffort, 'max');
 });
 
@@ -563,6 +563,8 @@ void test('a support verification is adopted with the injected checkedAt', async
       verifications: [
         { suggestionId: suggestion.suggestionId, verdict: 'support', evidenceOk: true, conflictingSolutionIds: [], note: '' },
       ],
+      // The completeness-aware prompt requires the omissions answer in every reply.
+      missingSuggestions: [],
     },
   ]);
   clock.value = CHECKED_AT;
@@ -600,6 +602,7 @@ void test('verification covers every suggestion exactly once and in input order'
         { suggestionId: second.suggestionId, verdict: 'insufficient', evidenceOk: true, conflictingSolutionIds: [], note: '' },
         { suggestionId: first.suggestionId, verdict: 'support', evidenceOk: true, conflictingSolutionIds: [], note: '' },
       ],
+      missingSuggestions: [],
     },
   ]);
 
@@ -717,6 +720,7 @@ void test('the output validator still refuses a support verdict without local ev
           verifications: [
             { suggestionId: fabricated.suggestionId, verdict: 'support', evidenceOk: true, conflictingSolutionIds: [] },
           ],
+          missingSuggestions: [],
         },
         {
           snapshot: SNAPSHOT,
@@ -740,13 +744,13 @@ void test('verification refuses foreign or non-analysis input before any dispatc
     evidence: [{ sourceId: 'editorial-1', solutionId: 'solution-1', excerpt: EXCERPT }],
     createdAt: AT,
   });
+  // Sprint 11b: an empty suggestion list is a legal input — the pass must still scan the
+  // material for omissions — so it is dispatched instead of being refused locally. The
+  // answer is then held to the strict parser, which is why it fails as `invalid_output`.
   const empty = harness([]);
-  assert.equal(
-    failureOf(await empty.gateway.verify(verifyRequest([]))).error.code,
-    'unsupported',
-    'an empty suggestion list must not be dispatched',
-  );
-  assert.equal(empty.state.dispatch.length, 0);
+  const emptyFailure = failureOf(await empty.gateway.verify(verifyRequest([])));
+  assert.notEqual(emptyFailure.error.code, 'unsupported', 'an empty suggestion list is a legal input');
+  assert.equal(empty.state.dispatch.length, 1, 'an empty suggestion list must still reach the model');
 
   const badSnapshot = harness([]);
   const failure = failureOf(await badSnapshot.gateway.verify(verifyRequest([mismatch])));

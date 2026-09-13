@@ -126,6 +126,22 @@ export const WORKBENCH_API_OPERATIONS = {
   planCheckoff: 'plan.checkoff',
 } as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
 
+/** AI routes registered by the owned model API, separately from free business routes. */
+export const PLANNING_API_OPERATIONS = {
+  /**
+   * Additive AI planning operations (Sprint 11d).
+   *
+   * They drive the owned planning host through the same authenticated envelope as every other
+   * operation; `plan.preview` and the whole adopt/edit/checkoff/detail group stay the free rule-based
+   * path and are unchanged.
+   */
+  planAiPrepare: 'plan.aiPrepare',
+  planAiRun: 'plan.aiRun',
+  planAiStatus: 'plan.aiStatus',
+  planAiCancel: 'plan.aiCancel',
+  planAiHistory: 'plan.aiHistory',
+} as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
+
 // ---------------------------------------------------------------------------------------
 // Account / sync / import / material DTOs
 // ---------------------------------------------------------------------------------------
@@ -558,6 +574,11 @@ export interface WorkbenchApiMap {
   'plan.adopt': ApiEndpoint<ApiPlanAdoptRequest, ApiPlanAdoptResult>;
   'plan.edit': ApiEndpoint<ApiPlanEditRequest, ApiPlanEditResult>;
   'plan.checkoff': ApiEndpoint<ApiPlanCheckoffRequest, ApiPlanCheckoffResult>;
+  'plan.aiPrepare': ApiEndpoint<Model.ModelPlanPrepareRequest, Model.ModelPlanPrepareResult>;
+  'plan.aiRun': ApiEndpoint<Model.ModelPlanRunRequest, Model.ModelPlanRunResult>;
+  'plan.aiStatus': ApiEndpoint<Model.ModelPlanStatusRequest, Model.ModelPlanStatusResult>;
+  'plan.aiCancel': ApiEndpoint<Model.ModelPlanCancelRequest, Model.ModelPlanCancelResult>;
+  'plan.aiHistory': ApiEndpoint<Model.ModelPlanHistoryRequest, Model.ModelPlanHistoryResult>;
 }
 
 /**

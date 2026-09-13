@@ -24,7 +24,15 @@ import {
   STORE_TABLES_V2,
   STORE_TABLES_V3,
 } from '../../src/adapters/sqlite/index.js';
-import { applySchemaV1, initializeSchemaV2, migrateSchemaV1ToV2 } from '../../src/adapters/sqlite/schema.js';
+import {
+  SCHEMA_VERSION_V3,
+  STORE_TABLES_V4,
+  applySchemaV1,
+  applySchemaV3,
+  initializeSchemaV2,
+  initializeSchemaV3,
+  migrateSchemaV1ToV2,
+} from '../../src/adapters/sqlite/schema.js';
 import { createAnalysisBatch } from '../../src/application/batch-types.js';
 import { defaultWorkbenchSettings } from '../../src/application/workbench-settings.js';
 import {
@@ -242,6 +250,7 @@ void test('a fresh path is initialized with the marker, the current schema and i
     'jobs',
     'manual_decisions',
     'manual_revisions',
+    'plan_attempts',
     'plans',
     'problems',
     'retrospectives',
@@ -257,6 +266,7 @@ void test('a fresh path is initialized with the marker, the current schema and i
     assert.ok(state.tables.includes(table), `schema is missing ${table}`);
   }
   assert.equal(rawScalar(nested, 'SELECT count(*) FROM coaching_attempts'), 0, 'the reserved coaching table starts empty');
+  assert.equal(rawScalar(nested, 'SELECT count(*) FROM plan_attempts'), 0, 'the planning table starts empty');
   assert.equal(rawScalar(nested, 'SELECT count(*) FROM workbench_settings'), 0, 'settings are written only by a save');
   fx.removeDirectory(paths.dir);
 });
@@ -266,8 +276,11 @@ void test('a database from a newer schema is rejected before anything is written
   rawExec(paths.path, [
     'CREATE TABLE problems (x TEXT)',
     `INSERT INTO problems (x) VALUES ('foreign data')`,
+    // Literal v5: one version newer than this build's v4 store, never a moving target.
     `PRAGMA user_version = ${STORE_SCHEMA_VERSION + 1}`,
   ]);
+  assert.equal(STORE_SCHEMA_VERSION, 4);
+  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 5);
   const before = fingerprint(paths.path);
   const beforeBytes = readFileSync(paths.path);
   assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');
@@ -373,7 +386,7 @@ void test('a v1 database is copied, then migrated to v3 with every row kept', as
   assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION);
   assert.equal(migrated.marker, STORE_MARKER);
   assert.equal(migrated.integrity, 'ok');
-  for (const table of STORE_TABLES_V3) {
+  for (const table of STORE_TABLES_V4) {
     assert.ok(migrated.tables.includes(table), `migrated schema is missing ${table}`);
   }
   assert.equal(
@@ -387,6 +400,7 @@ void test('a v1 database is copied, then migrated to v3 with every row kept', as
     0,
     'the reserved coaching table stays empty',
   );
+  assert.equal(rawScalar(paths.path, 'SELECT count(*) FROM plan_attempts'), 0, 'the planning table is created empty');
 
   const backupNames = readdirSync(paths.dir).filter((name) => name.includes('.backup-v1-') && name.endsWith('.sqlite'));
   assert.equal(backupNames.length, 1, 'exactly one pre-migration copy of the v1 database is kept');
@@ -495,6 +509,56 @@ void test('historical v2 helpers keep writing exactly schema v2', () => {
   fx.removeDirectory(paths.dir);
 });
 
+void test('historical v3 helpers keep writing exactly schema v3 while the current store adds v4', async () => {
+  const paths = fx.tempDatabase();
+  const v3Path = join(paths.dir, 'v3.sqlite');
+  let db = new DatabaseSync(v3Path);
+  try {
+    initializeSchemaV3(db);
+  } finally {
+    db.close();
+  }
+  assert.equal(rawScalar(v3Path, 'PRAGMA user_version'), SCHEMA_VERSION_V3, 'initializeSchemaV3 stops at 3');
+  assert.deepEqual(
+    fingerprint(v3Path).tables,
+    [...STORE_TABLES_V3].sort(),
+    'the fixture is exactly a v3 store',
+  );
+  assert.equal(
+    rawScalar(v3Path, `SELECT count(*) FROM sqlite_master WHERE name = 'plan_attempts'`),
+    0,
+    'a v3 database has no v4 table',
+  );
+
+  // A bare `applySchemaV3` must also keep its own literal version, so a fixture stays a real v3 file.
+  const appliedPath = join(paths.dir, 'applied-v3.sqlite');
+  db = new DatabaseSync(appliedPath);
+  try {
+    applySchemaV1(db);
+    applySchemaV3(db);
+  } finally {
+    db.close();
+  }
+  assert.equal(rawScalar(appliedPath, 'PRAGMA user_version'), 3, 'applySchemaV3 writes the literal 3');
+
+  const store = new SqliteTrainingStore({ path: v3Path, now: () => fx.AT });
+  try {
+    const migrated = fingerprint(v3Path);
+    assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION);
+    for (const table of STORE_TABLES_V4) {
+      assert.ok(migrated.tables.includes(table), `migrated v3 schema is missing ${table}`);
+    }
+  } finally {
+    await store.close();
+  }
+  assert.equal(
+    readdirSync(paths.dir).filter((name) => name.includes('.backup-v3-') && name.endsWith('.sqlite')).length,
+    1,
+    'the real v3 file is copied before it is migrated',
+  );
+  fx.removeDirectory(paths.dir);
+});
+
 void test('a v2 database is copied, then migrated to v3 with every row kept', async () => {
   const paths = fx.tempDatabase();
   const world = seedV2World(paths.path);
@@ -520,7 +584,7 @@ void test('a v2 database is copied, then migrated to v3 with every row kept', as
   assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION);
   assert.equal(migrated.marker, STORE_MARKER);
   assert.equal(migrated.integrity, 'ok');
-  for (const table of STORE_TABLES_V3) {
+  for (const table of STORE_TABLES_V4) {
     assert.ok(migrated.tables.includes(table), `migrated schema is missing ${table}`);
   }
   assert.equal(
@@ -536,6 +600,7 @@ void test('a v2 database is copied, then migrated to v3 with every row kept', as
     0,
     'the reserved coaching table is created empty',
   );
+  assert.equal(rawScalar(paths.path, 'SELECT count(*) FROM plan_attempts'), 0, 'the planning table is created empty');
 
   const backupNames = readdirSync(paths.dir).filter((name) => name.includes('.backup-v2-') && name.endsWith('.sqlite'));
   assert.equal(backupNames.length, 1, 'exactly one pre-migration copy of the v2 database is kept');

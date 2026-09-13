@@ -165,6 +165,112 @@ export interface AnalysisFailure {
   readonly retryable: boolean;
 }
 
+/**
+ * Version of the completeness/audit procedure recorded on an analysis result.
+ *
+ * Bumping this value invalidates every earlier check: `prepareBatch` skips a stored success
+ * only while its recorded version is current, and `reanalyze` (or a legacy record without the
+ * metadata) creates new work instead. Old results keep their own recorded version forever —
+ * history is never rewritten.
+ */
+export const COMPLETENESS_AUDIT_VERSION = 'completeness-v1';
+
+/**
+ * Proof that one analysis actually performed the completeness check.
+ *
+ * The check is a *workflow* fact, not a mathematical proof of exhaustiveness: a current
+ * editorial analysis completed **and** an independent verification pass answered the
+ * omissions question (`missingSuggestions`) against the same snapshot and taxonomy.
+ * Reasoning-only, failed and cancelled runs carry no completeness at all, so "unchecked"
+ * stays visibly different from "checked".
+ *
+ * The record is additive and optional on {@link AnalysisResult}: a legacy row without it is
+ * read as unchecked, and re-saving a legacy body stays byte-identical because the field only
+ * enters the canonical body and the content hash when it is actually present.
+ */
+export interface AnalysisCompleteness {
+  /** Audit procedure version; see {@link COMPLETENESS_AUDIT_VERSION}. */
+  readonly version: string;
+  /** Taxonomy version the check ran against, frozen together with the snapshot relation. */
+  readonly taxonomyVersion: string;
+  /** Snapshot the check applies to; a different head makes it outdated, not wrong. */
+  readonly snapshotId: string;
+  readonly snapshotVersion: number;
+  readonly checkedAt: string;
+  /** The independent pass really answered the omissions question (possibly with "none"). */
+  readonly omissionsChecked: true;
+}
+
+export interface CreateAnalysisCompletenessInput {
+  readonly version?: string;
+  readonly taxonomyVersion: string;
+  readonly snapshotId: string;
+  readonly snapshotVersion: number;
+  readonly checkedAt: string;
+}
+
+/** Build the validated, frozen completeness record of one successful checked analysis. */
+export function createAnalysisCompleteness(input: CreateAnalysisCompletenessInput): AnalysisCompleteness {
+  const version = (input.version ?? COMPLETENESS_AUDIT_VERSION).trim();
+  invariant(version.length > 0, 'invalid_input', 'completeness version must not be empty', { input });
+  invariant(
+    typeof input.taxonomyVersion === 'string' && input.taxonomyVersion.trim().length > 0,
+    'invalid_input',
+    'completeness taxonomyVersion must not be empty',
+    { taxonomyVersion: input.taxonomyVersion },
+  );
+  invariant(
+    typeof input.snapshotId === 'string' && input.snapshotId.trim().length > 0,
+    'invalid_input',
+    'completeness snapshotId must not be empty',
+    { snapshotId: input.snapshotId },
+  );
+  invariant(
+    Number.isInteger(input.snapshotVersion) && input.snapshotVersion >= 1,
+    'invalid_input',
+    'completeness snapshotVersion must be >= 1',
+    { snapshotVersion: input.snapshotVersion },
+  );
+  return deepFreeze({
+    version,
+    taxonomyVersion: input.taxonomyVersion,
+    snapshotId: input.snapshotId,
+    snapshotVersion: input.snapshotVersion,
+    checkedAt: assertIsoTimestamp('checkedAt', input.checkedAt),
+    omissionsChecked: true as const,
+  });
+}
+
+/** What a caller currently requires a stored completeness record to match. */
+export interface RequiredCompleteness {
+  readonly version: string;
+  readonly taxonomyVersion: string;
+  readonly snapshotId: string;
+  readonly snapshotVersion: number;
+}
+
+/**
+ * True only when the recorded check is the *current* procedure against the *current*
+ * snapshot and taxonomy. A missing record (legacy), an older audit version, an outdated
+ * snapshot or a different taxonomy all report `false` — such a result stays readable, but it
+ * no longer satisfies the check.
+ */
+export function completenessIsCurrent(
+  completeness: AnalysisCompleteness | null | undefined,
+  required: RequiredCompleteness,
+): boolean {
+  if (completeness === null || completeness === undefined) {
+    return false;
+  }
+  return (
+    completeness.version === required.version &&
+    completeness.taxonomyVersion === required.taxonomyVersion &&
+    completeness.snapshotId === required.snapshotId &&
+    completeness.snapshotVersion === required.snapshotVersion &&
+    completeness.omissionsChecked === true
+  );
+}
+
 /** Immutable analysis output for exactly one snapshot. */
 export interface AnalysisResult {
   readonly analysisId: string;
@@ -179,6 +285,11 @@ export interface AnalysisResult {
   readonly reasoningDrafts: readonly ReasoningDraft[];
   readonly usage: ModelUsage | null;
   readonly failure: AnalysisFailure | null;
+  /**
+   * Present only when this run really performed the completeness check; absent on legacy rows
+   * (recorded before the check existed) and on reasoning-only/failed/cancelled runs.
+   */
+  readonly completeness?: AnalysisCompleteness;
 }
 
 export interface CreateAnalysisResultInput {
@@ -193,6 +304,8 @@ export interface CreateAnalysisResultInput {
   readonly reasoningDrafts?: readonly ReasoningDraft[];
   readonly usage?: ModelUsage | null;
   readonly failure?: AnalysisFailure | null;
+  /** Omitted (or `null`) keeps the legacy body and content hash byte-identical. */
+  readonly completeness?: AnalysisCompleteness | null;
 }
 
 /**
@@ -248,10 +361,40 @@ export function createAnalysisResult(input: CreateAnalysisResultInput): Analysis
       status: input.status,
     });
   }
+  const completeness = input.completeness ?? null;
+  if (completeness !== null) {
+    invariant(
+      completeness.snapshotId === input.snapshotId && completeness.snapshotVersion === input.snapshotVersion,
+      'invalid_input',
+      'completeness record targets another snapshot',
+      {
+        completenessSnapshotId: completeness.snapshotId,
+        completenessSnapshotVersion: completeness.snapshotVersion,
+        snapshotId: input.snapshotId,
+        snapshotVersion: input.snapshotVersion,
+      },
+    );
+    invariant(
+      completeness.taxonomyVersion === input.taxonomyVersion,
+      'invalid_input',
+      'completeness record was produced under another taxonomy version',
+      {
+        completenessTaxonomyVersion: completeness.taxonomyVersion,
+        taxonomyVersion: input.taxonomyVersion,
+      },
+    );
+    invariant(
+      input.status === 'completed',
+      'invalid_input',
+      'only a completed analysis may carry a completeness record',
+      { status: input.status },
+    );
+  }
   // The id covers the whole semantic result (version, suggestions, verifications, drafts,
   // usage and failure), not only the referenced ids and the timestamp: two different model
   // answers recorded in the same millisecond must stay distinct immutable records, while an
-  // identical replay still produces the identical id.
+  // identical replay still produces the identical id. The optional completeness record joins
+  // the hash **only when present**, so a legacy replay keeps its original id and body.
   const analysisId = `analysis|${contentHashOf({
     key,
     snapshotId: input.snapshotId,
@@ -264,6 +407,7 @@ export function createAnalysisResult(input: CreateAnalysisResultInput): Analysis
     reasoningDrafts,
     usage: input.usage ?? null,
     failure: input.failure ?? null,
+    ...(completeness === null ? {} : { completeness }),
   }).slice(0, 32)}`;
   return deepFreeze({
     analysisId,
@@ -278,6 +422,7 @@ export function createAnalysisResult(input: CreateAnalysisResultInput): Analysis
     reasoningDrafts,
     usage: input.usage ?? null,
     failure: input.failure ?? null,
+    ...(completeness === null ? {} : { completeness }),
   });
 }
 
@@ -357,18 +502,34 @@ export interface AnalysisJobLimits {
  * merely reverts to earlier content (`A -> B -> A`, a new version) gets a fresh job instead
  * of inheriting the finished job of the first `A`.
  */
-export function analysisJobIdOf(snapshotId: string): string {
-  return `analysis-job|${contentHashOf({ snapshotId }).slice(0, 32)}`;
+export function analysisJobIdOf(snapshotId: string, runId?: string | null): string {
+  return runId === undefined || runId === null
+    ? `analysis-job|${contentHashOf({ snapshotId }).slice(0, 32)}`
+    : `analysis-job|${contentHashOf({ snapshotId, runId }).slice(0, 32)}`;
 }
 
 export function createAnalysisJob(input: {
   readonly problemRef: ProblemRef;
   readonly snapshotId: string;
   readonly at: string;
+  /**
+   * Optional run identity: a rerun of an already finished snapshot gets its own job instead of
+   * overwriting the immutable legacy one. Omitting it keeps the legacy deterministic id, so
+   * existing callers and recorded fixtures are unaffected.
+   */
+  readonly runId?: string | null;
 }): AnalysisJobState {
   const at = assertIsoTimestamp('at', input.at);
+  if (input.runId !== undefined && input.runId !== null) {
+    invariant(
+      typeof input.runId === 'string' && input.runId.trim().length > 0,
+      'invalid_input',
+      'runId must be a non-empty string when supplied',
+      { runId: input.runId },
+    );
+  }
   return deepFreeze({
-    jobId: analysisJobIdOf(input.snapshotId),
+    jobId: analysisJobIdOf(input.snapshotId, input.runId ?? null),
     problemKey: problemKey(input.problemRef),
     snapshotId: input.snapshotId,
     status: 'pending',

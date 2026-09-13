@@ -35,6 +35,17 @@ export function useAction(){
   }
   return {run,busy,error,cancel:()=>active.current?.abort(),clear:()=>setError(null)};
 }
+/**
+ * Re-run one refresh after the previous read settled, only while `active`.
+ *
+ * It never overlaps itself, so a slow status read cannot be aborted by its own next tick, and it
+ * starts no work of its own: the caller decides when polling is meaningful (for AI planning: only
+ * while a run is owned or an attempt is durably reserved).
+ */
+export function usePollAfterSettle(active:boolean,pending:boolean,refresh:()=>void,delayMs=1500){
+  const latest=useRef(refresh);latest.current=refresh;
+  useEffect(()=>{if(!active||pending)return;const timer=setTimeout(()=>latest.current(),delayMs);return()=>clearTimeout(timer);},[active,pending,delayMs]);
+}
 export function tagName(id:string,boot:BootstrapResult):string{return boot.taxonomy.nodes.find(n=>n.id===id)?.names.zh??id;}
 export function percent(value:number|null|undefined):string{return value===null||value===undefined?'暂无样本':(value*100).toFixed(0)+'%';}
 export function localDay(time:string|Date):number{const d=new Date(time);return Date.UTC(d.getFullYear(),d.getMonth(),d.getDate())/86400000;}

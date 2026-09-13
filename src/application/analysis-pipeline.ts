@@ -71,8 +71,11 @@ import {
   type ModelCallRole,
 } from './batch-types.js';
 import {
+  COMPLETENESS_AUDIT_VERSION,
   DomainError,
   analysisJobIdOf,
+  completenessIsCurrent,
+  createAnalysisCompleteness,
   createAnalysisJob,
   createAnalysisResult,
   createCancellationSource,
@@ -83,12 +86,15 @@ import {
   resolveTagDecisions,
   transitionJob,
   type AiTagSuggestion,
+  type AnalysisCompleteness,
   type AnalysisJobState,
   type AnalysisJobStatus,
+  type AnalysisResult,
   type CancellationToken,
   type ModelUsage,
   type ProblemSnapshot,
   type SuggestionVerification,
+  type TagDecision,
   type Taxonomy,
   type TaxonomyIndex,
 } from '../domain/index.js';
@@ -98,10 +104,16 @@ import {
  *
  * The pipeline appends the taxonomy version when it persists or sends one
  * (`<version>|taxonomy:<version>`); see `AnalysisPipeline.promptVersionFor`.
+ *
+ * `verification-v2` is the completeness-aware prompt: it requires the `missingSuggestions`
+ * omissions answer. Because the version is part of the recorded prompt identity, a settled
+ * attempt produced under `verification-v1` can never be replayed as if it had answered the
+ * omissions question, and `analysis-v3` likewise invalidates any cached analysis outcome
+ * recorded before the completeness contract existed.
  */
 export const DEFAULT_PROMPT_VERSIONS: Readonly<Record<ModelCallRole, string>> = {
-  analysis: 'analysis-v2',
-  verification: 'verification-v1',
+  analysis: 'analysis-v3',
+  verification: 'verification-v2',
   reasoning: 'reasoning-v1',
 };
 
@@ -190,6 +202,17 @@ export interface PrepareBatchSettings {
   readonly maxJobs?: number;
   readonly limits?: Partial<AnalysisBatchLimits>;
   readonly createdAt?: string;
+  /**
+   * Explicit rerun request.
+   *
+   * `false` (the default) skips a snapshot only while its stored success carries a *current*
+   * completeness check for this snapshot and taxonomy. `true` always creates a new run
+   * identity — even for an already checked result — so the old job, result and decision
+   * history stay immutable while the new run is free to correct them.
+   */
+  readonly reanalyze?: boolean;
+  /** Optional run identity for the new jobs; defaults to a fresh unique id per rerun. */
+  readonly runId?: string | null;
 }
 
 /** A job that was already finished before the batch was prepared; it is never reset. */
@@ -198,12 +221,26 @@ export interface AlreadyDoneJob {
   readonly snapshotId: string;
   readonly status: AnalysisJobStatus;
   readonly analysisId: string | null;
+  /** Why it was skipped: always a current completeness check for this snapshot/taxonomy. */
+  readonly completeness: 'current';
+}
+
+/** A finished job that this prepare superseded with a new run identity. */
+export interface PreparedRerun {
+  readonly jobId: string;
+  readonly snapshotId: string;
+  readonly previousJobId: string;
+  readonly previousStatus: AnalysisJobStatus;
+  /** `legacy_unchecked` | `cancelled_run` | `reanalyze_requested`. */
+  readonly reason: 'legacy_unchecked' | 'cancelled_run' | 'reanalyze_requested';
 }
 
 export interface PreparedBatch {
   /** `null` when every requested job was already done, so no batch was created. */
   readonly batch: AnalysisBatch | null;
   readonly alreadyDone: readonly AlreadyDoneJob[];
+  /** Finished jobs superseded by a new run; their history is untouched. */
+  readonly reruns: readonly PreparedRerun[];
 }
 
 export interface AnalysisJobOutcome {
@@ -306,6 +343,11 @@ interface AdoptableContent {
   readonly suggestions: readonly AiTagSuggestion[];
   readonly verifications: readonly SuggestionVerification[];
   readonly reasoningDrafts: readonly import('../domain/index.js').ReasoningDraft[];
+  /**
+   * Completeness record of this run, or `null` when the run did not perform the check
+   * (reasoning-only, or a verification pass without an omissions answer).
+   */
+  readonly completeness: AnalysisCompleteness | null;
 }
 
 interface ActiveRun {
@@ -394,10 +436,11 @@ export class AnalysisPipeline {
    * Prepare a batch for already persisted, current snapshots.
    *
    * Runs in one store transaction: each snapshot must exist and still be its problem's head;
-   * the deterministic job of each snapshot is created only when absent (a finished job is
-   * reported `alreadyDone`, never reset and never overwritten); a job already scheduled by
-   * another active batch is refused; and each job records the problem's manual revision at
-   * this moment. When every requested job was already done, no batch is created.
+   * the deterministic job of each snapshot is created only when absent (any finished job whose
+   * result carries the current completeness check is reported `alreadyDone`, never reset and
+   * never overwritten); a job already scheduled by another active batch is refused; and each job
+   * records the problem's manual revision at this moment. When every requested job was already
+   * done, no batch is created.
    */
   async prepareBatch(snapshotIds: readonly string[], settings: PrepareBatchSettings = {}): Promise<PreparedBatch> {
     invariant(snapshotIds.length > 0, 'invalid_input', 'prepareBatch needs at least one snapshot id', {});
@@ -439,42 +482,115 @@ export class AnalysisPipeline {
       const activeBatches = (await this.store.listBatches(null)).filter(
         (batch) => batch.status === 'pending' || batch.status === 'running' || batch.status === 'paused',
       );
+      const reanalyze = settings.reanalyze === true;
       const jobs: AnalysisBatchJob[] = [];
       const alreadyDone: AlreadyDoneJob[] = [];
+      const reruns: PreparedRerun[] = [];
+      const storedJobs = await this.store.listJobs(null);
       for (const snapshot of snapshots) {
-        const jobId = analysisJobIdOf(snapshot.snapshotId);
+        // Ownership is decided per *snapshot*, not per job id: a rerun gets a distinct run
+        // identity, so matching on the id alone would let two concurrent runs race to adoption.
         const owner = activeBatches.find(
-          (batch) => batch.batchId !== batchId && batch.jobs.some((job) => job.jobId === jobId),
+          (batch) => batch.batchId !== batchId && batch.jobs.some((job) => job.snapshotId === snapshot.snapshotId),
         );
         if (owner) {
-          throw new DomainError('invalid_transition', `job ${jobId} already belongs to active batch ${owner.batchId}`, {
-            jobId,
-            batchId: owner.batchId,
-          });
+          throw new DomainError(
+            'invalid_transition',
+            `snapshot ${snapshot.snapshotId} is already scheduled by active batch ${owner.batchId}`,
+            { snapshotId: snapshot.snapshotId, batchId: owner.batchId },
+          );
         }
-        const existing = await this.store.getJob(jobId);
-        if (existing && (existing.status === 'succeeded' || existing.status === 'cancelled')) {
-          alreadyDone.push({
-            jobId,
-            snapshotId: snapshot.snapshotId,
-            status: existing.status,
-            analysisId: existing.analysisId,
-          });
+        const legacyJobId = analysisJobIdOf(snapshot.snapshotId);
+        const existing = await this.store.getJob(legacyJobId);
+        // "Already done" is decided over *every* succeeded job of this snapshot, not only the
+        // legacy deterministic one: the check that satisfies the current snapshot/taxonomy may
+        // live on a rerun identity while the legacy record it superseded never carries one. This
+        // runs before the unfinished branch, so a snapshot whose current completeness check was
+        // already recorded is skipped instead of being continued as stale work.
+        if (!reanalyze) {
+          const checked = await this.currentSucceededJob(snapshot, storedJobs);
+          if (checked !== null) {
+            alreadyDone.push({
+              jobId: checked.jobId,
+              snapshotId: snapshot.snapshotId,
+              status: checked.status,
+              analysisId: checked.analysisId,
+              completeness: 'current',
+            });
+            continue;
+          }
+        }
+        if (existing !== null && existing.status !== 'succeeded' && existing.status !== 'cancelled' && !(reanalyze && existing.status === 'failed')) {
+          // Unfinished work is continued, never duplicated and never reset.
+          if (existing.status === 'failed') {
+            await this.store.saveJob(transitionJob(existing, { type: 'requeue', at }));
+          }
+          const manualRevision = await this.store.getManualRevision(snapshot.problem.key);
+          jobs.push({ jobId: existing.jobId, snapshotId: snapshot.snapshotId, manualRevision });
           continue;
         }
-        if (!existing) {
-          await this.store.saveJob(
-            createAnalysisJob({ problemRef: snapshot.problem.ref, snapshotId: snapshot.snapshotId, at: createdAt }),
-          );
-        } else if (existing.status === 'failed') {
-          // A previously failed job may be scheduled again; its counters and attempts survive.
-          await this.store.saveJob(transitionJob(existing, { type: 'requeue', at }));
+        // A new run identity is required only when a finished legacy job must be preserved;
+        // the very first analysis of a snapshot keeps the legacy deterministic job id.
+        const unfinished = storedJobs.find(
+          (job) =>
+            job.jobId !== legacyJobId &&
+            job.snapshotId === snapshot.snapshotId &&
+            (job.status === 'pending' ||
+              job.status === 'running' ||
+              job.status === 'paused_quota' ||
+              (job.status === 'failed' && !reanalyze)),
+        );
+        let jobId: string;
+        if (unfinished !== undefined) {
+          jobId = unfinished.jobId;
+          if (unfinished.status === 'failed') {
+            await this.store.saveJob(transitionJob(unfinished, { type: 'requeue', at }));
+          }
+        } else {
+          const runId = existing === null ? null : (settings.runId ?? this.uniqueId('run'));
+          jobId = analysisJobIdOf(snapshot.snapshotId, runId);
+          const scheduled = await this.store.getJob(jobId);
+          if (scheduled === null) {
+            await this.store.saveJob(
+              createAnalysisJob({
+                problemRef: snapshot.problem.ref,
+                snapshotId: snapshot.snapshotId,
+                at: createdAt,
+                runId,
+              }),
+            );
+          } else if (scheduled.status === 'failed') {
+            await this.store.saveJob(transitionJob(scheduled, { type: 'requeue', at }));
+          } else if (scheduled.status === 'succeeded' || scheduled.status === 'cancelled') {
+            // A supplied run identity that already reached a terminal state must never be
+            // reported as a fresh batch: the job would be skipped as finished and the batch
+            // would look completed without any work. Finished history is immutable, so the
+            // collision is refused and the caller has to choose a fresh run identity.
+            throw new DomainError(
+              'invalid_transition',
+              `run identity ${String(runId)} of snapshot ${snapshot.snapshotId} already names a ${scheduled.status} job; use a fresh run identity`,
+              { snapshotId: snapshot.snapshotId, jobId, status: scheduled.status, runId },
+            );
+          }
+        }
+        if (existing !== null) {
+          reruns.push({
+            jobId,
+            snapshotId: snapshot.snapshotId,
+            previousJobId: legacyJobId,
+            previousStatus: existing.status,
+            reason: reanalyze
+              ? 'reanalyze_requested'
+              : existing.status === 'cancelled'
+                ? 'cancelled_run'
+                : 'legacy_unchecked',
+          });
         }
         const manualRevision = await this.store.getManualRevision(snapshot.problem.key);
         jobs.push({ jobId, snapshotId: snapshot.snapshotId, manualRevision });
       }
       if (jobs.length === 0) {
-        return { batch: null, alreadyDone };
+        return { batch: null, alreadyDone, reruns };
       }
       const batch = createAnalysisBatch({
         batchId,
@@ -485,7 +601,7 @@ export class AnalysisPipeline {
         ...(settings.limits ? { limits: settings.limits } : {}),
       });
       const revision = await this.store.saveBatch(batch, null);
-      return { batch: { ...batch, revision }, alreadyDone };
+      return { batch: { ...batch, revision }, alreadyDone, reruns };
     });
   }
 
@@ -1085,26 +1201,45 @@ export class AnalysisPipeline {
       }
       suggestions = analyzed.value.suggestions;
     }
-    let verifications: readonly SuggestionVerification[] = [];
-    if (suggestions.length > 0) {
-      const verified = await this.callRole<VerifyOutcome>(claim, 'verification', token, pause, (attemptId, callToken) =>
-        this.gateway.verify({
-          snapshot: claim.snapshot,
-          taxonomy: this.taxonomy,
-          suggestions,
-          token: callToken,
-          limits: this.limits,
-          roles: this.roles,
-          attemptId,
-          promptVersion: this.promptVersionFor('verification'),
-        }),
-      );
-      if (verified.kind !== 'ok') {
-        return this.handleCallStop(claim, verified);
-      }
-      verifications = verified.value.verifications;
+    // The independent pass always runs — also when the analysis proposed nothing. Its
+    // omissions answer is what makes this run a completeness check, and the call counts
+    // against the analysis budget exactly like a verification of a non-empty list.
+    const verified = await this.callRole<VerifyOutcome>(claim, 'verification', token, pause, (attemptId, callToken) =>
+      this.gateway.verify({
+        snapshot: claim.snapshot,
+        taxonomy: this.taxonomy,
+        suggestions,
+        token: callToken,
+        limits: this.limits,
+        roles: this.roles,
+        attemptId,
+        promptVersion: this.promptVersionFor('verification'),
+      }),
+    );
+    if (verified.kind !== 'ok') {
+      return this.handleCallStop(claim, verified);
     }
-    return this.adoptOrRefuse(claim, { suggestions, verifications, reasoningDrafts: [] }, token, pause);
+    const verifications = verified.value.verifications;
+    const missing = verified.value.missingSuggestions;
+    // `missingSuggestions` is present only when the pass really answered the omissions
+    // question. A gateway or parser that does not provide it leaves the run *unchecked*
+    // instead of pretending the check happened.
+    const omissionsAnswered = Array.isArray(missing);
+    const merged = omissionsAnswered && (missing?.length ?? 0) > 0 ? [...suggestions, ...missing!] : [...suggestions];
+    const completeness = omissionsAnswered
+      ? createAnalysisCompleteness({
+          taxonomyVersion: this.taxonomy.version,
+          snapshotId: claim.snapshot.snapshotId,
+          snapshotVersion: claim.snapshot.version,
+          checkedAt: this.now(),
+        })
+      : null;
+    return this.adoptOrRefuse(
+      claim,
+      { suggestions: merged, verifications, reasoningDrafts: [], completeness },
+      token,
+      pause,
+    );
   }
 
   private async runReasoningJob(
@@ -1129,7 +1264,7 @@ export class AnalysisPipeline {
     }
     return this.adoptOrRefuse(
       claim,
-      { suggestions: [], verifications: [], reasoningDrafts: drafted.value.drafts },
+      { suggestions: [], verifications: [], reasoningDrafts: drafted.value.drafts, completeness: null },
       token,
       pause,
     );
@@ -1675,22 +1810,38 @@ export class AnalysisPipeline {
       }
       const usage = await this.settledUsage(claim);
       const manualDecisions = await this.store.listManualDecisions(claim.snapshot.problem.key);
-      const afterDecisions = stopReason();
-      if (afterDecisions) {
-        return abort(afterDecisions);
+      // History is read only for a checked run: it is what lets the new result explicitly
+      // withdraw an old automatic adoption it no longer supports. A run without completeness
+      // must never touch the last valid adoption, so it passes no previous decisions.
+      const previousDecisions =
+        content.completeness === null ? null : await this.store.listTagDecisions(claim.snapshot.problem.key);
+      // The same read also feeds the logical ordering below. A checked run must be *strictly*
+      // newer than every result and AI decision this problem already has, because `now()` may
+      // repeat (tests drive it; real clocks have millisecond resolution) and the domain compares
+      // decisions by their timestamp alone. Prior analyses are included even when they carry no
+      // suggestion: a tagless result is still part of the history the new check must supersede.
+      const previousAnalyses =
+        content.completeness === null ? null : await this.store.listAnalyses(claim.snapshot.problem.key);
+      const afterHistory = stopReason();
+      if (afterHistory) {
+        return abort(afterHistory);
       }
       const result = createAnalysisResult({
         problemRef: claim.snapshot.problem.ref,
         snapshotId: claim.snapshot.snapshotId,
         snapshotVersion: claim.snapshot.version,
         taxonomyVersion: this.taxonomy.version,
-        createdAt: at,
+        createdAt:
+          content.completeness === null
+            ? at
+            : logicalAdoptionInstant(at, previousAnalyses ?? [], previousDecisions ?? []),
         status: 'completed',
         suggestions: content.suggestions,
         verifications: content.verifications,
         reasoningDrafts: content.reasoningDrafts,
         usage,
         failure: null,
+        completeness: content.completeness,
       });
       const resolved = resolveTagDecisions({
         index: this.index,
@@ -1698,6 +1849,7 @@ export class AnalysisPipeline {
         analysis: result,
         currentHead: head,
         manualDecisions,
+        ...(previousDecisions === null ? {} : { previousDecisions }),
         settings: { minExcerptChars: this.minExcerptChars },
       });
       await this.store.saveAnalysis(result);
@@ -1746,6 +1898,55 @@ export class AnalysisPipeline {
     }
     await this.releaseJob(claim, `analysis interrupted (${reason})`);
     return this.outcomeOf(claim.jobSpec, await this.store.getJob(claim.jobSpec.jobId), reason);
+  }
+
+  /**
+   * The latest succeeded job of one snapshot whose analysis carries the *current* completeness
+   * check, or `null` when no succeeded record qualifies.
+   *
+   * Eligibility deliberately covers every succeeded job of the snapshot — the legacy deterministic
+   * id and any rerun identity alike — because a superseded legacy success never carries the check
+   * while the checked rerun that replaced it does, and after a rerun it is that rerun identity a
+   * default prepare must recognise as done. Candidates are ordered latest-first by `createdAt` and
+   * then by `jobId`, so identical stored state always reports the same representative.
+   */
+  private async currentSucceededJob(
+    snapshot: ProblemSnapshot,
+    storedJobs: readonly AnalysisJobState[],
+  ): Promise<AnalysisJobState | null> {
+    const succeeded = storedJobs
+      .filter((job) => job.snapshotId === snapshot.snapshotId && job.status === 'succeeded')
+      .sort((left, right) => {
+        const delta = Date.parse(right.createdAt) - Date.parse(left.createdAt);
+        return delta !== 0 ? delta : right.jobId.localeCompare(left.jobId);
+      });
+    for (const job of succeeded) {
+      if (await this.jobCompletenessIsCurrent(job, snapshot)) {
+        return job;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * True when a stored job's analysis carries the *current* completeness check for this
+   * snapshot and taxonomy. A legacy success (no record), an older audit version or a record
+   * for another snapshot/taxonomy is not "already done".
+   */
+  private async jobCompletenessIsCurrent(job: AnalysisJobState, snapshot: ProblemSnapshot): Promise<boolean> {
+    if (job.analysisId === null) {
+      return false;
+    }
+    const analysis = await this.store.getAnalysis(job.analysisId);
+    if (analysis === null || analysis.status !== 'completed') {
+      return false;
+    }
+    return completenessIsCurrent(analysis.completeness, {
+      version: COMPLETENESS_AUDIT_VERSION,
+      taxonomyVersion: this.taxonomy.version,
+      snapshotId: snapshot.snapshotId,
+      snapshotVersion: snapshot.version,
+    });
   }
 
   /**
@@ -1962,6 +2163,33 @@ export class AnalysisPipeline {
       { batchId: batch.batchId, jobIds: legacy.map((job) => job.jobId) },
     );
   }
+}
+
+/**
+ * Logical timestamp of one checked adoption.
+ *
+ * `at` is kept whenever it is already strictly newer, so an ordinary run records exactly the real
+ * clock instant it was given. Only a repeated clock (or a stored row written with a later
+ * timestamp) advances the instant to one millisecond past the newest previous result or AI
+ * decision of the same problem. That keeps the append-only decision history totally ordered
+ * without inventing a second clock: manual decisions keep their real dates, the completeness
+ * record keeps its real `checkedAt`, and the job/batch lease timestamps stay untouched.
+ */
+function logicalAdoptionInstant(
+  at: string,
+  previousAnalyses: readonly AnalysisResult[],
+  previousDecisions: readonly TagDecision[],
+): string {
+  let instant = Date.parse(at);
+  for (const analysis of previousAnalyses) {
+    instant = Math.max(instant, Date.parse(analysis.createdAt) + 1);
+  }
+  for (const decision of previousDecisions) {
+    if (decision.origin === 'ai') {
+      instant = Math.max(instant, Date.parse(decision.decidedAt) + 1);
+    }
+  }
+  return new Date(instant).toISOString();
 }
 
 function outcomeFor(role: ModelCallRole, value: unknown): ModelCallOutcome {

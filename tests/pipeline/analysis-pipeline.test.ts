@@ -493,10 +493,16 @@ void test('two-pass analysis adopts verified evidence and keeps raw platform tag
     assert.ok(attempts.every((attempt) => attempt.status === 'settled' && attempt.hostCallId !== null));
     assert.ok(attempts.every((attempt) => attempt.hostSessionId !== null));
 
-    // A second prepare does not reset a finished job; it reports it as already done.
+    // A second prepare does not reset a finished job. This run's verification answer carried no
+    // omissions list (the fake outcome has no `missingSuggestions`), so it is not a completeness
+    // check: the finished job stays immutable history and a distinct rerun is scheduled.
     const again = await pipeline.prepareBatch([snapshot.snapshotId], { batchId: 'second-batch' });
-    assert.equal(again.batch, null);
-    assert.deepEqual(again.alreadyDone.map((entry) => entry.status), ['succeeded']);
+    assert.ok(again.batch);
+    assert.deepEqual(again.alreadyDone, []);
+    assert.deepEqual(again.reruns.map((entry) => entry.reason), ['legacy_unchecked']);
+    assert.equal(again.reruns[0]?.previousJobId, analysisJobIdOf(snapshot.snapshotId));
+    assert.notEqual(again.reruns[0]?.jobId, analysisJobIdOf(snapshot.snapshotId));
+    assert.equal((await store.getJob(analysisJobIdOf(snapshot.snapshotId)))?.status, 'succeeded');
     assert.equal((await store.getJob(analysisJobIdOf(snapshot.snapshotId)))?.counters.analysisCalls, 2);
   });
 });
@@ -1607,7 +1613,7 @@ void test('a settled analysis pass is only reused under the same provider and pr
       (attempt) => attempt.role === 'analysis',
     );
     assert.equal(analysisAttempt?.provider, 'fake-provider');
-    assert.equal(analysisAttempt?.promptVersion, 'analysis-v2|taxonomy:test-v1');
+    assert.equal(analysisAttempt?.promptVersion, 'analysis-v3|taxonomy:test-v1');
 
     // A different provider must not reuse a pass that was paid for under another provider.
     const otherProvider = new FakeGateway(

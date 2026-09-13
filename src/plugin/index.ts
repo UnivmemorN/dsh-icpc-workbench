@@ -15,13 +15,15 @@ import { LuoguAdapter, luoguSourceInstance } from '../adapters/luogu/index.js';
 import { DshAuditedModelClient, type DshAuditedHost } from '../adapters/dsh/audited-client.js';
 import { DshModelGateway } from '../adapters/dsh/model-gateway.js';
 import { DshCoachingGenerator } from '../adapters/dsh/coaching-generator.js';
+import { DshPlanGenerator } from '../adapters/dsh/plan-generator.js';
 import { AnalysisPipeline } from '../application/analysis-pipeline.js';
 import { CoachingService } from '../application/coaching-service.js';
 import { ImportService } from '../application/import-service.js';
+import { PlanningService } from '../application/planning-service.js';
 import { WorkbenchService } from '../application/workbench-service.js';
 import { defaultWorkbenchSettings } from '../application/workbench-settings.js';
 import type { PlatformAdapter } from '../application/ports.js';
-import { CURRENT_TAXONOMY, createTaxonomyIndex } from '../domain/index.js';
+import { CURRENT_TAXONOMY, createCancellationSource, createTaxonomyIndex } from '../domain/index.js';
 import { checkHostCompatibility, type HostCompatibilityProbe } from './compatibility.js';
 import { parsePluginConfig, resolveDataDir } from './config.js';
 import { ModelCatalog, type CatalogHost } from './model-catalog.js';
@@ -79,7 +81,17 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
     const imports=new ImportService({store,now}),workbench=new WorkbenchService({store,taxonomy:createTaxonomyIndex(CURRENT_TAXONOMY),now,uniqueId:randomUUID});
     const client=new DshAuditedModelClient({llm:host.llm,sessions:auditSessions},{now}),catalog=new ModelCatalog(host.llm);
     const coaching=new CoachingService({store,now,generator:new DshCoachingGenerator({client,now}),onInternalError:reportFailure});
+    // AI planning (Sprint 11d): the accepted durable service over the same audited client, with the
+    // workbench's own preparation/revalidation/save methods bound as its data port. The port names
+    // (`prepare`/`revalidate`/`savePlan`) deliberately differ from the workbench method names.
+    const planning=new PlanningService({store,generator:new DshPlanGenerator({client,now}),now,onInternalError:reportFailure,
+      preparation:{prepare:workbench.preparePlanInput.bind(workbench),revalidate:workbench.revalidatePlanInput.bind(workbench),savePlan:workbench.saveModelPlan.bind(workbench)}});
+    // Recovery runs before any route can accept a start: a reservation left behind by a dead process
+    // becomes terminal `uncertain` (keeping its quota slot) instead of looking like a live call, and
+    // an activation that cannot recover refuses to serve rather than guessing.
+    await planning.recoverExpiredReservations(createCancellationSource().token);
     controller=new ModelOperations({store,coaching,now,uniqueId,validateModels:(s,t)=>catalog.validate(s,t),onInternalError:reportFailure,
+      planning,getPlan:(planId,accountId,reveal,token)=>workbench.getPlan(reveal?{planId,accountId,reveal:true}:{planId,accountId},token),
       ...(environment.closeWaitMs===undefined?{}:{closeWaitMs:environment.closeWaitMs}),
       createPipeline:r=>new AnalysisPipeline({store,gateway:new DshModelGateway({provider:r.value.provider,client,now}),taxonomy:CURRENT_TAXONOMY,roles:r.value.roles,limits:r.value.modelLimits,now,uniqueId})});
     const observer={onInternalError:reportFailure};

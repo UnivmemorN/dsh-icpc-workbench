@@ -1,4 +1,4 @@
-/** dsh host adapters: the audited auxiliary model client, the tag-model gateway and the coaching generator. */
+/** dsh host adapters: the audited auxiliary model client, the tag-model gateway, the coaching generator and the AI plan generator. */
 export {
   AUDITED_MODEL_ROLES,
   AUDIT_CONTEXT_FRAMING_MARGIN_TOKENS,
@@ -36,6 +36,14 @@ export {
   parseCoachingOutput,
 } from './coaching-generator.js';
 export type { DshCoachingGeneratorClient, DshCoachingGeneratorOptions } from './coaching-generator.js';
+
+export {
+  DshPlanGenerator,
+  PLANNING_SYSTEM_PROMPT,
+  PLANNING_TEMPERATURE,
+  parsePlanGenerationOutput,
+} from './plan-generator.js';
+export type { DshPlanGeneratorClient, DshPlanGeneratorOptions } from './plan-generator.js';
 
 export {
   MAX_ANALYSIS_SUGGESTIONS,

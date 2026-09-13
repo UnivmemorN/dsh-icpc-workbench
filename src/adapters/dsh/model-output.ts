@@ -76,6 +76,23 @@ export interface VerifyOutputContext {
   readonly suggestions: readonly AiTagSuggestion[];
   /** Injected clock; every `checkedAt` comes from here. */
   readonly now: () => string;
+  /**
+   * Prompt identity the answer was produced under.
+   *
+   * New dispatches use the completeness-aware prompt and therefore **must** answer
+   * `missingSuggestions`. Only an explicitly recorded legacy identity may omit it, which keeps
+   * recorded old fixtures replayable without ever letting a new run silently pass the old
+   * schema off as an omissions answer.
+   */
+  readonly promptVersion?: string;
+}
+
+/** Prompt identity prefix of the verification role that predates the omissions question. */
+export const LEGACY_VERIFICATION_PROMPT_PREFIX = 'verification-v1';
+
+/** True when the recorded prompt identity is the legacy one without the omissions question. */
+export function isLegacyVerificationPrompt(promptVersion: string | undefined): boolean {
+  return typeof promptVersion === 'string' && promptVersion.startsWith(LEGACY_VERIFICATION_PROMPT_PREFIX);
 }
 
 /** Everything the reasoning validator needs; no editorial material exists by contract. */
@@ -337,12 +354,29 @@ function requireLocalEvidence(suggestion: AiTagSuggestion, where: string, contex
 
 /**
  * Parse one verification answer: exactly one verification per suggestion sent, no foreign,
- * missing or duplicated ids. Verifications are returned in the input suggestion order so the
- * resulting analysis identity stays deterministic.
+ * missing or duplicated ids, plus the **required** omissions answer of the current prompt.
+ *
+ * Verifications are returned in the input suggestion order so the resulting analysis identity
+ * stays deterministic. An empty suggestion list is legal: `verifications` must then be empty
+ * and only `missingSuggestions` may carry content, because the independent pass still had to
+ * scan the whole material.
+ *
+ * `missingSuggestions` uses exactly the analysis evidence/taxonomy rules (known taxonomy id,
+ * a literal excerpt of at least {@link MIN_EVIDENCE_EXCERPT_CHARS} characters from a shown
+ * solution), refuses malformed entries, refuses a tag the analysis already proposed (that
+ * suggestion must be verified instead) and refuses repeats. The entries are returned as
+ * `role: 'verification'` suggestions: they were invented by this pass, so they are never
+ * self-verified and always require manual review.
  */
 export function parseVerificationOutput(value: unknown, context: VerifyOutputContext): VerifyOutcome {
   const root = asRecord(value, 'verification output');
-  requireKeys(root, 'verification output', ['verifications']);
+  const legacy = isLegacyVerificationPrompt(context.promptVersion);
+  if (legacy) {
+    requireKeys(root, 'verification output', ['verifications'], ['missingSuggestions']);
+  } else {
+    // No silent legacy success under the current prompt: the omissions answer is mandatory.
+    requireKeys(root, 'verification output', ['verifications', 'missingSuggestions']);
+  }
   const entries = requireArray(root, 'verifications', 'verification output', context.suggestions.length);
   const byId = new Map(context.suggestions.map((suggestion) => [suggestion.suggestionId, suggestion]));
   const verified = new Map<string, SuggestionVerification>();
@@ -401,7 +435,60 @@ export function parseVerificationOutput(value: unknown, context: VerifyOutputCon
     }
     ordered.push(verification);
   }
-  return { verifications: ordered };
+  if (legacy && root.missingSuggestions === undefined) {
+    // A recorded legacy answer is replayed exactly as it was: no omissions answer exists, so
+    // the outcome carries no `missingSuggestions` and can never mark a run complete.
+    return { verifications: ordered };
+  }
+  return { verifications: ordered, missingSuggestions: parseMissingSuggestions(root, context) };
+}
+
+/**
+ * Parse the verifier's omissions list.
+ *
+ * Each entry follows the analyze contract (known taxonomy id, rationale, at least one literal
+ * excerpt from a shown solution). A tag the analysis already proposed is refused: it must be
+ * verified through the ordinary verification entry instead, so the two answers stay
+ * distinguishable. Repeats inside the list are refused rather than merged, because an
+ * omission repeated with different evidence is ambiguous about which citation is meant.
+ */
+function parseMissingSuggestions(root: Record<string, unknown>, context: VerifyOutputContext): AiTagSuggestion[] {
+  const entries = requireArray(root, 'missingSuggestions', 'verification output', MAX_ANALYSIS_SUGGESTIONS);
+  const proposed = new Set(context.suggestions.map((suggestion) => suggestion.taxonomyId));
+  const seen = new Set<string>();
+  const missing: AiTagSuggestion[] = [];
+  for (const [index, raw] of entries.entries()) {
+    const where = `missingSuggestions[${index}]`;
+    const entry = asRecord(raw, where);
+    requireKeys(entry, where, ['taxonomyId', 'rationale', 'evidence']);
+    const taxonomyId = requireText(entry, 'taxonomyId', where, MAX_ID_CHARS);
+    if (!context.taxonomy.has(taxonomyId)) {
+      fail('unknown_taxonomy_id', `${where}.taxonomyId is not in taxonomy ${context.taxonomy.taxonomy.version}`);
+    }
+    if (proposed.has(taxonomyId)) {
+      fail('duplicate_proposal', `${where}.taxonomyId ${taxonomyId} was already proposed by the analysis pass`);
+    }
+    if (seen.has(taxonomyId)) {
+      fail('duplicate_entry', `${where} repeats missing taxonomyId ${taxonomyId}`);
+    }
+    seen.add(taxonomyId);
+    const rationale = requireText(entry, 'rationale', where, MAX_RATIONALE_CHARS);
+    const evidence = parseEvidenceList(where, entry, context);
+    missing.push(
+      createAiTagSuggestion({
+        problemRef: context.snapshot.problem.ref,
+        snapshotId: context.snapshot.snapshotId,
+        taxonomyId,
+        // The pass that invented the tag never verifies it: `verification` output without a
+        // matching verification record always resolves to "needs manual review".
+        role: 'verification',
+        rationale,
+        evidence,
+        createdAt: context.now(),
+      }),
+    );
+  }
+  return missing;
 }
 
 /**

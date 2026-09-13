@@ -30,12 +30,29 @@
  *
  * A queued start answers with plain metadata; the work runs on the controller's **own** cancellation
  * token, never on the HTTP request's token, so a client abort after the acknowledgement cannot
- * cancel paid work while an explicit `batch.cancel`/`coaching.cancel` still can. The stored promise
+ * cancel paid work while an explicit `batch.cancel`/`coaching.cancel`/`plan.aiCancel` still can. The
+ * stored promise
  * is a containment barrier: it never rejects, it records the fixed safe error code of a background
  * failure and hands the raw failure only to the optional local diagnostic observer. Settled
  * operations are retained in bounded maps (oldest settled first out, active never pruned) so
- * `batch.detail` and `coaching.status` can report this instance's own view without re-reading a
- * log; a fulfilled coaching call is retained as its safe metadata projection only, never its body.
+ * `batch.detail`, `coaching.status` and `plan.aiStatus` can report this instance's own view without
+ * re-reading a log; a fulfilled coaching call is retained as its safe metadata projection only,
+ * never its body, and an AI planning run retains at most the stable code of a typed refusal.
+ *
+ * ## AI planning (Sprint 11d)
+ *
+ * The planning service arrives through {@link ModelOperationsOptions.planning} and its stored-plan
+ * projection through {@link ModelOperationsOptions.getPlan}; both are optional so an old isolated
+ * controller fixture still composes, and every `plan.*` operation then refuses with the typed
+ * `unavailable` code while host composition always installs them. `plan.aiPrepare` is free and holds
+ * the start/save gate for its whole preparation, so the settings it borrows cannot move under a
+ * local save. `plan.aiRun` captures the preparation's settings revision, checks the closed state,
+ * the current revision, the model probe and the reciprocal active/persisted work, and then creates
+ * the owned token and operation **before** releasing the gate; the paid call runs on that owned
+ * token. A live AI planning reservation blocks `batch.prepare`/`batch.run`/`batch.resume`, a new
+ * `coaching.ask` reservation and `settings.save`, and an AI start refuses active/persisted
+ * batch/coaching/other-plan work — while an expired reservation never blocks anything forever,
+ * because recovery is explicit (startup) and the reservation's own lease bounds it.
  *
  * ## Projections
  *
@@ -122,11 +139,36 @@ import {
   type ModelOperationErrorCode,
   type ModelOperationName,
   type ModelOperationStatusView,
+  type ModelPlanCancelRequest,
+  type ModelPlanCancelResult,
+  type ModelPlanHistoryRequest,
+  type ModelPlanHistoryResult,
+  type ModelPlanOperationView,
+  type ModelPlanPrepareRequest,
+  type ModelPlanPrepareResult,
+  type ModelPlanRunRequest,
+  type ModelPlanRunResult,
+  type ModelPlanStatusRequest,
+  type ModelPlanStatusResult,
   type ModelRoleModels,
   type ModelSettingsSaveRequest,
   type ModelSettingsSaveResult,
   type ModelValidationDiagnostic,
 } from '../application/model-operation-types.js';
+import {
+  MAX_PLANNING_HISTORY_LIMIT,
+  PlanningServiceError,
+  type PlanAttemptRequest,
+  type PlanAttemptStatusResult,
+  type PlanHistoryRequest,
+  type PlanPrepareRequest,
+  type PlanPrepareResult,
+  type PlanRunRequest,
+  type PlanRunResult,
+  type PlanningAttemptView,
+} from '../application/planning-service.js';
+import { MAX_PLANNING_REQUEST_ID_CHARS } from '../application/planning-types.js';
+import type { WorkbenchPlanView } from '../application/workbench-types.js';
 import {
   defaultWorkbenchSettings,
   validateWorkbenchSettings,
@@ -142,11 +184,42 @@ export type ModelOperationsStore = TrainingStore & SettingsStore & CoachingStore
 export interface ModelOperationFailureReport {
   readonly operation: ModelOperationName;
   readonly operationId: string;
-  /** Batch id or coaching request id the operation belongs to. */
+  /** Batch id, coaching request id or AI plan request id the operation belongs to. */
   readonly key: string;
   /** The original thrown value; never persisted and never returned by a projection. */
   readonly error: unknown;
 }
+
+/**
+ * Narrow structural surface of the accepted AI planning service this controller drives.
+ *
+ * The controller owns *when* a planning operation may start — the one gate, the captured settings
+ * revision, the model probe and the reciprocal exclusion — while the accepted service owns the
+ * durable preparation/reservation/settlement protocol. Keeping the surface narrow makes that split
+ * explicit and lets a fixture supply the real service without a second adapter.
+ */
+export interface ModelPlanningPort {
+  prepare(request: PlanPrepareRequest, token: CancellationToken): Promise<PlanPrepareResult>;
+  run(request: PlanRunRequest, token: CancellationToken): Promise<PlanRunResult>;
+  status(request: PlanAttemptRequest, token: CancellationToken): Promise<PlanAttemptStatusResult>;
+  cancel(request: PlanAttemptRequest, token: CancellationToken): Promise<PlanAttemptStatusResult>;
+  history(request: PlanHistoryRequest, token: CancellationToken): Promise<readonly PlanningAttemptView[]>;
+  /** `true` while any AI planning call is reserved and its lease has not expired. */
+  hasLiveReservation(token: CancellationToken): Promise<boolean>;
+  /** Recover expired orphans without dispatching or refunding a call. */
+  recoverExpiredReservations(token: CancellationToken): Promise<number>;
+}
+
+/**
+ * Spoiler-safe projection of one stored model plan, injected from the workbench service
+ * (`WorkbenchService.getPlan`) so no raw stored plan row ever travels through the controller.
+ */
+export type ModelPlanProjection = (
+  planId: string,
+  accountId: string,
+  reveal: boolean,
+  token: CancellationToken,
+) => Promise<WorkbenchPlanView>;
 
 export interface ModelOperationsOptions {
   readonly store: ModelOperationsStore;
@@ -170,6 +243,19 @@ export interface ModelOperationsOptions {
   readonly uniqueId: (prefix: string) => string;
   /** Optional local diagnostic sink for background failures; no public projection carries them. */
   readonly onInternalError?: (report: ModelOperationFailureReport) => void;
+  /**
+   * Accepted AI planning service (Sprint 11d).
+   *
+   * Optional only so an old isolated controller fixture still composes without planning: when it is
+   * absent, every `plan.*` operation refuses with the typed `unavailable` code. Host composition
+   * always installs it together with {@link ModelOperationsOptions.getPlan}.
+   */
+  readonly planning?: ModelPlanningPort;
+  /**
+   * Spoiler-safe projection of one stored model plan, injected from the workbench service. It must
+   * be supplied together with {@link ModelOperationsOptions.planning}.
+   */
+  readonly getPlan?: ModelPlanProjection;
   /** Bounded wait of {@link ModelOperations.close}; defaults to 5000 ms. */
   readonly closeWaitMs?: number;
 }
@@ -181,16 +267,29 @@ interface OwnedCoachingIdentity {
   readonly level: CoachingLevel;
 }
 
+/** Identity of an owned AI planning run, so one account can never read or repeat another's. */
+interface OwnedPlanIdentity {
+  readonly accountId: string;
+}
+
+/** Safe projection of one planning dispatch refusal; the service's own message never travels. */
+interface PlanRefusalView {
+  readonly code: string;
+  readonly retryable: boolean;
+}
+
 /** One owned background operation: the controller's own token, promise and settlement record. */
 interface OwnedOperation {
   readonly operation: ModelOperationName;
   readonly operationId: string;
-  /** Batch id (`batch.*`) or coaching request id (`coaching.ask`). */
+  /** Batch id (`batch.*`), coaching request id (`coaching.ask`) or AI plan request id (`plan.aiRun`). */
   readonly key: string;
   readonly source: ReturnType<typeof createCancellationSource>;
   /** Pipeline that owns the live run, so pause/cancel can signal that exact instance. */
   readonly pipeline: AnalysisPipeline | null;
   readonly coaching: OwnedCoachingIdentity | null;
+  /** Owned AI planning identity; `null` for every other operation. */
+  readonly plan: OwnedPlanIdentity | null;
   readonly settingsRevision: number | null;
   readonly startedAt: string;
   settled: boolean;
@@ -198,6 +297,8 @@ interface OwnedOperation {
   errorCode: string | null;
   /** Fixed safe projection of a fulfilled coaching call; never a hint body. */
   coachingResult: ModelCoachingAskResult | null;
+  /** Stable code/retryability of a typed planning refusal; never a message, payload or usage body. */
+  planRefusal: PlanRefusalView | null;
   /** Never rejects; see {@link ModelOperations.launch}. */
   promise: Promise<void> | null;
 }
@@ -207,6 +308,18 @@ interface ResolvedProblem {
   readonly snapshotId: string;
   /** `null` when the head references a snapshot row that is not readable. */
   readonly snapshot: ProblemSnapshot | null;
+}
+
+/**
+ * One selected problem that cannot be analysed yet because it has no material snapshot.
+ *
+ * It is reported as an explicit blocked entry rather than rejecting the whole selection or
+ * fabricating an empty snapshot; the rest of the selection is still prepared.
+ */
+interface BlockedProblem {
+  readonly problemKey: string;
+  readonly reason: 'material_missing';
+  readonly action: 'refresh_materials';
 }
 
 /**
@@ -246,12 +359,16 @@ export class ModelOperations {
   private readonly now: () => string;
   private readonly uniqueId: (prefix: string) => string;
   private readonly onInternalError: ((report: ModelOperationFailureReport) => void) | undefined;
+  private readonly planning: ModelPlanningPort | undefined;
+  private readonly getPlan: ModelPlanProjection | undefined;
   private readonly closeWaitMs: number;
   private readonly gate = new StartGate();
   private ownedBatch: OwnedOperation | null = null;
   private ownedCoaching: OwnedOperation | null = null;
+  private ownedPlan: OwnedOperation | null = null;
   private readonly settledBatches = new Map<string, OwnedOperation>();
   private readonly settledCoaching = new Map<string, OwnedOperation>();
+  private readonly settledPlans = new Map<string, OwnedOperation>();
   private closed = false;
   /** The one close attempt every caller shares; see {@link ModelOperations.close}. */
   private closing: Promise<ModelOperationCloseReport> | null = null;
@@ -278,6 +395,15 @@ export class ModelOperations {
     if (options.onInternalError !== undefined && typeof options.onInternalError !== 'function') {
       throw new TypeError('ModelOperationsOptions.onInternalError must be a function when supplied');
     }
+    if ((options.planning === undefined) !== (options.getPlan === undefined)) {
+      throw new TypeError('ModelOperationsOptions.planning and getPlan must be supplied together');
+    }
+    if (options.planning !== undefined && (options.planning === null || typeof options.planning !== 'object')) {
+      throw new TypeError('ModelOperationsOptions.planning must be the accepted planning service');
+    }
+    if (options.getPlan !== undefined && typeof options.getPlan !== 'function') {
+      throw new TypeError('ModelOperationsOptions.getPlan must be a projection function when supplied');
+    }
     const closeWaitMs = options.closeWaitMs ?? 5000;
     if (!Number.isSafeInteger(closeWaitMs) || closeWaitMs < 1) {
       throw new TypeError('ModelOperationsOptions.closeWaitMs must be a positive integer');
@@ -289,6 +415,8 @@ export class ModelOperations {
     this.now = options.now;
     this.uniqueId = options.uniqueId;
     this.onInternalError = options.onInternalError;
+    this.planning = options.planning;
+    this.getPlan = options.getPlan;
     this.closeWaitMs = closeWaitMs;
   }
 
@@ -330,6 +458,7 @@ export class ModelOperations {
       if (this.activeOperations().length > 0) {
         throw busyFailure('an owned model operation is still running');
       }
+      await this.requireNoLivePlan(cancellation);
       let value: WorkbenchSettings;
       try {
         value = validateWorkbenchSettings(request.value);
@@ -361,6 +490,7 @@ export class ModelOperations {
           if (inside !== null) {
             throw busyFailure(`${inside} is still running`);
           }
+          await this.requireNoLivePlan(cancellation);
           cancellation.throwIfCancelled();
           const saved = await this.store.saveWorkbenchSettings(value, expectedRevision);
           // After the write: a cancellation observed here rolls the transaction back, so settings
@@ -384,30 +514,41 @@ export class ModelOperations {
   /**
    * Resolve real current snapshots and prepare a batch for them.
    *
-   * Missing problems (`not_found`) and problems without a current snapshot head (`conflict`) are
-   * refused before any batch state is written. The batch captures the settings limits in force at
-   * this moment, and finished jobs are reported as `alreadyDone` instead of being reset.
+   * A missing problem (`not_found`) is refused before any batch state is written. A problem
+   * without a current snapshot head is **not** a whole-selection failure: it is reported in
+   * `blocked` with an explicit refresh action, no job is created for it and no model call can
+   * reach it. The remaining, resolvable problems are prepared normally, so no selection is
+   * silently dropped and none is silently paid for.
+   *
+   * The batch captures the settings limits in force at this moment, and finished jobs are
+   * reported as `alreadyDone` only while their stored success carries a current completeness
+   * check; legacy successes and explicit `reanalyze` requests become `reruns` instead.
    */
   async prepareBatch(request: ModelBatchPrepareRequest, token: CancellationToken): Promise<ModelBatchPrepareResult> {
     const cancellation = requireToken(token);
     const problemKeys = requireProblemKeys(request);
     const maxJobs = requireMaxJobs(request?.maxJobs);
+    const reanalyze = requireFlag('reanalyze', request?.reanalyze);
     if (!this.gate.tryAcquire()) {
       throw busyFailure('another model operation is already starting or saving settings');
     }
     try {
       this.assertOpen();
       cancellation.throwIfCancelled();
+      await this.requireNoLivePlan(cancellation);
       const record = await this.effectiveSettings();
       cancellation.throwIfCancelled();
-      const resolved = await this.resolveCurrentSnapshots(problemKeys, cancellation);
+      const { resolved, blocked } = await this.resolveCurrentSnapshots(problemKeys, cancellation);
       const limits = batchLimitsOf(record.value);
-      const pipeline = this.createPipeline(record);
-      const prepared = await pipeline.prepareBatch(
-        resolved.map((entry) => entry.snapshotId),
-        { maxJobs, limits },
-      );
-      return prepareResult(prepared, resolved, record, limits);
+      // Nothing analysable was selected: no batch is created, so nothing can be run or paid for.
+      const prepared: PreparedBatch =
+        resolved.length === 0
+          ? { batch: null, alreadyDone: [], reruns: [] }
+          : await this.createPipeline(record).prepareBatch(
+              resolved.map((entry) => entry.snapshotId),
+              { maxJobs, limits, reanalyze },
+            );
+      return prepareResult(prepared, resolved, record, limits, blocked);
     } finally {
       this.gate.release();
     }
@@ -701,6 +842,285 @@ export class ModelOperations {
   }
 
   // -------------------------------------------------------------------------------------
+  // AI planning (Sprint 11d)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * `plan.aiPrepare`: free, durable preparation of one account's AI plan input.
+   *
+   * The start/save gate is held for the whole preparation, so the settings record the preparation
+   * borrows cannot move under a local `settings.save` (that save is refused with `model_busy`); the
+   * accepted service confirms the same revision inside its own transaction, so a change made by
+   * another process refuses as `settings_changed` instead of being silently absorbed. Nothing is
+   * dispatched, nothing is charged, and a service refusal is returned as the typed `refused`
+   * outcome rather than thrown.
+   */
+  async planPrepare(request: ModelPlanPrepareRequest, token: CancellationToken): Promise<ModelPlanPrepareResult> {
+    const cancellation = requireToken(token);
+    const { planning } = this.requirePlanning();
+    if (!this.gate.tryAcquire()) {
+      throw busyFailure('another model operation is already starting or saving settings');
+    }
+    try {
+      this.assertOpen();
+      cancellation.throwIfCancelled();
+      return await this.planningCall(() => planning.prepare(request, cancellation));
+    } finally {
+      this.gate.release();
+    }
+  }
+
+  /**
+   * `plan.aiRun`: acknowledge one paid AI planning call and run it on an owned token.
+   *
+   * Refusals decided here happen before any dispatch: the request must name a durable preparation
+   * (`not_found` otherwise), the captured `expectedSettingsRevision` must still be the stored one
+   * (`settings_changed`), the model probe must not report a blocking diagnostic (`model_invalid`),
+   * and another owned or persisted batch/coaching/plan operation must not be active (`model_busy`).
+   * An owned repeat of the same request id, and a durable attempt that is no longer `prepared`, are
+   * answered from metadata without a second model probe or a second paid call. The acknowledged run
+   * continues on the controller's own token, so a client abort after the answer cannot cancel it.
+   */
+  async planRun(request: ModelPlanRunRequest, token: CancellationToken): Promise<ModelPlanRunResult> {
+    const cancellation = requireToken(token);
+    const run = parsePlanRun(request);
+    const { planning } = this.requirePlanning();
+    if (!this.gate.tryAcquire()) {
+      throw busyFailure('another model operation is already starting or saving settings');
+    }
+    try {
+      this.assertOpen();
+      cancellation.throwIfCancelled();
+      const owned = this.ownedPlan;
+      if (owned !== null && owned.key === run.requestId) {
+        // An owned repeat of the very request this instance is running: same answer, no new probe.
+        assertPlanIdentity(owned, run.accountId);
+        return planRunResult(run, this.planOperationViewOf(owned), null);
+      }
+      if (this.activeOperations().length > 0) {
+        throw busyFailure('another owned model operation is still running');
+      }
+      const known = await this.planningCall(() => planning.status({ requestId: run.requestId, accountId: run.accountId }, cancellation));
+      cancellation.throwIfCancelled();
+      if (known.status === 'unknown') {
+        throw new ModelOperationError(
+          'not_found',
+          'the AI plan request was never prepared; prepare it before a paid run',
+        );
+      }
+      if (known.attempt.status !== 'prepared') {
+        // A reserved, settled, uncertain or cancelled attempt is its own durable audit: returning it
+        // needs no settings revision and no model probe, and never dispatches a second paid call.
+        return planRunResult(run, this.planOperationView(run.requestId, run.accountId), known.attempt);
+      }
+      // The attempt itself is `prepared`, so any live reservation belongs to another AI plan call.
+      await this.requireNoLivePlan(cancellation);
+      const blocking = await this.findLivePersistedOperation(cancellation);
+      if (blocking !== null) {
+        throw busyFailure(`${blocking} is still running`);
+      }
+      const record = await this.requireCurrentSettings(run.expectedSettingsRevision, cancellation);
+      await this.requireValidModels(record.value, cancellation);
+      cancellation.throwIfCancelled();
+      // Re-checked synchronously right before the launch: a close that landed while the settings
+      // were read must not let new paid work start.
+      this.assertOpen();
+      const source = createCancellationSource();
+      const operation: OwnedOperation = {
+        operation: 'plan.aiRun',
+        operationId: this.uniqueId('model-op'),
+        key: run.requestId,
+        source,
+        pipeline: null,
+        coaching: null,
+        plan: { accountId: run.accountId },
+        settingsRevision: record.revision,
+        startedAt: this.now(),
+        settled: false,
+        settledAt: null,
+        errorCode: null,
+        coachingResult: null,
+        planRefusal: null,
+        promise: null,
+      };
+      this.ownedPlan = operation;
+      this.launch(operation, this.runPlanDispatch(planning, run, source.token, operation));
+      return planRunResult(run, this.planOperationViewOf(operation), known.attempt);
+    } finally {
+      this.gate.release();
+    }
+  }
+
+  /**
+   * `plan.aiStatus`: durable attempt metadata plus this instance's own operation and the stored plan.
+   *
+   * The accepted service owns account scoping and spoiler discipline, so an attempt of another
+   * account answers exactly like an unknown id and this instance's operation view is attached only
+   * when the caller's account is the one the run was started for. A planned attempt is projected
+   * through the injected workbench callback (never the raw stored row); its failure propagates as
+   * the workbench's own typed failure instead of being reported as a plan that does not exist.
+   */
+  async planStatus(request: ModelPlanStatusRequest, token: CancellationToken): Promise<ModelPlanStatusResult> {
+    const cancellation = requireToken(token);
+    const read = parsePlanStatus(request);
+    const { planning, getPlan } = this.requirePlanning();
+    cancellation.throwIfCancelled();
+    this.assertOpen();
+    // A restart before lease expiry must not leave later status polls reserved forever.
+    // This instance's live work settles itself; only unowned expired reservations are recovered.
+    if (this.ownedPlan === null) await this.planningCall(() => planning.recoverExpiredReservations(cancellation));
+    const durable = await this.planningCall(() =>
+      planning.status({ requestId: read.requestId, accountId: read.accountId }, cancellation),
+    );
+    cancellation.throwIfCancelled();
+    const operation = this.planOperationView(read.requestId, read.accountId);
+    if (durable.status === 'unknown') {
+      return {
+        status: 'unknown',
+        requestId: read.requestId,
+        accountId: read.accountId,
+        attempt: null,
+        operation,
+        plan: null,
+        verification: 'unverified_ai',
+      };
+    }
+    const planId = durable.attempt.planId;
+    const plan =
+      planId === null
+        ? null
+        : await this.planningCall(() => getPlan(planId, read.accountId, read.reveal, cancellation));
+    return {
+      status: 'found',
+      requestId: read.requestId,
+      accountId: read.accountId,
+      attempt: durable.attempt,
+      operation,
+      plan,
+      verification: 'unverified_ai',
+    };
+  }
+
+  /**
+   * `plan.aiCancel`: cancel this instance's own run first, then let the service answer.
+   *
+   * The owned token is cancelled **before** the service call, so a reservation that is already being
+   * written settles with its real usage instead of being stranded. The service call itself only
+   * abandons a `prepared` attempt (known-zero, free); it never rewrites a `reserved` attempt, never
+   * refunds a known cost and never claims a settlement it did not observe. A request this instance
+   * does not own is reported with `cancelled: false` and its durable status.
+   */
+  async planCancel(request: ModelPlanCancelRequest, token: CancellationToken): Promise<ModelPlanCancelResult> {
+    const cancellation = requireToken(token);
+    const read = parsePlanAttemptRequest(request);
+    const { planning } = this.requirePlanning();
+    cancellation.throwIfCancelled();
+    this.assertOpen();
+    const owned = this.ownedPlan;
+    const mine = owned !== null && owned.key === read.requestId;
+    if (mine && owned !== null) {
+      assertPlanIdentity(owned, read.accountId);
+      owned.source.cancel('AI plan request cancelled by the user');
+    }
+    const durable = await this.planningCall(() =>
+      planning.cancel({ requestId: read.requestId, accountId: read.accountId }, cancellation),
+    );
+    return {
+      requestId: read.requestId,
+      accountId: read.accountId,
+      cancelled: mine,
+      status: durable.status === 'unknown' ? 'unknown' : durable.attempt.status,
+      operation: this.planOperationView(read.requestId, read.accountId),
+      verification: 'unverified_ai',
+    };
+  }
+
+  /**
+   * `plan.aiHistory`: one bounded, account-scoped, newest-first page of attempt metadata.
+   *
+   * The read is the service's own audit projection, so a refreshed UI can recover the request ids it
+   * no longer has in memory and then replay `plan.aiPrepare` for free to read the captured settings
+   * revision. No preparation, candidate pool, tag, ability aggregate or plan body is carried.
+   */
+  async planHistory(request: ModelPlanHistoryRequest, token: CancellationToken): Promise<ModelPlanHistoryResult> {
+    const cancellation = requireToken(token);
+    const read = parsePlanHistory(request);
+    const { planning } = this.requirePlanning();
+    cancellation.throwIfCancelled();
+    this.assertOpen();
+    if (this.ownedPlan === null) await this.planningCall(() => planning.recoverExpiredReservations(cancellation));
+    const items = await this.planningCall(() => planning.history(read, cancellation));
+    return { items, total: items.length };
+  }
+
+  /**
+   * Background paid run of one accepted AI planning start.
+   *
+   * A typed dispatch refusal (quota, staleness, another live reservation, a preparation that moved)
+   * is retained as its stable code and retryability only: the service's prose, the preparation and
+   * the model answer never enter an owned map. The returned promise never rejects; a thrown failure
+   * is recorded by {@link ModelOperations.launch} as a fixed safe code.
+   */
+  private async runPlanDispatch(
+    planning: ModelPlanningPort,
+    request: ParsedPlanRun,
+    token: CancellationToken,
+    owned: OwnedOperation,
+  ): Promise<void> {
+    const result = await planning.run(
+      {
+        requestId: request.requestId,
+        accountId: request.accountId,
+        expectedSettingsRevision: request.expectedSettingsRevision,
+      },
+      token,
+    );
+    if (result.outcome === 'refused' && result.error !== null) {
+      owned.planRefusal = { code: result.error.code, retryable: result.error.retryable };
+    }
+  }
+
+  /**
+   * Refuse a non-plan start/save while this instance owns an AI planning run or *any* persisted
+   * planning reservation is still live.
+   *
+   * Read-only: it never recovers, settles, refunds or relabels the reservation it reports. An
+   * expired reservation never blocks configuration forever — the accepted service converts it on its
+   * next reservation or on startup recovery, and nothing here changes that record.
+   */
+  private async requireNoLivePlan(token: CancellationToken): Promise<void> {
+    const planning = this.planning;
+    if (planning === undefined) {
+      return;
+    }
+    if (this.ownedPlan !== null) {
+      throw busyFailure('an owned AI plan run is still active');
+    }
+    const live = await this.planningCall(() => planning.hasLiveReservation(token));
+    token.throwIfCancelled();
+    if (live) {
+      throw busyFailure('an AI plan call is reserved');
+    }
+  }
+
+  /** The installed planning service plus its plan projection; a typed `unavailable` refusal else. */
+  private requirePlanning(): { readonly planning: ModelPlanningPort; readonly getPlan: ModelPlanProjection } {
+    if (this.planning === undefined || this.getPlan === undefined) {
+      throw new ModelOperationError('unavailable', 'AI planning is not installed in this host composition');
+    }
+    return { planning: this.planning, getPlan: this.getPlan };
+  }
+
+  /** Wrap one accepted planning-service call so its typed failures surface as controller codes. */
+  private async planningCall<T>(work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (error) {
+      throw mapPlanningFailure(error);
+    }
+  }
+
+  // -------------------------------------------------------------------------------------
   // Disposal
   // -------------------------------------------------------------------------------------
 
@@ -759,6 +1179,9 @@ export class ModelOperations {
     for (const operation of this.settledCoaching.values()) {
       settled.push(operation.operationId);
     }
+    for (const operation of this.settledPlans.values()) {
+      settled.push(operation.operationId);
+    }
     return { settled, outstanding: [] };
   }
 
@@ -783,6 +1206,7 @@ export class ModelOperations {
       if (this.ownedBatch !== null) {
         throw busyFailure('an owned batch is already running');
       }
+      await this.requireNoLivePlan(token);
       const batch = await this.store.getBatch(batchId);
       token.throwIfCancelled();
       if (batch === null) {
@@ -803,12 +1227,14 @@ export class ModelOperations {
         source,
         pipeline,
         coaching: null,
+        plan: null,
         settingsRevision: record.revision,
         startedAt: this.now(),
         settled: false,
         settledAt: null,
         errorCode: null,
         coachingResult: null,
+        planRefusal: null,
         promise: null,
       };
       this.ownedBatch = owned;
@@ -847,6 +1273,9 @@ export class ModelOperations {
         // settings revision and no model probe: an idempotent answer stays readable after a change.
         return { kind: 'replay' };
       }
+      // Only a *new* reservation is excluded from starting while AI planning is active or reserved;
+      // a durable replay above stays free and readable.
+      await this.requireNoLivePlan(token);
       if (this.ownedCoaching !== null) {
         throw busyFailure('an owned coaching call is already running');
       }
@@ -862,12 +1291,14 @@ export class ModelOperations {
         source,
         pipeline: null,
         coaching: { accountId: ask.accountId, problemKey: ask.problemKey, level: ask.level },
+        plan: null,
         settingsRevision: record.revision,
         startedAt: this.now(),
         settled: false,
         settledAt: null,
         errorCode: null,
         coachingResult: null,
+        planRefusal: null,
         promise: null,
       };
       this.ownedCoaching = owned;
@@ -935,7 +1366,15 @@ export class ModelOperations {
     if (this.ownedCoaching === owned) {
       this.ownedCoaching = null;
     }
-    const target = owned.operation === 'coaching.ask' ? this.settledCoaching : this.settledBatches;
+    if (this.ownedPlan === owned) {
+      this.ownedPlan = null;
+    }
+    const target =
+      owned.operation === 'coaching.ask'
+        ? this.settledCoaching
+        : owned.operation === 'plan.aiRun'
+          ? this.settledPlans
+          : this.settledBatches;
     target.set(owned.key, owned);
     while (target.size > MAX_SETTLED_MODEL_OPERATIONS) {
       const oldest = target.keys().next();
@@ -1014,15 +1453,18 @@ export class ModelOperations {
   /**
    * Resolve every requested problem to its stored current snapshot.
    *
-   * A missing problem is `not_found`; a problem whose material was never frozen is `conflict`. The
-   * snapshot body is read only to summarise availability — a head whose row is unreadable is counted
-   * as an error and left for the pipeline's own `missing_reference` refusal.
+   * A missing problem is `not_found`; a problem whose material was never frozen is reported as
+   * a `blocked` entry (`material_missing` + `refresh_materials`) so the caller can keep the rest
+   * of the selection. The snapshot body is read only to summarise availability — a head whose
+   * row is unreadable is counted as an error and left for the pipeline's own
+   * `missing_reference` refusal.
    */
   private async resolveCurrentSnapshots(
     problemKeys: readonly string[],
     token: CancellationToken,
-  ): Promise<readonly ResolvedProblem[]> {
+  ): Promise<{ readonly resolved: readonly ResolvedProblem[]; readonly blocked: readonly BlockedProblem[] }> {
     const resolved: ResolvedProblem[] = [];
+    const blocked: BlockedProblem[] = [];
     for (const key of problemKeys) {
       const problem = await this.store.getProblem(key);
       if (problem === null) {
@@ -1031,10 +1473,10 @@ export class ModelOperations {
       const head = await this.store.getCurrentSnapshotHead(problem.ref);
       token.throwIfCancelled();
       if (head === null) {
-        throw new ModelOperationError(
-          'conflict',
-          'a requested problem has no current snapshot; refresh its material first',
-        );
+        // An honest, explicit block instead of a fabricated metadata-only snapshot: nothing was
+        // captured for this problem, so claiming a snapshot would invent material.
+        blocked.push({ problemKey: key, reason: 'material_missing', action: 'refresh_materials' });
+        continue;
       }
       resolved.push({
         problemKey: key,
@@ -1043,7 +1485,7 @@ export class ModelOperations {
       });
       token.throwIfCancelled();
     }
-    return resolved;
+    return { resolved, blocked };
   }
 
   /**
@@ -1162,6 +1604,36 @@ export class ModelOperations {
   }
 
   /**
+   * This instance's own metadata view of one AI planning run, or `null`.
+   *
+   * Attached only when the requested account is exactly the account the run was started for, so one
+   * account can never read another's operation state. The view carries no preparation, candidate
+   * pool, plan body or refusal message — only identity, lifecycle, the captured revision and a
+   * stable code.
+   */
+  private planOperationView(requestId: string, accountId: string): ModelPlanOperationView | null {
+    const owned = (this.ownedPlan?.key === requestId ? this.ownedPlan : this.settledPlans.get(requestId)) ?? null;
+    if (owned === null || owned.key !== requestId || owned.plan === null || owned.plan.accountId !== accountId) {
+      return null;
+    }
+    return this.planOperationViewOf(owned);
+  }
+
+  /** Metadata projection of one owned AI planning run; never a plan body, refusal text or usage. */
+  private planOperationViewOf(owned: OwnedOperation): ModelPlanOperationView {
+    return {
+      operationId: owned.operationId,
+      operation: 'plan.aiRun',
+      state: owned.settled ? 'settled' : 'running',
+      startedAt: owned.startedAt,
+      settledAt: owned.settledAt,
+      settingsRevision: owned.settingsRevision,
+      errorCode: owned.errorCode ?? owned.planRefusal?.code ?? null,
+      retryable: owned.errorCode === null ? (owned.planRefusal?.retryable ?? null) : null,
+    };
+  }
+
+  /**
    * This instance's own metadata view of one coaching request, or `null`.
    *
    * Attached only when the caller's account and problem are exactly the identity the operation was
@@ -1227,6 +1699,9 @@ export class ModelOperations {
     }
     if (this.ownedCoaching !== null) {
       active.push(this.ownedCoaching);
+    }
+    if (this.ownedPlan !== null) {
+      active.push(this.ownedPlan);
     }
     return active;
   }
@@ -1357,6 +1832,136 @@ function assertCoachingIdentity(owned: OwnedOperation, identity: ParsedCoachingI
   }
 }
 
+interface ParsedPlanRun {
+  readonly requestId: string;
+  readonly accountId: string;
+  readonly expectedSettingsRevision: number;
+}
+
+interface ParsedPlanStatus {
+  readonly requestId: string;
+  readonly accountId: string;
+  readonly reveal: boolean;
+}
+
+interface ParsedPlanAttempt {
+  readonly requestId: string;
+  readonly accountId: string;
+}
+
+/** Closed key sets of the planning operations; an undeclared member is refused, never ignored. */
+const PLAN_RUN_KEYS: readonly string[] = ['requestId', 'accountId', 'expectedSettingsRevision'];
+const PLAN_STATUS_KEYS: readonly string[] = ['requestId', 'accountId', 'reveal'];
+const PLAN_ATTEMPT_KEYS: readonly string[] = ['requestId', 'accountId'];
+const PLAN_HISTORY_KEYS: readonly string[] = ['accountId', 'limit'];
+
+function parsePlanRun(request: ModelPlanRunRequest | null | undefined): ParsedPlanRun {
+  rejectUnknownKeys('the AI plan run request', request, PLAN_RUN_KEYS);
+  if (request === null || typeof request !== 'object') {
+    throw new ModelOperationError('invalid_input', 'an AI plan run needs a request object');
+  }
+  return {
+    requestId: requirePlanningRequestId(request.requestId),
+    accountId: requirePlanningAccountId(request.accountId),
+    // Required and strictly positive at this boundary: a run is only ever validated against a
+    // concrete stored revision the caller actually read.
+    expectedSettingsRevision: requireSettingsRevision(request.expectedSettingsRevision),
+  };
+}
+
+function parsePlanStatus(request: ModelPlanStatusRequest | null | undefined): ParsedPlanStatus {
+  rejectUnknownKeys('the AI plan status request', request, PLAN_STATUS_KEYS);
+  if (request === null || typeof request !== 'object') {
+    throw new ModelOperationError('invalid_input', 'an AI plan status read needs a request object');
+  }
+  if (request.reveal !== undefined && typeof request.reveal !== 'boolean') {
+    throw new ModelOperationError('invalid_input', 'reveal must be boolean when supplied');
+  }
+  return {
+    requestId: requirePlanningRequestId(request.requestId),
+    accountId: requirePlanningAccountId(request.accountId),
+    reveal: request.reveal === true,
+  };
+}
+
+function parsePlanAttemptRequest(request: ModelPlanCancelRequest | null | undefined): ParsedPlanAttempt {
+  rejectUnknownKeys('the AI plan request', request, PLAN_ATTEMPT_KEYS);
+  if (request === null || typeof request !== 'object') {
+    throw new ModelOperationError('invalid_input', 'an AI plan read needs a request object');
+  }
+  return {
+    requestId: requirePlanningRequestId(request.requestId),
+    accountId: requirePlanningAccountId(request.accountId),
+  };
+}
+
+function parsePlanHistory(request: ModelPlanHistoryRequest | null | undefined): PlanHistoryRequest {
+  rejectUnknownKeys('the AI plan history request', request, PLAN_HISTORY_KEYS);
+  if (request === null || typeof request !== 'object') {
+    throw new ModelOperationError('invalid_input', 'an AI plan history read needs a request object');
+  }
+  const limit = request.limit;
+  if (limit !== undefined && limit !== null) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PLANNING_HISTORY_LIMIT) {
+      throw new ModelOperationError(
+        'invalid_input',
+        `the AI plan history limit must be an integer within 1..${MAX_PLANNING_HISTORY_LIMIT}`,
+      );
+    }
+  }
+  return {
+    accountId: requirePlanningAccountId(request.accountId),
+    ...(limit === undefined ? {} : { limit }),
+  };
+}
+
+/** Refuse an undeclared own member of one planning request instead of silently ignoring it. */
+function rejectUnknownKeys(label: string, request: unknown, keys: readonly string[]): void {
+  if (request === null || typeof request !== 'object') {
+    return;
+  }
+  const unknown = Object.keys(request).filter((key) => !keys.includes(key));
+  if (unknown.length > 0) {
+    throw new ModelOperationError('invalid_input', `${label} has unknown keys: ${unknown.join(', ')}`);
+  }
+}
+
+function requirePlanningRequestId(value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0 || value.length > MAX_PLANNING_REQUEST_ID_CHARS) {
+    throw new ModelOperationError('invalid_input', 'requestId must be a non-empty bounded string');
+  }
+  return value;
+}
+
+function requirePlanningAccountId(value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new ModelOperationError('invalid_input', 'accountId must be a non-empty stored account id');
+  }
+  return value;
+}
+
+/** Identity check of a repeat start/cancel against the AI planning operation this instance owns. */
+function assertPlanIdentity(owned: OwnedOperation, accountId: string): void {
+  if (owned.plan === null || owned.plan.accountId !== accountId) {
+    throw new ModelOperationError('conflict', 'the request id already belongs to another AI plan request');
+  }
+}
+
+/** Acknowledgement of one paid planning start/replay; both members are metadata-only. */
+function planRunResult(
+  request: ParsedPlanRun,
+  operation: ModelPlanOperationView | null,
+  attempt: PlanningAttemptView | null,
+): ModelPlanRunResult {
+  return {
+    requestId: request.requestId,
+    accountId: request.accountId,
+    operation,
+    attempt,
+    verification: 'unverified_ai',
+  };
+}
+
 /** Service request built field by field; an absent optional flag is omitted, never `undefined`. */
 function serviceAsk(ask: ParsedCoachingAsk): CoachingAskRequest {
   return {
@@ -1424,6 +2029,7 @@ function prepareResult(
   resolved: readonly ResolvedProblem[],
   record: WorkbenchSettingsRecord,
   limits: AnalysisBatchLimits,
+  blocked: readonly BlockedProblem[],
 ): ModelBatchPrepareResult {
   const keyBySnapshot = new Map(resolved.map((entry) => [entry.snapshotId, entry.problemKey] as const));
   const batch = prepared.batch;
@@ -1446,6 +2052,18 @@ function prepareResult(
     availability,
     jobs,
     alreadyDone: (prepared.alreadyDone ?? []).map(alreadyDoneView),
+    reruns: (prepared.reruns ?? []).map((entry) => ({
+      jobId: entry.jobId,
+      snapshotId: entry.snapshotId,
+      previousJobId: entry.previousJobId,
+      previousStatus: entry.previousStatus,
+      reason: entry.reason,
+    })),
+    blocked: blocked.map((entry) => ({
+      problemKey: entry.problemKey,
+      reason: entry.reason,
+      action: entry.action,
+    })),
   };
 }
 
@@ -1486,7 +2104,14 @@ function alreadyDoneView(entry: {
   readonly status: ModelBatchJobSummary['status'];
   readonly analysisId: string | null;
 }): ModelBatchJobSummary {
-  return { jobId: entry.jobId, snapshotId: entry.snapshotId, status: entry.status, analysisId: entry.analysisId };
+  return {
+    jobId: entry.jobId,
+    snapshotId: entry.snapshotId,
+    status: entry.status,
+    analysisId: entry.analysisId,
+    // Only a current completeness check is ever reported as already done.
+    completeness: 'current',
+  };
 }
 
 function batchSummary(batch: AnalysisBatch): ModelBatchSummaryView {
@@ -1605,6 +2230,9 @@ function safeErrorCode(error: unknown): ModelOperationErrorCode {
   if (error instanceof CoachingServiceError) {
     return coachingFailureCode(error.code);
   }
+  if (error instanceof PlanningServiceError) {
+    return planningFailureCode(error.code);
+  }
   if (error instanceof DomainError) {
     return DOMAIN_FAILURE_CODES[error.code] ?? 'internal';
   }
@@ -1630,6 +2258,43 @@ function mapCoachingFailure(error: unknown): unknown {
     return error;
   }
   return new ModelOperationError(coachingFailureCode(error.code), COACHING_FAILURE_MESSAGES[error.code], {
+    retryable: false,
+    cause: error,
+  });
+}
+
+/** Fixed safe messages of the planning-service failures this controller re-codes. */
+const PLANNING_FAILURE_MESSAGES = {
+  invalid_request: 'the AI plan request is invalid',
+  request_conflict: 'the request id already belongs to another AI plan request',
+  unknown_request: 'the AI plan request is not known for this account',
+  history_overflow: 'the AI plan history exceeds the readable bound',
+  storage_inconsistent: 'the stored AI plan record is inconsistent',
+} as const;
+
+function planningFailureCode(code: PlanningServiceError['code']): ModelOperationErrorCode {
+  switch (code) {
+    case 'invalid_request':
+      return 'invalid_input';
+    case 'request_conflict':
+      return 'conflict';
+    case 'unknown_request':
+      return 'not_found';
+    case 'history_overflow':
+      return 'history_overflow';
+    default:
+      // `storage_inconsistent`: a durable row that contradicts its own protocol is an internal
+      // failure, never something a caller can fix by retrying a different request.
+      return 'internal';
+  }
+}
+
+/** Re-code an accepted planning-service failure onto the controller's stable vocabulary. */
+function mapPlanningFailure(error: unknown): unknown {
+  if (!(error instanceof PlanningServiceError)) {
+    return error;
+  }
+  return new ModelOperationError(planningFailureCode(error.code), PLANNING_FAILURE_MESSAGES[error.code], {
     retryable: false,
     cause: error,
   });
@@ -1756,6 +2421,17 @@ function requireMaxJobs(value: unknown): number {
   }
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > MAX_MODEL_BATCH_PROBLEMS) {
     throw new ModelOperationError('invalid_input', `maxJobs must be an integer within 1..${MAX_MODEL_BATCH_PROBLEMS}`);
+  }
+  return value;
+}
+
+/** Optional boolean request flag; an undeclared type is refused instead of coerced. */
+function requireFlag(label: string, value: unknown): boolean {
+  if (value === undefined) {
+    return false;
+  }
+  if (typeof value !== 'boolean') {
+    throw new ModelOperationError('invalid_input', `${label} must be boolean when supplied`);
   }
   return value;
 }
