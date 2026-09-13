@@ -267,7 +267,10 @@ void test('the payload carries the ability summary and the prepared candidates o
   assert.deepEqual(Object.keys(payload), ['task', 'settings', 'ability', 'weakness', 'candidates']);
   assert.equal(payload.task, 'training_plan');
   assert.deepEqual(payload.settings, { horizonDays: 7, minutesPerDay: 60, maxTasksPerDay: 3, estimatedMinutes: 30 });
-  assert.deepEqual(payload.ability, ABILITY, 'the real identifier-free 11a aggregate is sent unchanged');
+  assert.deepEqual(payload.ability, ABILITY, 'the real identifier-free aggregate is sent unchanged');
+  assert.deepEqual((payload.ability as typeof ABILITY).history, ABILITY.history, 'all-time/recent/earlier history is sent with the aggregate');
+  assert.equal(ABILITY.history?.periods.length, 3);
+  assert.match(PLANNING_SYSTEM_PROMPT, /历史积累不能因近期样本充足而忽略/);
   assert.deepEqual(payload.weakness, {
     attemptedDistinctTotal: 12,
     weakTags: [{ taxonomyId: 'data-structure.stack', solveRate: 0.25 }],

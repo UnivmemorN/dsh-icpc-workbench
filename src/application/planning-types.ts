@@ -1130,7 +1130,8 @@ function dedupeIds(values: readonly string[]): readonly string[] {
  */
 function requireAbilityAggregate(value: unknown): AbilityPlanningAggregate {
   const record = requireObject('planning preparation ability', value);
-  requireExactKeys('planning preparation ability', record, ABILITY_KEYS);
+  requireExactKeys('planning preparation ability', record,
+    Object.hasOwn(record, 'history') ? [...ABILITY_KEYS, 'history'] : ABILITY_KEYS);
   const platform = record['platform'];
   invariant(
     SOURCE_PLATFORMS.includes(platform as (typeof SOURCE_PLATFORMS)[number]),
@@ -1172,6 +1173,7 @@ function requireAbilityAggregate(value: unknown): AbilityPlanningAggregate {
   });
 
   return {
+    ...(Object.hasOwn(record, 'history') ? { history: requireAbilityHistory(record['history']) } : {}),
     version: requireText('planning ability version', record['version']),
     platform: platform as AbilityPlanningAggregate['platform'],
     estimateStatus: estimateStatus as AbilityPlanningAggregate['estimateStatus'],
@@ -1219,6 +1221,69 @@ function requireAbilityAggregate(value: unknown): AbilityPlanningAggregate {
     reasonCodes: requireStringList('planning ability reasonCodes', record['reasonCodes'], 64) as AbilityPlanningAggregate['reasonCodes'],
     caveats: requireStringList('planning ability caveats', record['caveats'], 64),
   };
+}
+
+
+/** Closed additive history shape. Legacy preparations omit it and round-trip without rewriting. */
+function requireAbilityHistory(value: unknown): NonNullable<AbilityPlanningAggregate['history']> {
+  const root = requireExactObject('ability history', value, ['recentWindowDays', 'periods']);
+  const recentWindowDays = requireCount('history window days', root['recentWindowDays']);
+  invariant(recentWindowDays > 0, 'invalid_input', 'history window must be positive', {});
+  invariant(Array.isArray(root['periods']) && root['periods'].length === 3, 'invalid_input', 'history needs three periods', {});
+  const names = ['all_time', 'recent', 'earlier'] as const;
+  const periods = (root['periods'] as unknown[]).map((value, i) => {
+    const row = requireExactObject('ability history period', value, [
+      'period', 'solvedDistinct', 'excludedDistinct', 'missingOrInvalidRatingDistinct', 'eligibleDistinct',
+      'independentEligibleDistinct', 'completionModes', 'minimumSampleSize', 'estimateStatus',
+      'baselineTrainingLevel', 'quartileBand', 'independentlyConfirmed', 'confidence', 'includesEarlierSolves', 'nativeDifficulty',
+    ]);
+    const period = requireEnum('ability history period', row['period'], names);
+    invariant(period === names[i], 'invalid_input', 'history period order or identity mismatch', {});
+    const solvedDistinct = requireCount('history solved', row['solvedDistinct']);
+    const excludedDistinct = requireCount('history excluded', row['excludedDistinct']);
+    const missingOrInvalidRatingDistinct = requireCount('history missing rating', row['missingOrInvalidRatingDistinct']);
+    const eligibleDistinct = requireCount('history eligible', row['eligibleDistinct']);
+    const independentEligibleDistinct = requireCount('history independent eligible', row['independentEligibleDistinct']);
+    const minimumSampleSize = requireCount('history minimum sample', row['minimumSampleSize']);
+    const completionModes = requireModeCounts('history completion modes', row['completionModes']);
+    invariant(solvedDistinct === excludedDistinct + missingOrInvalidRatingDistinct + eligibleDistinct &&
+      independentEligibleDistinct <= eligibleDistinct && minimumSampleSize > 0 &&
+      completionModes.total === solvedDistinct &&
+      completionModes.independent + completionModes.assisted + completionModes.solutionUsed + completionModes.unknown === solvedDistinct &&
+      excludedDistinct === completionModes.assisted + completionModes.solutionUsed,
+      'invalid_input', 'history evidence counts do not reconcile', {});
+    invariant(typeof row['independentlyConfirmed'] === 'boolean' && typeof row['includesEarlierSolves'] === 'boolean',
+      'invalid_input', 'history evidence flags must be boolean', {});
+    const independentlyConfirmed = row['independentlyConfirmed'] as boolean;
+    const includesEarlierSolves = row['includesEarlierSolves'] as boolean;
+    invariant(independentlyConfirmed === (eligibleDistinct > 0 && independentEligibleDistinct === eligibleDistinct) &&
+      (period !== 'recent' || !includesEarlierSolves), 'invalid_input', 'history evidence flags disagree with counts', {});
+    const estimateStatus = requireEnum('history status', row['estimateStatus'], ESTIMATE_STATUSES);
+    const confidence = row['confidence'] === null ? null : requireEnum('history confidence', row['confidence'], CONFIDENCES);
+    const baselineTrainingLevel = requireNullableNumber('history baseline', row['baselineTrainingLevel']);
+    const quartileBand = requireNullableRange('history quartiles', row['quartileBand']);
+    invariant(estimateStatus === 'estimated'
+      ? eligibleDistinct >= minimumSampleSize && baselineTrainingLevel !== null && quartileBand !== null && confidence !== null
+      : baselineTrainingLevel === null && quartileBand === null && confidence === null,
+      'invalid_input', 'history estimate disagrees with sample gate', {});
+    invariant(Array.isArray(row['nativeDifficulty']), 'invalid_input', 'history native difficulty must be an array', {});
+    const nativeDifficulty = (row['nativeDifficulty'] as unknown[]).map(value => {
+      const native = requireExactObject('history native dimension', value, ['dimension', 'count', 'missing', 'median', 'p25', 'p75']);
+      const count = requireCount('history native count', native['count']), missing = requireCount('history native missing', native['missing']);
+      invariant(count + missing === solvedDistinct, 'invalid_input', 'native counts must cover solved history', {});
+      return { dimension: requireText('history native dimension', native['dimension']), count, missing,
+        median: requireNullableNumber('history native median', native['median']),
+        p25: requireNullableNumber('history native p25', native['p25']), p75: requireNullableNumber('history native p75', native['p75']) };
+    });
+    return { period, solvedDistinct, excludedDistinct, missingOrInvalidRatingDistinct, eligibleDistinct,
+      independentEligibleDistinct, completionModes, minimumSampleSize, estimateStatus, baselineTrainingLevel,
+      quartileBand, independentlyConfirmed, confidence, includesEarlierSolves, nativeDifficulty };
+  });
+  const [all, recent, earlier] = periods;
+  invariant(all!.solvedDistinct === recent!.solvedDistinct + earlier!.solvedDistinct &&
+    all!.eligibleDistinct === recent!.eligibleDistinct + earlier!.eligibleDistinct,
+    'invalid_input', 'history periods must partition all-time evidence', {});
+  return { recentWindowDays, periods };
 }
 
 function requireEnum<T extends string>(label: string, value: unknown, allowed: readonly T[]): T {

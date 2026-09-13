@@ -55,6 +55,11 @@ export const styles=`
 .icpc-merged-detail{margin-top:16px}
 @media(max-width:640px){.icpc-merged-accounts{grid-template-columns:1fr}.icpc-merged-members li{flex-direction:column;gap:2px}}
 .icpc-root .icpc-viewswitch button[aria-pressed=true]{background:var(--icpc-accent);border-color:var(--icpc-accent);color:var(--icpc-card)}
+.icpc-history-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:12px 0}
+.icpc-history-card{border:1px solid var(--icpc-line);border-radius:8px;padding:14px;background:var(--icpc-card);min-width:0}
+.icpc-history-card:first-child{border-color:var(--icpc-accent);background:var(--icpc-soft)}
+.icpc-history-value{display:block;font-size:20px;margin:8px 0}
+.icpc-history-card p{font-size:12px;overflow-wrap:anywhere}
 .icpc-knowledge-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:16px}
 .icpc-knowledge-summary>div{padding:12px 14px;border:1px solid var(--icpc-line);border-radius:8px;background:var(--icpc-card);min-width:0}
 .icpc-knowledge-summary span{display:block;font-size:12px;color:var(--icpc-muted)}

@@ -457,3 +457,21 @@ test('a hand-edited stored body is refused as corrupt instead of being cast to a
     fx.removeDirectory(paths.dir);
   }
 });
+
+void test('new history survives persisted plan validation while legacy preparations remain unchanged', () => {
+  const current = makeAttempt();
+  assert.deepEqual(validatePlanAttempt(current), current);
+  const legacy = structuredClone(current);
+  delete (legacy.preparation.ability as { history?: unknown }).history;
+  (legacy.preparation.ability as { version: string }).version = 'ability.1';
+  Object.assign(legacy.preparation, { evidenceHash: planPreparationEvidenceHash(legacy.preparation) });
+  const restored = validatePlanAttempt(legacy);
+  assert.deepEqual(restored, legacy);
+  assert.equal(Object.hasOwn(restored.preparation.ability, 'history'), false, 'never rewrite an old immutable preparation');
+  const leaked = structuredClone(current);
+  Object.assign(leaked.preparation.ability.history!.periods[0]!, { accountId: 'private-account' });
+  assert.throws(() => validatePlanAttempt(leaked), hasCode('invalid_input'), 'nested identifiers cannot reach the model');
+  const corrupt = structuredClone(current);
+  Object.assign(corrupt.preparation.ability.history!.periods[0]!, { eligibleDistinct: 100 });
+  assert.throws(() => validatePlanAttempt(corrupt), hasCode('invalid_input'), 'inconsistent history counters are refused');
+});

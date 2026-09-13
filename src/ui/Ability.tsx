@@ -1,3 +1,4 @@
+import { AbilityHistory } from './AbilityHistory.js';
 import type { ApiWeaknessResult } from '../application/workbench-api.js';
 import { Empty, ExternalLink, Notice, Panel, Stats } from './common.js';
 import {
@@ -40,6 +41,8 @@ export function Ability({ ability }: { ability: AbilityViewData }) {
         <ExternalLink href={ability.officialRating.apiHelpUrl}>{ABILITY_OFFICIAL_RATING_LINK_TEXT}</ExternalLink>
         ）。
       </Notice>
+      <AbilityHistory history={ability.history} platform={ability.platform} />
+      <h3>近期训练建议（近期不足时参考历史）</h3>
       {estimated ? (
         <>
         <Stats

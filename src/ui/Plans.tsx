@@ -1,3 +1,4 @@
+import { abilityHistoryLabel, abilityPeriodValue } from './ability-history-view.js';
 import {useEffect,useRef,useState} from 'react';
 import type {ApiResponse} from '../application/workbench-api.js';
 import type {WorkbenchPlanTaskView,WorkbenchPlanView} from '../application/workbench-types.js';
@@ -175,6 +176,9 @@ export function Plans(){
     {label:'置信度',value:summary.confidence},
    ]}/>
    {summary.native.length>0&&<ul className="icpc-diagnosis">{summary.native.map(line=><li key={line}>{line}</li>)}</ul>}
+   {view.ability.history && <p className="icpc-muted">AI 同时读取历史与近期对照：
+    {view.ability.history.periods.map(period => abilityHistoryLabel(period.period, view.ability.history!.recentWindowDays) + '：' + abilityPeriodValue(period, view.ability.platform) + '（有效 ' + period.eligibleDistinct + ' 题）').join('；')}。
+   </p>}
    <div className="icpc-actions"><button type="button" onClick={()=>navigate('weakness')}>查看完整能力评估</button></div>
    <div className="icpc-plan-meta">
     <span>提供方：{view.generator.provider}</span><span>模型：{view.generator.model}</span><span>推理强度：{view.generator.effort}</span>

@@ -90,7 +90,7 @@ export function Weakness() {
             <>
               <Stats
                 items={[
-                  { label: '能力评估（训练难度参考）', value: abilityStatValue(data.ability) },
+                  { label: '近期训练参考（详见历史对照）', value: abilityStatValue(data.ability) },
                   { label: '尝试过的不同题目', value: attempted },
                   { label: '已通过题目', value: data.report.solvedDistinctTotal },
                   { label: '已复核标签覆盖（占尝试题）', value: `${formalTagged} / ${attempted}` },

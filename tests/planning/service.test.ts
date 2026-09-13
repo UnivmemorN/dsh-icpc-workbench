@@ -1242,3 +1242,39 @@ test('an ordinary success still stores its plan and a provider failure keeps its
     assert.deepEqual(await store.listPlans(scope.account.id), []);
   }, failure);
 });
+
+test('prepared plans include earlier evidence and detect its change while the recent baseline stays unchanged', async () => {
+  const scripted = scriptedGenerator(async () => { throw Error('No model dispatch expected'); });
+  await withBench(async ({ store, workbench, planning, clock, scope }) => {
+    const old = Array.from({ length: 6 }, (_, i) => {
+      const base = fx.makeProblem(fx.makeRef(scope.instance, 'old-' + i));
+      return { ...base, ratings: [{ dimension: 'rating', value: 2200 + i * 100, scale: null, raw: String(2200 + i * 100) }] };
+    });
+    const recent = Array.from({ length: 5 }, (_, i) => {
+      const base = fx.makeProblem(fx.makeRef(scope.instance, 'new-' + i));
+      return { ...base, ratings: [{ dimension: 'rating', value: 800 + i * 100, scale: null, raw: String(800 + i * 100) }] };
+    });
+    await store.upsertProblems([...old, ...recent]);
+    await store.upsertSubmissions([
+      ...old.map((p, i) => fx.makeSubmission(scope.account, p.ref, 'history-' + i, 'accepted', '2025-01-01T00:00:00.000Z')),
+      ...recent.map((p, i) => fx.makeSubmission(scope.account, p.ref, 'recent-' + i, 'accepted', AT)),
+    ]);
+    const prepared = await planning.prepare({ requestId: REQUEST, accountId: scope.account.id }, TOKEN);
+    assert.equal(prepared.outcome, 'prepared');
+    const stored = await store.getPlanAttempt(REQUEST);
+    assert.ok(stored);
+    const history = stored.preparation.ability.history!;
+    assert.equal(history.periods[2]!.eligibleDistinct, 6);
+    assert.equal(history.periods[2]!.baselineTrainingLevel, 2500);
+    const recentBaseline = stored.preparation.ability.baselineTrainingLevel;
+    clock.value = LATER;
+    assert.equal((await workbench.revalidatePlanInput(stored.preparation, TOKEN)).ok, true, 'elapsed time alone preserves the preparation');
+    await store.upsertProblems(old.map(p => ({ ...p, ratings: [{ dimension: 'rating', value: 3000, scale: null, raw: '3000' }] })));
+    const current = await workbench.weakness({ accountId: scope.account.id }, TOKEN);
+    assert.equal(current.ability.estimate.baselineTrainingLevel, recentBaseline);
+    const changed = await workbench.revalidatePlanInput(stored.preparation, TOKEN);
+    assert.equal(changed.ok, false);
+    if (!changed.ok) assert.equal(changed.staleness.reason, 'ability_changed');
+    assert.equal(scripted.calls.length, 0);
+  }, scripted);
+});

@@ -548,3 +548,87 @@ void test('the planning aggregate carries no account, handle or row identifiers'
   assert.equal(isDeeplyFrozen(aggregate), true);
   assert.deepEqual(JSON.parse(serialized), aggregate);
 });
+
+void test('all-time and earlier assessments remain present when recent evidence already meets the gate', () => {
+  const recent = cohort([800, 900, 1000, 1100, 1200], { withRetrospective: false });
+  const old = [2200, 2300, 2400, 2500, 2600, 2700].map((r, i) => problem('old-' + i, { ratings: [rating(r)] }));
+  const input = { problems: [...recent.problems, ...old],
+    submissions: [...recent.submissions, ...old.map((p, i) => submission(ALICE, p, 'old-' + i, 'accepted', OLD))],
+    retrospectives: old.map(p => retrospective(ALICE, p, 'independent', OLD)) };
+  const report = assess(input);
+  assert.equal(report.estimate.baselineTrainingLevel, 1000, 'the separate near-term reference keeps its existing rule');
+  const [all, latest, earlier] = report.history.periods;
+  assert.deepEqual(report.history.periods.map(p => p.period), ['all_time', 'recent', 'earlier']);
+  assert.equal(all!.eligibleDistinct, 11, 'history does not disappear when recent evidence is sufficient');
+  assert.equal(all!.baselineTrainingLevel, 2200);
+  assert.equal(all!.independentlyConfirmed, false, 'unknown recent independence stays unknown');
+  assert.equal(all!.independentEligibleDistinct, 6);
+  assert.equal(latest!.baselineTrainingLevel, 1000);
+  assert.equal(earlier!.eligibleDistinct, 6);
+  assert.equal(earlier!.baselineTrainingLevel, 2500);
+  assert.equal(earlier!.includesEarlierSolves, true);
+  assert.equal(earlier!.confidence, 'low');
+  const aggregate = aggregateAbilityForPlanning(report);
+  assert.deepEqual(aggregate.history, report.history);
+  assert.deepEqual(aggregateAbilityForPlanning(assess({ ...input, now: '2026-11-02T08:00:00.000Z' })), aggregate,
+    'a moved clock alone never makes a prepared plan stale');
+  const changed = assess({ ...input, problems: [...recent.problems, ...old.map((_, i) => problem('old-' + i, { ratings: [rating(2800)] }))] });
+  assert.equal(changed.estimate.baselineTrainingLevel, 1000);
+  assert.notDeepEqual(aggregateAbilityForPlanning(changed).history, aggregate.history, 'earlier evidence changes reach planning despite the same recent estimate');
+});
+
+void test('history periods conserve counts, use first AC and latest modes, and exclude future/foreign evidence', () => {
+  const old = problem('old'), fresh = problem('fresh'), missing = problem('missing', { ratings: [] }),
+    assisted = problem('assisted'), future = problem('future'), foreign = problem('foreign');
+  const report = assess({ problems: [old, fresh, missing, assisted, future, foreign],
+    submissions: [
+      submission(ALICE, old, 'o1', 'accepted', OLD), submission(ALICE, old, 'o2', 'accepted', RECENT),
+      submission(ALICE, fresh, 'f1', 'accepted', RECENT), submission(ALICE, missing, 'm1', 'accepted', OLD),
+      submission(ALICE, assisted, 'a1', 'accepted', OLD), submission(ALICE, future, 'future', 'accepted', FUTURE),
+      submission(BOB, foreign, 'foreign', 'accepted', OLD),
+    ],
+    retrospectives: [
+      retrospective(ALICE, assisted, 'independent', OLD), retrospective(ALICE, assisted, 'solution_used', RECENT),
+      retrospective(ALICE, old, 'independent', OLD), retrospective(ALICE, old, 'assisted', FUTURE),
+    ] });
+  const [all, recent, earlier] = report.history.periods;
+  assert.equal(all!.solvedDistinct, 4); assert.equal(recent!.solvedDistinct, 1); assert.equal(earlier!.solvedDistinct, 3);
+  assert.equal(earlier!.eligibleDistinct, 1); assert.equal(earlier!.independentEligibleDistinct, 1);
+  assert.equal(earlier!.excludedDistinct, 1); assert.equal(earlier!.missingOrInvalidRatingDistinct, 1);
+  for(const p of report.history.periods) {
+    assert.equal(p.solvedDistinct, p.eligibleDistinct + p.excludedDistinct + p.missingOrInvalidRatingDistinct);
+    assert.equal(p.baselineTrainingLevel, null);
+    assert.equal(p.estimateStatus, 'unknown');
+  }
+  assert.equal(recent!.includesEarlierSolves, false);
+  assert.equal(report.last90Days.repeatedAcDistinct, 1);
+  assert.equal(isDeeplyFrozen(report.history), true);
+});
+
+void test('period boundary is inclusive at first AC and follows a custom recent window', () => {
+  const boundary = '2026-10-02T08:00:00.000Z';
+  const a = problem('a'), b = problem('b');
+  const report = assess({ problems: [a, b], settings: { recentWindowDays: 30 },
+    submissions: [submission(ALICE, a, 'a', 'accepted', boundary), submission(ALICE, b, 'b', 'accepted', '2026-10-02T07:59:59.999Z')] });
+  assert.equal(report.history.recentWindowDays, 30);
+  assert.equal(report.history.periods[1]!.solvedDistinct, 1);
+  assert.equal(report.history.periods[2]!.solvedDistinct, 1);
+});
+
+void test('non-CF history remains native and an empty recent period never borrows the historic score', () => {
+  const old = cohort([1400, 1600, 1800, 2000, 2200], { solvedAt: OLD });
+  const report = assess(old);
+  assert.equal(report.history.periods[0]!.baselineTrainingLevel, 1800);
+  assert.equal(report.history.periods[1]!.baselineTrainingLevel, null);
+  assert.equal(report.history.periods[1]!.eligibleDistinct, 0);
+  const source = 'luogu:luogu.com.cn';
+  const ps = [1, 2, 3, 4, 5, 0].map((r, i) => problem('L' + i, { sourceInstanceId: source, ratings: [rating(r, 'difficulty')] }));
+  const luogu = assess({ platform: 'luogu', sourceInstanceId: source, problems: ps,
+    submissions: ps.map((p, i) => submission(ALICE, p, String(i), 'accepted', OLD)) });
+  const period = luogu.history.periods[2]!;
+  assert.equal(period.eligibleDistinct, 5);
+  assert.equal(period.missingOrInvalidRatingDistinct, 1, 'Luogu unclassified is not usable estimate evidence');
+  assert.equal(period.nativeDifficulty[0]!.median, 2.5);
+  assert.equal(period.baselineTrainingLevel, null);
+  assert.equal(period.estimateStatus, 'unknown');
+});

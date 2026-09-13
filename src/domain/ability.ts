@@ -24,6 +24,10 @@
  * - native difficulty is reported per raw dimension and never converted between platforms; a value
  *   that is absent, blank or non-numeric is missing, never a fabricated `0`.
  *
+ * The additive history comparison always assesses all-time, recent and earlier solves in parallel,
+ * independent of the near-term tier choice. Every valid non-assisted solve in that period is used,
+ * and missing independence remains explicit. It never blends a historic score into a current Elo.
+ *
  * The estimate itself exists for Codeforces only and needs at least
  * {@link ABILITY_MIN_ESTIMATE_SAMPLES} valid distinct rated solved problems. A value is valid
  * estimate evidence only when it is a positive finite safe integer: `0`, negative and fractional
@@ -50,7 +54,7 @@ import { expectedRatingDimension } from './training-stats.js';
 const DAY_MS = 86_400_000;
 
 /** Version of the assessment shape and its counting rules; bump when an exported meaning changes. */
-export const ABILITY_ASSESSMENT_VERSION = 'ability.1';
+export const ABILITY_ASSESSMENT_VERSION = 'ability.2';
 
 /** Version of the Codeforces training-band heuristic alone; the numbers below belong to it. */
 export const CF_TRAINING_BAND_HEURISTIC_VERSION = 'cf-rating-band.1';
@@ -299,6 +303,45 @@ export interface AbilityCoverage {
   readonly nativeDimension: string;
 }
 
+/** Parallel periods defined by a problem's FIRST known AC, never by its latest re-submission. */
+export type AbilityHistoryPeriod = 'all_time' | 'recent' | 'earlier';
+
+/** Identifier-free assessment of one period. All eligible solves participate; no recency fallback. */
+export interface AbilityPeriodAssessment {
+  readonly period: AbilityHistoryPeriod;
+  readonly solvedDistinct: number;
+  /** Known assisted/solution-used excluded first; remaining missing/invalid values excluded next. */
+  readonly excludedDistinct: number;
+  readonly missingOrInvalidRatingDistinct: number;
+  readonly eligibleDistinct: number;
+  readonly independentEligibleDistinct: number;
+  readonly completionModes: AbilityCompletionModeCounts;
+  readonly minimumSampleSize: number;
+  readonly estimateStatus: AbilityEstimateStatus;
+  /** Null below the gate or on non-CF platforms. */
+  readonly baselineTrainingLevel: number | null;
+  readonly quartileBand: AbilityRatingRange | null;
+  /** True only when every eligible problem has an independent retrospective. */
+  readonly independentlyConfirmed: boolean;
+  readonly confidence: AbilityConfidence | null;
+  /** Historical achievements are visible without claiming they prove current form. */
+  readonly includesEarlierSolves: boolean;
+  readonly nativeDifficulty: readonly {
+    readonly dimension: string;
+    readonly count: number;
+    readonly missing: number;
+    readonly median: number | null;
+    readonly p25: number | null;
+    readonly p75: number | null;
+  }[];
+}
+
+/** Stable aggregates only: no account/row identifiers, notes, or clock-dependent timestamps. */
+export interface AbilityHistoryComparison {
+  readonly recentWindowDays: number;
+  readonly periods: readonly AbilityPeriodAssessment[];
+}
+
 /** One account's complete ability assessment. */
 export interface AbilityAssessment {
   readonly version: string;
@@ -311,6 +354,8 @@ export interface AbilityAssessment {
   readonly completionModes: AbilityCompletionModes;
   readonly nativeDifficulty: readonly AbilityNativeDistribution[];
   readonly estimate: AbilityTrainingEstimate;
+  /** Always evaluates all-time, recent and earlier solves independently. */
+  readonly history: AbilityHistoryComparison;
   readonly officialRating: AbilityOfficialRatingStatus;
   readonly excludedFromEstimate: AbilityExcludedSamples;
   readonly coverage: AbilityCoverage;
@@ -341,6 +386,8 @@ export interface ComputeAbilityAssessmentInput {
  * is closed, a later caller cannot accidentally forward raw rows to a model.
  */
 export interface AbilityPlanningAggregate {
+  /** Absent in legacy immutable preparations; present in newly prepared plans. */
+  readonly history?: AbilityHistoryComparison;
   readonly version: string;
   readonly platform: SourcePlatform;
   readonly estimateStatus: AbilityEstimateStatus;
@@ -381,6 +428,52 @@ interface SolvedRecord {
   readonly recent: boolean;
   readonly mode: AbilityCompletionMode;
   readonly problem: NormalizedProblem | null;
+}
+
+
+/** Compute one period from the same resolved, account-isolated records as the near-term estimate. */
+function assessPeriod(
+  period: AbilityHistoryPeriod,
+  records: readonly SolvedRecord[],
+  platform: SourcePlatform,
+  expectedDimension: string,
+  minimumSampleSize: number,
+): AbilityPeriodAssessment {
+  const completionModes = modeCountsOf(records);
+  const excludedDistinct = completionModes.assisted + completionModes.solutionUsed;
+  const eligible = records.filter(record => {
+    if (record.mode === 'assisted' || record.mode === 'solution_used' || record.problem === null) return false;
+    const value = numericDimensionValue(record.problem, expectedDimension);
+    if (value === null) return false;
+    if (platform === 'codeforces') return Number.isSafeInteger(value) && value > 0;
+    if (platform === 'luogu') return Number.isInteger(value) && value >= 1 && value <= 7;
+    return true;
+  });
+  const values = eligible.map(r => numericDimensionValue(r.problem as NormalizedProblem, expectedDimension) as number).sort((a, b) => a - b);
+  const estimated = platform === 'codeforces' && values.length >= minimumSampleSize;
+  const independentEligibleDistinct = eligible.filter(r => r.mode === 'independent').length;
+  const independentlyConfirmed = eligible.length > 0 && independentEligibleDistinct === eligible.length;
+  const includesEarlierSolves = records.some(r => !r.recent);
+  const nativeDifficulty = nativeDimensionLabels(records, expectedDimension).map(({ key, label }) => {
+    const ratings = records.flatMap(r => {
+      const value = r.problem === null ? null : numericDimensionValue(r.problem, key);
+      return value === null ? [] : [value];
+    }).sort((a, b) => a - b);
+    return { dimension: label, count: ratings.length, missing: records.length - ratings.length,
+      median: quantileOf(ratings, 0.5), p25: quantileOf(ratings, 0.25), p75: quantileOf(ratings, 0.75) };
+  });
+  return {
+    period, solvedDistinct: records.length, excludedDistinct,
+    missingOrInvalidRatingDistinct: records.length - excludedDistinct - eligible.length,
+    eligibleDistinct: eligible.length, independentEligibleDistinct, completionModes, minimumSampleSize,
+    estimateStatus: estimated ? 'estimated' : 'unknown',
+    baselineTrainingLevel: estimated ? roundTo100(quantileOf(values, 0.5) as number) : null,
+    quartileBand: estimated ? { min: floorTo100(quantileOf(values, 0.25) as number), max: ceilTo100(quantileOf(values, 0.75) as number) } : null,
+    independentlyConfirmed,
+    confidence: estimated ? independentlyConfirmed && !includesEarlierSolves ? 'medium' : 'low' : null,
+    includesEarlierSolves,
+    nativeDifficulty,
+  };
 }
 
 /** One eligible estimate sample: a rated solved problem that is neither assisted nor solution-used. */
@@ -892,6 +985,14 @@ export function computeAbilityAssessment(input: ComputeAbilityAssessmentInput): 
       repeatedAcDistinct,
     },
     completionModes: { allTime: allTimeModes, last90Days: windowModes },
+    history: {
+      recentWindowDays,
+      periods: [
+        assessPeriod('all_time', solvedRecords, input.platform, expectedDimension, minimumSampleSize),
+        assessPeriod('recent', solvedRecords.filter(r => r.recent), input.platform, expectedDimension, minimumSampleSize),
+        assessPeriod('earlier', solvedRecords.filter(r => !r.recent), input.platform, expectedDimension, minimumSampleSize),
+      ],
+    },
     nativeDifficulty,
     estimate,
     officialRating: {
@@ -917,6 +1018,7 @@ export function aggregateAbilityForPlanning(report: AbilityAssessment): AbilityP
   const estimate = report.estimate;
   return deepFreeze({
     version: report.version,
+    history: report.history,
     platform: report.platform,
     estimateStatus: estimate.status,
     estimateBasis: estimate.basis,
