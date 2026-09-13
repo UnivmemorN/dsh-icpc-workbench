@@ -78,6 +78,9 @@ export const styles=`
 .icpc-knowledge-status{display:inline-block;padding:2px 8px;border-radius:4px;background:var(--icpc-soft);color:var(--icpc-accent);font-size:11px}
 .icpc-knowledge-status-none{background:transparent;border:1px dashed var(--icpc-line);color:var(--icpc-muted)}
 .icpc-knowledge-detail summary{font-size:12px}
+.icpc-knowledge-band{min-width:180px;margin:8px 0;padding:8px;border:1px solid var(--icpc-line);border-radius:7px}
+.icpc-knowledge-band button{font-size:12px;text-align:left;overflow-wrap:anywhere;width:100%;margin-bottom:4px}
+.icpc-knowledge-band button[aria-pressed=true]{border-color:var(--icpc-accent);background:var(--icpc-soft)}
 .icpc-knowledge-links{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
 .icpc-knowledge-links li{font-size:12px;overflow-wrap:anywhere}
 .icpc-knowledge-sources{margin-top:18px;padding:12px 16px;border:1px solid var(--icpc-line);border-radius:9px;background:var(--icpc-card);font-size:12px;color:var(--icpc-muted)}

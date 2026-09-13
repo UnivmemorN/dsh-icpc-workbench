@@ -53,6 +53,7 @@ import {
   type KnowledgeViewState,
   type TagMappingViewState,
 } from './knowledge-view.js';
+import { knowledgeAtDifficulty, knowledgeDifficultyLabel } from './knowledge-difficulty-view.js';
 import { jumpHint, pageNumbers, pagerDisplay, parseJumpPage } from './pager.js';
 
 /** The knowledge report as the business API returns it; the UI invents no second model. */
@@ -101,7 +102,13 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
     setState((previous) => reconcileKnowledgeCategory(previous, catalog));
   }, [catalog]);
 
-  const rows = selectKnowledgeTechniques(knowledge.nodes, catalog, state);
+  useEffect(() => {
+    setState(previous => previous.difficultyId !== null &&
+      !knowledge.difficultyBands.some(entry => entry.band.id === previous.difficultyId)
+      ? changeKnowledgeFilter(previous, { difficultyId: null }) : previous);
+  }, [knowledge.difficultyBands]);
+  const scoped = knowledgeAtDifficulty(knowledge, state.difficultyId);
+  const rows = selectKnowledgeTechniques(scoped.nodes, catalog, state);
   const page = knowledgePage(rows, state.page);
   const pagerState = pagerDisplay(
     page.totalPages === 0
@@ -138,12 +145,12 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
     setMappingState((previous) => reconcileTagMappingSource(previous, knowledge.sourceTagMappings));
   }, [knowledge.sourceTagMappings]);
 
-  const counts = knowledgeStatusCounts(knowledge.nodes);
+  const counts = knowledgeStatusCounts(scoped.nodes);
   const peak = Math.max(1, ...counts.map((entry) => entry.count));
-  const techniqueCoverage = knowledgeTechniqueCoverage(knowledge.nodes, knowledge.minimumIndependentProblems);
+  const techniqueCoverage = knowledgeTechniqueCoverage(scoped.nodes, knowledge.minimumIndependentProblems);
   const categories = knowledgeCategoryOptions(catalog);
   const categorySummary =
-    state.categoryId === null ? null : knowledgeCategorySummary(knowledge.nodes, catalog, state.categoryId);
+    state.categoryId === null ? null : knowledgeCategorySummary(scoped.nodes, catalog, state.categoryId);
   // Resource metadata covers every catalog node, categories included, so the selected category can
   // show its own OI Wiki references beside its subtree summary.
   const categoryResources = categorySummary === null ? [] : knowledgeResourcesFor(categorySummary.taxonomyId);
@@ -257,6 +264,28 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
 
   return (
     <Panel title="按知识点汇总学习证据">
+      <div className="icpc-toolbar">
+        <label>
+          难度范围
+          <select value={state.difficultyId ?? ''} onChange={event =>
+            setState(previous => changeKnowledgeFilter(previous, { difficultyId: event.target.value || null }))
+          }>
+            <option value="">全部难度（汇总）</option>
+            {knowledge.difficultyBands.map(entry => (
+              <option key={entry.band.id} value={entry.band.id}>
+                {knowledgeDifficultyLabel(entry.band)} · 通过 {entry.coverage.solvedDistinctTotal} / 尝试 {entry.coverage.attemptedDistinctTotal}
+              </option>
+            ))}
+          </select>
+        </label>
+        <span role="status">
+          当前范围：{scoped.label} · 通过 {scoped.coverage.solvedDistinctTotal} / 尝试 {scoped.coverage.attemptedDistinctTotal} 题
+        </span>
+      </div>
+      <p className="icpc-muted">
+        选择难度后，下方状态分布、分类汇总与知识点计数只统计该档。CF 按 200 分一档；洛谷按原生等级；其他来源保留原生数值。
+        未知难度单列。不同来源与难度维度不换算，多维度计数不能相加。每档独立判断是否达到证据阈值，低难度记录不能证明高难度能力。
+      </p>
       <div className="icpc-knowledge-summary">
         <div>
           <span>知识点总数</span>
@@ -273,7 +302,7 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
         <div>
           <span>独立证据阈值</span>
           <strong>≥ {techniqueCoverage.minimumIndependentProblems} 题</strong>
-          <small className="icpc-muted">达到阈值才标记“已有独立证据”。</small>
+          <small className="icpc-muted">在当前范围达到阈值才标记“已有独立证据”；汇总状态不代表所有难度。</small>
         </div>
       </div>
 
@@ -436,6 +465,7 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
                   <th>状态</th>
                   <th>相关题目结果</th>
                   <th>实际解法（复盘）</th>
+                  <th>难度分层</th>
                   <th>详情 / 学习链接</th>
                 </tr>
               </thead>
@@ -444,6 +474,9 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
                   <KnowledgeRow
                     key={row.taxonomyId}
                     row={row}
+                    difficultyBands={knowledge.difficultyBands}
+                    difficultyId={state.difficultyId}
+                    onDifficulty={id => setState(previous => changeKnowledgeFilter(previous, { difficultyId: id }))}
                     minimumIndependentProblems={knowledge.minimumIndependentProblems}
                   />
                 ))}
@@ -459,7 +492,7 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
 
       <details className="icpc-coverage">
         <summary>
-          证据覆盖与未匹配标签：未匹配原始标签 {knowledge.unmatchedAlgorithmLabels.length} 个 · 缺少题目元数据{' '}
+          证据覆盖与未匹配标签（全部难度）：未匹配原始标签 {knowledge.unmatchedAlgorithmLabels.length} 个 · 缺少题目元数据{' '}
           {coverage.metadataMissing} / {coverage.distinctProblems} 题
         </summary>
         <div className="icpc-table-wrap">
@@ -724,13 +757,21 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
 /** One technique row; the expanded detail carries the honest reading and the verified links. */
 function KnowledgeRow({
   row,
+  difficultyBands, difficultyId, onDifficulty,
   minimumIndependentProblems,
 }: {
   row: KnowledgeTechniqueRow;
+  difficultyBands: KnowledgeViewData['difficultyBands'];
+  difficultyId: string | null;
+  onDifficulty: (id: string) => void;
   minimumIndependentProblems: number;
 }) {
   const evidence = row.evidence;
   const resources = knowledgeResourcesFor(row.taxonomyId);
+  const bands = difficultyBands.flatMap(entry => {
+    const node = entry.nodes.find(n => n.taxonomyId === row.taxonomyId);
+    return node ? [{ band: entry.band, node }] : [];
+  });
   return (
     <tr>
       <td>
@@ -766,6 +807,27 @@ function KnowledgeRow({
           {evidence.retrospectiveSolutionUsedDistinct}
         </span>
 
+      </td>
+      <td>
+        {bands.length === 0 ? <span className="icpc-muted">各难度暂无记录</span> : (
+          <details className="icpc-knowledge-detail">
+            <summary>各难度证据（{bands.length} 档）</summary>
+            <small className="icpc-muted">全难度对照；点击档位可筛选整页。</small>
+            {bands.map(({ band, node }) => (
+              <div key={band.id} className="icpc-knowledge-band">
+                <button type="button" aria-pressed={difficultyId === band.id} onClick={() => onDifficulty(band.id)}>
+                  {knowledgeDifficultyLabel(band)}
+                </button>
+                <span>{KNOWLEDGE_STATUS_LABELS[node.status]} · 独立 {node.retrospectiveIndependentDistinct}</span>
+                <span>提示辅助 {node.retrospectiveAssistedDistinct} · 参考题解 {node.retrospectiveSolutionUsedDistinct}</span>
+                <small className="icpc-muted">
+                  平台通过 {node.platformSolvedDistinct} / 尝试 {node.platformAttemptedDistinct}；
+                  复核通过 {node.verifiedSolvedDistinct} / 尝试 {node.verifiedAttemptedDistinct}
+                </small>
+              </div>
+            ))}
+          </details>
+        )}
       </td>
       <td>
         <details className="icpc-knowledge-detail">

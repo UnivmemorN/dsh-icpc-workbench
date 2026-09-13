@@ -285,6 +285,7 @@ export {
   type ComputeKnowledgeEvidenceInput,
   type KnowledgeCoverage,
   type KnowledgeEvidenceReport,
+  type KnowledgeDifficultyEvidence,
   type KnowledgeNodeEvidence,
   type KnowledgeNodeStatus,
   type KnowledgeRatingRange,
@@ -406,3 +407,5 @@ export {
   type CancellationSource,
   type CancellationToken,
 } from './cancellation.js';
+
+export { type KnowledgeDifficultyBand } from './knowledge-difficulty.js';

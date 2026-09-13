@@ -333,6 +333,8 @@ export function knowledgeTechniqueRows(
 
 /** The local filter set of the knowledge view; it never triggers an API request. */
 export interface KnowledgeFilter {
+  /** Native difficulty band id, or null for totals. */
+  readonly difficultyId: string | null;
   readonly query: string;
   /** Selected category id, or `null` for every category. */
   readonly categoryId: string | null;
@@ -347,7 +349,7 @@ export interface KnowledgeViewState extends KnowledgeFilter {
 
 /** Fresh view state: no filter, catalog order, first page. */
 export function initialKnowledgeViewState(): KnowledgeViewState {
-  return { query: '', categoryId: null, status: 'all', sort: 'catalog', page: 1 };
+  return { query: '', categoryId: null, difficultyId: null, status: 'all', sort: 'catalog', page: 1 };
 }
 
 /** Apply a filter patch; **any** filter change returns to page 1 (a stale page is never kept). */

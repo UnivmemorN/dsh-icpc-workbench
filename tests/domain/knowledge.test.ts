@@ -582,3 +582,99 @@ void test('an empty report still carries the crosswalk version with zero mapping
   assert.equal(report.tagMappingVersion, TAG_MAPPING_VERSION);
   assert.deepEqual(report.sourceTagMappings, []);
 });
+
+void test('difficulty strata keep thresholds, latest modes and distinct category unions within the band', () => {
+  const ps = [800, 899, 900, 999, 1000, 1199, 1200, 1800].map((v, i) =>
+    problem('band-' + i, { ratings: [rating(v)], rawTags: ['stack', 'queue'] }));
+  const report = run({
+    problems: ps,
+    submissions: [
+      ...ps.map((p, i) => submission(p.ref, String(i), 'accepted')),
+      submission(ps[0]!.ref, 'repeat', 'accepted'),
+      submission(ps[0]!.ref, 'later-wa', 'wrong_answer'),
+    ],
+    decisions: ps.map(p => tagDecision(p, 'ds.stack')),
+    retrospectives: [
+      ...ps.slice(0, 6).map(p => retrospective(p.ref, 'independent', ['ds.stack', 'ds.queue'], AT)),
+      retrospective(ps[5]!.ref, 'assisted', ['ds.stack'], LATER),
+      retrospective(ps[6]!.ref, 'solution_used', ['ds.stack'], AT),
+    ],
+  });
+  assert.equal(nodeOf(report, 'ds.stack').status, 'independent_evidence', 'five independent problems overall');
+  assert.deepEqual(report.difficultyBands.map(b => b.band.value), [800, 1000, 1200, 1800]);
+  const low = report.difficultyBands[0]!;
+  const stack = low.nodes.find(n => n.taxonomyId === 'ds.stack')!;
+  assert.equal(low.coverage.attemptedDistinctTotal, 4);
+  assert.equal(low.coverage.solvedDistinctTotal, 4);
+  assert.equal(stack.retrospectiveIndependentDistinct, 4);
+  assert.equal(stack.status, 'practicing', 'total five-sample status never leaks into the four-sample band');
+  assert.equal(stack.platformSolvedDistinct, 4);
+  assert.equal(stack.verifiedSolvedDistinct, 4);
+  assert.equal(low.nodes.find(n => n.taxonomyId === 'ds')!.observedRelatedDistinct, 4, 'parent unions two child tags');
+  assert.equal(low.nodes.find(n => n.taxonomyId === 'ds')!.descendantTechniqueNodesWithIndependentEvidence, 2);
+  const middle = report.difficultyBands[1]!.nodes.find(n => n.taxonomyId === 'ds.stack')!;
+  assert.equal(middle.retrospectiveIndependentDistinct, 1);
+  assert.equal(middle.retrospectiveAssistedDistinct, 1, 'latest weaker retrospective wins within the band');
+  const solution = report.difficultyBands[2]!.nodes.find(n => n.taxonomyId === 'ds.stack')!;
+  assert.equal(solution.status, 'needs_practice');
+  assert.equal(solution.retrospectiveSolutionUsedDistinct, 1);
+  const high = report.difficultyBands[3]!.nodes.find(n => n.taxonomyId === 'ds.stack')!;
+  assert.equal(high.status, 'unconfirmed', 'AC and tags alone never prove a method');
+  assert.equal(high.retrospectiveIndependentDistinct, 0);
+  assert.equal(isDeeplyFrozen(report), true);
+});
+
+void test('unknown difficulty includes missing metadata, blanks and invalid CF numbers; first dimension wins', () => {
+  const ps = [
+    problem('missing'), problem('blank', { ratings: [rating(' ')] }),
+    problem('text', { ratings: [rating('unknown')] }), problem('zero', { ratings: [rating(0)] }),
+    problem('fraction', { ratings: [rating(1000.5)] }), problem('no-metadata'),
+    problem('duplicate', { ratings: [rating(1000), rating(1600, 'Rating')] }),
+    problem('foreign', { ratings: [rating(2400)] }),
+  ];
+  const report = run({
+    problems: ps.filter(p => p !== ps[5]),
+    submissions: ps.map((p, i) => submission(p.ref, String(i), 'accepted', i === 7 ? OTHER_ACCOUNT : ACCOUNT)),
+    decisions: ps.map(p => tagDecision(p, 'ds.stack')),
+    retrospectives: ps.map((p, i) => retrospective(p.ref, 'independent', ['ds.stack'], AT, i === 7 ? OTHER_ACCOUNT : ACCOUNT)),
+  });
+  assert.deepEqual(report.difficultyBands.map(b => [b.band.value, b.coverage.attemptedDistinctTotal]), [[1000, 1], [null, 6]]);
+  const unknown = report.difficultyBands[1]!;
+  assert.equal(unknown.band.kind, 'unknown');
+  assert.equal(unknown.nodes.find(n => n.taxonomyId === 'ds.stack')!.retrospectiveIndependentDistinct, 6);
+  assert.equal(unknown.nodes.find(n => n.taxonomyId === 'ds.stack')!.status, 'independent_evidence', 'status scoped explicitly to unknown difficulty');
+  assert.equal(report.coverage.attemptedDistinctTotal, 7);
+});
+
+void test('native source/domain/dimension scopes stay separate and Luogu unclassified is unknown', () => {
+  const make = (source: string, key: string, value: number | string, dimension = 'difficulty', domain: string | null = null) =>
+    createNormalizedProblem({ ref: { sourceInstanceId: source, domain, externalKey: key }, title: key,
+      url: 'https://example.test/' + key, fetchedAt: AT, ratings: [rating(value, dimension)], rawTags: ['stack'] });
+  const ps = [
+    make('luogu:www.luogu.com.cn', 'P1', 1), make('luogu:www.luogu.com.cn', 'P2', 0),
+    make('luogu:www.luogu.com.cn', 'P3', 7), make(INSTANCE, 'CF1', 800, 'rating'),
+    make('manual:school.test', 'A', 1, 'difficulty', 'class-a'),
+    make('manual:school.test', 'B', 'Hard', 'difficulty', 'class-b'),
+    createNormalizedProblem({ ref: { sourceInstanceId: 'manual:school.test', domain: 'class-a', externalKey: 'C' },
+      title: 'C', url: 'https://example.test/C', fetchedAt: AT, ratings: [rating(1, 'difficulty'), rating(800)] }),
+  ];
+  const report = run({ problems: ps, submissions: ps.map((p, i) => submission(p.ref, String(i), 'accepted')) });
+  const luogu = report.difficultyBands.filter(b => b.band.sourceInstanceId.startsWith('luogu:'));
+  assert.deepEqual(luogu.map(b => b.band.value), [1, 7, null]);
+  const manual = report.difficultyBands.filter(b => b.band.sourceInstanceId.startsWith('manual:'));
+  assert.deepEqual(manual.map(b => [b.band.domain, b.band.dimension, b.band.value, b.coverage.solvedDistinctTotal]),
+    [['class-a', 'difficulty', 1, 2], ['class-a', 'rating', 800, 1], ['class-a', 'rating', null, 1], ['class-b', 'difficulty', 'Hard', 1]]);
+  assert.equal(report.difficultyBands.find(b => b.band.sourceInstanceId === INSTANCE)!.band.value, 800);
+  const reversed = run({ problems: [...ps].reverse(), submissions: ps.map((p, i) => submission(p.ref, String(i), 'accepted')).reverse() });
+  assert.deepEqual(report, reversed, 'input order does not change partition identities or evidence');
+});
+
+void test('five independent problems qualify only in their own band and empty reports have no fabricated bands', () => {
+  assert.deepEqual(run({ problems: [], submissions: [] }).difficultyBands, []);
+  const ps = Array.from({ length: 5 }, (_, i) => problem('threshold-' + i, { ratings: [rating(1600)] }));
+  const report = run({ problems: ps, submissions: ps.map((p, i) => submission(p.ref, String(i), 'accepted')),
+    retrospectives: ps.map(p => retrospective(p.ref, 'independent', ['ds.stack'], AT)) });
+  assert.equal(report.difficultyBands.length, 1);
+  assert.equal(report.difficultyBands[0]!.nodes.find(n => n.taxonomyId === 'ds.stack')!.status, 'independent_evidence');
+  assert.equal(report.difficultyBands[0]!.nodes.find(n => n.taxonomyId === 'ds.stack')!.platformSolvedDistinct, 0);
+});

@@ -396,6 +396,7 @@ void test('paging slices, clamps and reports an empty result as page 0', () => {
 void test('every filter change clears the page, and a vanished category falls back to all', () => {
   const paged: KnowledgeViewState = {
     query: 'x',
+    difficultyId: null,
     categoryId: 'math',
     status: 'practicing',
     sort: 'related-desc',

@@ -172,6 +172,9 @@ void test('weakness returns the knowledge report beside an unchanged formal repo
     assert.deepEqual(result.report, direct, 'the formal report is unchanged by the knowledge field');
     assert.equal(Object.hasOwn(result.report, 'knowledge'), false);
 
+    assert.deepEqual(result.knowledge.difficultyBands.map(b => [b.band.value, b.coverage.attemptedDistinctTotal]), [[1800, 1], [null, 1]]);
+    assert.equal(result.knowledge.difficultyBands[0]!.nodes.find(n => n.taxonomyId === 'ds.stack')!.retrospectiveIndependentDistinct, 1);
+    assert.deepEqual(result.knowledge.difficultyBands[1]!.nodes, [], 'unknown attempted problem has no fabricated method evidence');
     assert.equal(result.knowledge.accountId, scope.account.id);
     assert.equal(result.knowledge.taxonomyVersion, 'test.09a.1');
     assert.equal(result.knowledge.minimumIndependentProblems, WORKBENCH_MIN_WEAKNESS_SAMPLE);

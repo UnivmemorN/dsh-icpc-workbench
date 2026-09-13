@@ -30,9 +30,11 @@
  * Every output order is code-point order or the taxonomy's own catalog order, never
  * `localeCompare`, so the same evidence reports identically on every machine and locale.
  */
+import { knowledgeDifficultyPartitions, type KnowledgeDifficultyBand } from './knowledge-difficulty.js';
 import { invariant, requireFiniteInt } from './errors.js';
 import { deepFreeze } from './immutable.js';
-import { numericRating, type NormalizedProblem } from './problem.js';
+import type { NormalizedProblem } from './problem.js';
+import { numericRatingValue } from './sorting.js';
 import { latestRetrospectiveByProblem, type CompletionMode, type Retrospective } from './retrospective.js';
 import { reduceSubmissionsByAccount, type Submission } from './submission.js';
 import {
@@ -149,6 +151,13 @@ export interface SourceTagMappingDiagnostic extends SourceTagMapping {
   readonly solvedDistinct: number;
 }
 
+/** One native difficulty band. Nodes without related evidence are omitted to bound payload size. */
+export interface KnowledgeDifficultyEvidence {
+  readonly band: KnowledgeDifficultyBand;
+  readonly coverage: KnowledgeCoverage;
+  readonly nodes: readonly KnowledgeNodeEvidence[];
+}
+
 /** One account's per-taxonomy-node learning evidence. */
 export interface KnowledgeEvidenceReport {
   readonly accountId: string;
@@ -157,6 +166,8 @@ export interface KnowledgeEvidenceReport {
   readonly tagMappingVersion: string;
   /** Independent problems required for `independent_evidence` (echoed, never implicit). */
   readonly minimumIndependentProblems: number;
+  /** Same evidence rules, independently evaluated within each native difficulty band. */
+  readonly difficultyBands: readonly KnowledgeDifficultyEvidence[];
   readonly coverage: KnowledgeCoverage;
   /** Every taxonomy node, in the taxonomy's own catalog order, zero-evidence nodes included. */
   readonly nodes: readonly KnowledgeNodeEvidence[];
@@ -254,7 +265,7 @@ function sizeOf(buckets: ReadonlyMap<string, ReadonlySet<string>>, taxonomyId: s
  *
  * Dimensions are the ones actually observed on those problems (sorted by their case-insensitive
  * key, original spelling preserved), and a problem contributes at most once per dimension: a
- * repeated dimension entry is decided by its first value, exactly as `numericRating` defines it.
+ * repeated dimension entry is decided by its first value, exactly as `numericRatingValue` defines it.
  * A problem with no metadata row carries no rating and is counted as `missing`.
  */
 function independentRatingRanges(
@@ -286,7 +297,7 @@ function independentRatingRanges(
         if (problem === undefined) {
           continue;
         }
-        const value = numericRating(problem, alias);
+        const value = numericRatingValue(problem.ratings, alias);
         if (value !== null) {
           values.push(value);
         }
@@ -328,7 +339,7 @@ function techniqueStatus(
  * problem row simply contributes no tags or ratings), and returns every node of the taxonomy so a
  * caller can render "not observed" instead of an empty screen.
  */
-export function computeKnowledgeEvidence(input: ComputeKnowledgeEvidenceInput): KnowledgeEvidenceReport {
+function computeEvidence(input: ComputeKnowledgeEvidenceInput): Omit<KnowledgeEvidenceReport, 'difficultyBands'> {
   const index = input.taxonomy;
   invariant(
     index !== null &&
@@ -573,4 +584,26 @@ export function computeKnowledgeEvidence(input: ComputeKnowledgeEvidenceInput): 
     sourceTagMappings,
     notes: [...KNOWLEDGE_NOTES],
   });
+}
+
+/**
+ * Compute total and native-difficulty evidence with identical counting rules. No additional store
+ * reads or model calls are involved. Sparse band nodes retain category union counts; consumers
+ * should show omitted taxonomy nodes as not observed in that band, never borrow total counts.
+ */
+export function computeKnowledgeEvidence(input: ComputeKnowledgeEvidenceInput): KnowledgeEvidenceReport {
+  const total = computeEvidence(input);
+  const difficultyBands = knowledgeDifficultyPartitions(total.accountId, input.problems, input.submissions)
+    .map(({ band, problemKeys }): KnowledgeDifficultyEvidence => {
+      const slice = computeEvidence({
+        ...input,
+        accountId: total.accountId,
+        problems: input.problems.filter(p => problemKeys.has(p.key)),
+        submissions: input.submissions.filter(s => s.accountId === total.accountId && problemKeys.has(s.key)),
+        decisions: input.decisions.filter(d => problemKeys.has(d.problemKey)),
+        retrospectives: input.retrospectives.filter(r => r.accountId === total.accountId && problemKeys.has(r.problemKey)),
+      });
+      return { band, coverage: slice.coverage, nodes: slice.nodes.filter(n => n.observedRelatedDistinct > 0) };
+    });
+  return deepFreeze({ ...total, difficultyBands });
 }
