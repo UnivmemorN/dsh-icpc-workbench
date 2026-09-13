@@ -11,5 +11,5 @@ export function abilityPeriodValue(period: AbilityPeriodAssessment, platform: So
   if (period.solvedDistinct === 0) return '暂无通过记录';
   if (platform !== 'codeforces') return '原生难度参考（不换算 CF）';
   return period.baselineTrainingLevel === null ? '样本不足（' + period.eligibleDistinct + ' / ' + period.minimumSampleSize + '）'
-    : '难度参考 ' + period.baselineTrainingLevel + ' 左右';
+    : '练习中位数 ' + period.baselineTrainingLevel + ' 左右';
 }

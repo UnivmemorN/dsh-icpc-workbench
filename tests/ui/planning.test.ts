@@ -283,10 +283,10 @@ void test('the compact ability summary stays honest for unknown, estimated and n
     caveats: [],
   };
   const unknown = planningAbilitySummary(base);
-  assert.match(unknown.headline, /未知（有效样本 2 \/ 5）/);
-  assert.equal(unknown.sample, '2 / 5 题（无可用样本）');
+  assert.match(unknown.headline, /个人水平待校准/);
+  assert.equal(unknown.sample, '2 / 5 题（描述性练习样本）');
   assert.equal(unknown.band, '未给出');
-  assert.equal(unknown.confidence, '未知');
+  assert.equal(unknown.confidence, '未校准');
   assert.deepEqual(unknown.native, []);
 
   const estimated = planningAbilitySummary({
@@ -298,9 +298,11 @@ void test('the compact ability summary stays honest for unknown, estimated and n
     baselineTrainingLevel: 1600,
     quartileBand: { min: 1400, max: 1800 },
   });
-  assert.match(estimated.headline, /训练难度参考 1600 左右/);
+  assert.match(estimated.headline, /个人水平待校准/);
   assert.equal(estimated.band, '1400 – 1800');
-  assert.match(estimated.confidence, /未经验证/);
+  assert.equal(estimated.confidence, '未校准');
+  const calibrated = planningAbilitySummary({ ...base, trainingReference: { source: 'self_report', scale: 'codeforces', range: { min: 1700, max: 2200 }, revision: 1 } });
+  assert.equal(calibrated.headline, 'CF 水平 1700 – 2200（用户自评）');
 
   const luogu = planningAbilitySummary({
     ...base,

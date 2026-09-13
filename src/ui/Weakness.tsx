@@ -75,7 +75,7 @@ export function Weakness() {
           <h1>知识点与薄弱项</h1>
           <p>
             同一道题的多次提交只算一道；每个标签至少 5 道尝试题才进入已复核排名。平台原始标签只作参考，不算已接受标签。
-            能力评估是本地启发式的训练难度参考（非官方 rating）：样本不足时显示“未知”，不会给出 0 分或“新手”结论。
+            个人水平参考来自明确的校准；做题难度只描述练习分布，不能当作选手实力。
           </p>
         </div>
       </div>
@@ -90,7 +90,7 @@ export function Weakness() {
             <>
               <Stats
                 items={[
-                  { label: '近期训练参考（详见历史对照）', value: abilityStatValue(data.ability) },
+                  { label: '个人水平参考', value: abilityStatValue(data.ability) },
                   { label: '尝试过的不同题目', value: attempted },
                   { label: '已通过题目', value: data.report.solvedDistinctTotal },
                   { label: '已复核标签覆盖（占尝试题）', value: `${formalTagged} / ${attempted}` },
@@ -99,7 +99,7 @@ export function Weakness() {
               />
               <div className="icpc-viewswitch" role="group" aria-label="统计视图">
                 <button type="button" aria-pressed={view === 'ability'} onClick={() => setPicked('ability')}>
-                  能力评估（训练难度参考）
+                  能力评估
                 </button>
                 <button type="button" aria-pressed={view === 'knowledge'} onClick={() => setPicked('knowledge')}>
                   知识点掌握情况
@@ -169,7 +169,7 @@ export function Weakness() {
                 </div>
               </details>
               {view === 'ability' ? (
-                <Ability ability={data.ability} />
+                <Ability ability={data.ability} onSaved={read.refresh} />
               ) : view === 'knowledge' ? (
                 <Knowledge knowledge={data.knowledge} coverage={data.coverage} />
               ) : view === 'platform' ? (

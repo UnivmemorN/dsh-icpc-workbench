@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件。独立工作区、独立 SQLite 数据库；基于题解证据补全标签，保留原始标签、人工决定和分析版本。
 
-**0.1.9 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与训练计划（AI 计划：免费准备、显式付费生成；以及免费规则计划）。已完成隔离宿主和浏览器流程验收；本轮功能与已知限制见 [0.1.9 验收报告](docs/reports/stage-14-acceptance.md)，早期模型质量评测见 [30 题报告](docs/reports/stage-05-acceptance.md)。
+**0.1.10 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与训练计划（AI 计划：免费准备、显式付费生成；以及免费规则计划）。已完成隔离宿主和浏览器流程验收；本轮功能与已知限制见 [0.1.10 验收报告](docs/reports/stage-15-acceptance.md)，早期模型质量评测见 [30 题报告](docs/reports/stage-05-acceptance.md)。
 
 ## 构建和隔离安装
 
@@ -14,7 +14,7 @@ npm run check
 npm pack
 # 首次创建隔离的 Web 配置，保持日常配置独立
 dsh --profile icpc-acceptance --from-default-profile web --help
-dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.9.tgz
+dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.10.tgz
 ```
 
 插件不需要位于 harness 源码树中，构建也不依赖相邻的 harness checkout。默认数据目录为系统应用数据目录中的 `dsh-icpc-workbench`。如需自定义，在宿主的配置覆盖文件中设置绝对路径：
@@ -88,3 +88,5 @@ dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
 架构参考 [NovaPhy](https://github.com/UnivmemorN/NovaPhy) 的数据所有权、可替换后端与契约验收设计。依赖和宿主许可证见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)。这是独立社区项目。
 
 「知识点与薄弱项」中的 **来源标签对照** 按来源保留原始名称、映射关系和待核对原因。只有能识别出平台词汇的来源才会套用共享对照：来源实例缺失、格式错误或传入非法词汇时，除来源信息外一律不匹配、不计入知识点。确定的同义词用于未复核的平台参考，宽泛标签只统计分类；歧义、复合及粒度不符的标签（如 `dijkstra`、`fft`、`矩阵乘法`、`快速幂`）保留待核对或只落到更宽的分类。共享结果附平台术语页与 OI Wiki 定义页链接，这些页面只证明词条存在，不代表官方跨平台等价。牛客术语目前只参与对照规则，尚无牛客导入适配器；OI Wiki 目录仅作学习参考。规则带独立版本，详见 [跨来源标签对照](docs/tag-alignment.md)。
+
+个人水平不再由练习难度中位数推断；可保存带来源的账号自评范围用于新 AI 计划。见[个人水平校准](docs/ability-calibration.md)。

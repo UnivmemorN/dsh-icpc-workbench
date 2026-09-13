@@ -1,8 +1,8 @@
+import { AbilityCalibrationEditor } from './AbilityCalibration.js';
 import { AbilityHistory } from './AbilityHistory.js';
 import type { ApiWeaknessResult } from '../application/workbench-api.js';
 import { Empty, ExternalLink, Notice, Panel, Stats } from './common.js';
 import {
-  ABILITY_CONFIDENCE_LABELS,
   ABILITY_MODE_LABELS,
   ABILITY_NO_CONVERSION_NOTE,
   ABILITY_OFFICIAL_RATING_LINK_TEXT,
@@ -10,7 +10,6 @@ import {
   abilityEstimateHeadline,
   abilityExcludedText,
   abilityModeText,
-  abilityNativeScaleOnly,
   abilityNativeText,
   abilityPoolText,
   abilitySampleText,
@@ -19,62 +18,30 @@ import {
 /** The ability assessment as the business API returns it; the UI invents no second model. */
 export type AbilityViewData = ApiWeaknessResult['ability'];
 
-/**
- * Ability-assessment panel: the transparent local training-difficulty reference.
- *
- * The panel renders the domain report as-is — baseline, quartile band and pools, the sample and its
- * tier, the completion modes, the native difficulty distribution, the coverage gaps and the Chinese
- * caveats. Nothing here calls the network, a store or a model: the panel is a pure projection of the
- * `weakness` response the page already holds. A missing estimate is shown as "数据不足" with the
- * sample that missed the gate, never as a zero band, and the official account rating is stated to be
- * not loaded, with the platform page that explains user rating vs. problem rating.
- */
-export function Ability({ ability }: { ability: AbilityViewData }) {
+/** Personal calibration and descriptive evidence, projected from the typed weakness response. */
+export function Ability({ ability, onSaved }: { ability: AbilityViewData; onSaved: () => void }) {
   const estimate = ability.estimate;
   const estimated = estimate.status === 'estimated';
   return (
-    <Panel title="能力评估（本地启发式，非官方 rating）">
+    <Panel title="能力评估与练习记录">
       <Notice>
-        该评估只使用本地导入的题目难度与复盘记录：有效样本（已通过、带原生难度数值且非已知辅助/参考题解）达到{' '}
-        {estimate.minimumSampleSize} 道才给出训练难度带；数据不足时显示“未知”，不会给出 0 分或“新手”结论。
-        {ABILITY_NO_CONVERSION_NOTE} 官方账号 rating 未加载（
-        <ExternalLink href={ability.officialRating.apiHelpUrl}>{ABILITY_OFFICIAL_RATING_LINK_TEXT}</ExternalLink>
-        ）。
+        个人水平与练习选题是两个不同的量：基础题练得多、近期题目变简单，都不能据此降低能力评价。
+        当前使用有来源的个人校准作为水平参考；没有校准时保持“待校准”。{ABILITY_NO_CONVERSION_NOTE}
+        官方账号 rating 未加载（<ExternalLink href={ability.officialRating.apiHelpUrl}>{ABILITY_OFFICIAL_RATING_LINK_TEXT}</ExternalLink>）。
       </Notice>
+      <AbilityCalibrationEditor key={ability.accountId + ':' + ability.trainingReference.revision} ability={ability} onSaved={onSaved} />
       <AbilityHistory history={ability.history} platform={ability.platform} />
-      <h3>近期训练建议（近期不足时参考历史）</h3>
-      {estimated ? (
-        <>
-        <Stats
-          items={[
-            { label: '训练难度基线', value: `${estimate.baselineTrainingLevel} 左右` },
-            { label: '有效样本', value: `${estimate.sampleSize} 题` },
-            { label: '基线练习区间', value: abilityPoolText(estimate.baselinePool) },
-            { label: '拔高练习区间', value: abilityPoolText(estimate.stretchPool) },
-            { label: '四分位区间', value: abilityPoolText(estimate.quartileBand) },
-            {
-              label: '置信度',
-              value: estimate.confidence === null ? '未知' : estimate.confidence === 'medium' ? '中低' : '低',
-            },
-          ]}
-        />
-        <p className="icpc-muted">依据：{abilitySampleText(ability)}；置信度：{estimate.confidence === null ? '未知' : ABILITY_CONFIDENCE_LABELS[estimate.confidence]}。</p>
-        </>
-      ) : (
-        <>
-          <Empty>{abilityEstimateHeadline(ability)}</Empty>
-          {abilityNativeScaleOnly(ability) ? (
-            <p className="icpc-muted">
-              该平台只提供自己的原生难度刻度：请以下方的“原生难度分布”分位数为准，CF 训练难度带不适用于该平台；
-              官方账号 rating 仍未加载。
-            </p>
-          ) : (
-            <p className="icpc-muted">
-              当前有效样本 {estimate.sampleSize} / {estimate.minimumSampleSize} 道：补齐题目元数据、难度数值与复盘后可以重新评估。
-            </p>
-          )}
-        </>
-      )}
+      <details>
+        <summary>近期练习样本统计（描述性，不是实力评分）</summary>
+        {estimated ? <>
+          <Stats items={[
+            { label: '练习难度中位数（取整）', value: estimate.baselineTrainingLevel },
+            { label: '有效样本', value: estimate.sampleSize + ' 题' },
+            { label: '练习样本 P25–P75', value: abilityPoolText(estimate.quartileBand) },
+          ]} />
+          <p className="icpc-muted">样本口径：{abilitySampleText(ability)}。此数值不作为计划的水平上限或下限。</p>
+        </> : <Empty>{abilityEstimateHeadline(ability)}</Empty>}
+      </details>
 
       <h3>已通过题的完成方式（每题只取最新复盘）</h3>
       <Stats
@@ -151,7 +118,7 @@ export function Ability({ ability }: { ability: AbilityViewData }) {
       </details>
       <p className="icpc-muted">
         报告版本 {ability.version} · 启发式版本 {estimate.heuristicVersion} · 计算时间 {ability.computedAt}
-        。训练计划使用这里的聚合能力统计与真实候选题：发给模型的摘要只含聚合量，不含账号标识、提交明细或复盘笔记。
+        。训练计划使用个人水平校准、聚合练习统计与真实候选题：发给模型的摘要只含聚合量，不含账号标识、提交明细或复盘笔记。
       </p>
     </Panel>
   );

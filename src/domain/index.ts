@@ -412,3 +412,5 @@ export {
 } from './cancellation.js';
 
 export { type KnowledgeDifficultyBand } from './knowledge-difficulty.js';
+
+export * from './ability-calibration.js';

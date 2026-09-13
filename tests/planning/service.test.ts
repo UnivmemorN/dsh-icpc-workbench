@@ -1266,15 +1266,37 @@ test('prepared plans include earlier evidence and detect its change while the re
     const history = stored.preparation.ability.history!;
     assert.equal(history.periods[2]!.eligibleDistinct, 6);
     assert.equal(history.periods[2]!.baselineTrainingLevel, 2500);
-    const recentBaseline = stored.preparation.ability.baselineTrainingLevel;
+    const recentBaseline = stored.preparation.ability.history!.periods[1]!.baselineTrainingLevel;
     clock.value = LATER;
     assert.equal((await workbench.revalidatePlanInput(stored.preparation, TOKEN)).ok, true, 'elapsed time alone preserves the preparation');
     await store.upsertProblems(old.map(p => ({ ...p, ratings: [{ dimension: 'rating', value: 3000, scale: null, raw: '3000' }] })));
     const current = await workbench.weakness({ accountId: scope.account.id }, TOKEN);
-    assert.equal(current.ability.estimate.baselineTrainingLevel, recentBaseline);
+    assert.equal(current.ability.history.periods[1]!.baselineTrainingLevel, recentBaseline);
     const changed = await workbench.revalidatePlanInput(stored.preparation, TOKEN);
     assert.equal(changed.ok, false);
     if (!changed.ok) assert.equal(changed.staleness.reason, 'ability_changed');
     assert.equal(scripted.calls.length, 0);
+  }, scripted);
+});
+
+test('account calibration reaches free preparation and changes invalidate it before any model call', async () => {
+  const scripted = scriptedGenerator(async () => { throw Error('No model dispatch expected'); });
+  await withBench(async ({ store, workbench, planning, scope }) => {
+    const record = await workbench.calibrateAbility({ accountId: scope.account.id, expectedRevision: 0, range: { min: 1700, max: 2200 } }, TOKEN);
+    assert.equal(record.source, 'self_report');
+    const prepared = await planning.prepare({ requestId: REQUEST, accountId: scope.account.id }, TOKEN);
+    assert.equal(prepared.outcome, 'prepared');
+    const stored = (await store.getPlanAttempt(REQUEST))!;
+    assert.deepEqual(stored.preparation.ability.trainingReference?.range, record.range);
+    assert.equal(stored.preparation.ability.baselinePool, null);
+    assert.equal((await workbench.revalidatePlanInput(stored.preparation, TOKEN)).ok, true);
+    await workbench.calibrateAbility({ accountId: scope.account.id, expectedRevision: 1, range: { min: 1800, max: 2300 } }, TOKEN);
+    const stale = await workbench.revalidatePlanInput(stored.preparation, TOKEN);
+    assert.equal(stale.ok, false);
+    if (!stale.ok) assert.equal(stale.staleness.reason, 'ability_changed');
+    const run = await planning.run({ requestId: REQUEST, accountId: scope.account.id }, TOKEN);
+    assert.equal(run.outcome, 'refused');
+    assert.equal(scripted.calls.length, 0);
+    assert.deepEqual((await store.getPlanAttempt(REQUEST))!.preparation.ability.trainingReference?.range, { min: 1700, max: 2200 }, 'old preparation is immutable');
   }, scripted);
 });

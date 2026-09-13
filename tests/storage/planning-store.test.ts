@@ -463,6 +463,7 @@ void test('new history survives persisted plan validation while legacy preparati
   assert.deepEqual(validatePlanAttempt(current), current);
   const legacy = structuredClone(current);
   delete (legacy.preparation.ability as { history?: unknown }).history;
+  delete (legacy.preparation.ability as { trainingReference?: unknown }).trainingReference;
   (legacy.preparation.ability as { version: string }).version = 'ability.1';
   Object.assign(legacy.preparation, { evidenceHash: planPreparationEvidenceHash(legacy.preparation) });
   const restored = validatePlanAttempt(legacy);

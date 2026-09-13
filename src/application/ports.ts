@@ -613,6 +613,10 @@ export interface MergedProblemBrowsePage {
  * - job counters survive restarts and are never reset by an update.
  */
 export interface TrainingStore {
+  /** Latest account calibration, including explicit withdrawals. Imports never change it. */
+  getAbilityCalibration(accountId: string): Promise<import('../domain/ability-calibration.js').AbilityCalibration | null>;
+  /** Append exactly the next revision; expectedRevision 0 means no prior calibration. */
+  saveAbilityCalibration(record: import('../domain/ability-calibration.js').AbilityCalibration, expectedRevision: number): Promise<void>;
   capabilities(): StoreCapabilities;
 
   // Sources, accounts & incremental sync

@@ -1,5 +1,9 @@
 /**
- * Account ability assessment (Sprint 11a).
+ * Account ability assessment.
+ *
+ * Since ability.3, trainingReference is the sole player-level reference: self-report or
+ * uncalibrated. The legacy estimate below is retained for API readers as descriptive practice
+ * data only; its median-derived pools are withheld from new planning inputs.
  *
  * This module answers exactly one bounded question: "which Codeforces **training** difficulty band
  * does the imported solving history support?" It is deliberately not an official-rating estimate:
@@ -42,6 +46,7 @@
  * never rewritten — and no upper bound is invented, because the official CF problem rating has no
  * documented maximum. An insufficient sample yields `unknown` — never `0` and never "newbie".
  */
+import { validateAbilityCalibration, type AbilityCalibration, type AbilityTrainingReference } from './ability-calibration.js';
 import { invariant, requireFiniteInt } from './errors.js';
 import { assertIsoTimestamp, type SourcePlatform } from './ids.js';
 import { deepFreeze } from './immutable.js';
@@ -54,7 +59,7 @@ import { expectedRatingDimension } from './training-stats.js';
 const DAY_MS = 86_400_000;
 
 /** Version of the assessment shape and its counting rules; bump when an exported meaning changes. */
-export const ABILITY_ASSESSMENT_VERSION = 'ability.2';
+export const ABILITY_ASSESSMENT_VERSION = 'ability.3';
 
 /** Version of the Codeforces training-band heuristic alone; the numbers below belong to it. */
 export const CF_TRAINING_BAND_HEURISTIC_VERSION = 'cf-rating-band.1';
@@ -108,7 +113,7 @@ export type AbilityEvidenceReasonCode = (typeof ABILITY_EVIDENCE_REASONS)[number
  */
 export const ABILITY_REASON_TEXT: Readonly<Record<AbilityEvidenceReasonCode, string>> = {
   heuristic_unvalidated:
-    '该训练难度带是本地透明启发式（样本中位数取整到 100 作为基线，四分位区间是样本自身的 P25–P75 描述性范围，不是校准过的置信区间或不确定性区间），未经过官方或经验校准，不是 Codeforces 官方 rating，也不是校准过的 Elo 分。',
+    '练习难度中位数与 P25–P75 只描述选过的题，不能作为选手实力或能力区间。个人水平使用有来源的校准；未校准时保持未知，不把基础题的数量当成低水平证据。',
   selection_bias_practice_vs_contest:
     '样本来自平时练习而不是正式比赛：练习环境、题面提示与时间压力都和比赛不同，练习表现可能高估或低估比赛表现。',
   incomplete_imports: '导入不完整：有尝试题缺少本地元数据或难度数值，可用样本可能不完整。',
@@ -344,6 +349,9 @@ export interface AbilityHistoryComparison {
 
 /** One account's complete ability assessment. */
 export interface AbilityAssessment {
+  readonly calibration: AbilityCalibration | null;
+  /** Player-level reference is never derived from a practice median. */
+  readonly trainingReference: AbilityTrainingReference;
   readonly version: string;
   readonly accountId: string;
   readonly sourceInstanceId: string;
@@ -353,6 +361,7 @@ export interface AbilityAssessment {
   readonly last90Days: AbilityWindowCounts;
   readonly completionModes: AbilityCompletionModes;
   readonly nativeDifficulty: readonly AbilityNativeDistribution[];
+  /** @deprecated Legacy practice summary; median and pools are not player ability. Use trainingReference. */
   readonly estimate: AbilityTrainingEstimate;
   /** Always evaluates all-time, recent and earlier solves independently. */
   readonly history: AbilityHistoryComparison;
@@ -365,6 +374,7 @@ export interface AbilityAssessment {
 }
 
 export interface ComputeAbilityAssessmentInput {
+  readonly calibration?: AbilityCalibration | null;
   readonly accountId: string;
   readonly sourceInstanceId: string;
   readonly platform: SourcePlatform;
@@ -386,6 +396,8 @@ export interface ComputeAbilityAssessmentInput {
  * is closed, a later caller cannot accidentally forward raw rows to a model.
  */
 export interface AbilityPlanningAggregate {
+  /** Absent only in legacy immutable preparations; never synthesize it when reading those. */
+  readonly trainingReference?: AbilityTrainingReference;
   /** Absent in legacy immutable preparations; present in newly prepared plans. */
   readonly history?: AbilityHistoryComparison;
   readonly version: string;
@@ -968,7 +980,15 @@ export function computeAbilityAssessment(input: ComputeAbilityAssessmentInput): 
   ).length;
   const codes = orderedReasons(reportReasons);
 
+  const calibration = input.calibration == null ? null : validateAbilityCalibration(input.calibration);
+  invariant(calibration === null || calibration.accountId === accountId, 'invalid_input', 'calibration belongs to another account');
+  invariant(calibration === null || input.platform === 'codeforces', 'invalid_input', 'CF self-assessment belongs to a Codeforces account');
+  const trainingReference: AbilityTrainingReference = {
+    source: calibration?.range ? 'self_report' : 'uncalibrated',
+    scale: 'codeforces', range: calibration?.range ?? null, revision: calibration?.revision ?? 0,
+  };
   return deepFreeze({
+    calibration, trainingReference,
     version: ABILITY_ASSESSMENT_VERSION,
     accountId,
     sourceInstanceId,
@@ -1020,16 +1040,17 @@ export function aggregateAbilityForPlanning(report: AbilityAssessment): AbilityP
     version: report.version,
     history: report.history,
     platform: report.platform,
-    estimateStatus: estimate.status,
-    estimateBasis: estimate.basis,
+    trainingReference: report.trainingReference,
+    estimateStatus: 'unknown',
+    estimateBasis: null,
     heuristicVersion: estimate.heuristicVersion,
-    confidence: estimate.confidence,
+    confidence: null,
     sampleSize: estimate.sampleSize,
     minimumSampleSize: estimate.minimumSampleSize,
-    baselineTrainingLevel: estimate.baselineTrainingLevel,
+    baselineTrainingLevel: null,
     quartileBand: estimate.quartileBand,
-    baselinePool: estimate.baselinePool,
-    stretchPool: estimate.stretchPool,
+    baselinePool: null,
+    stretchPool: null,
     counts: report.counts,
     last90Days: report.last90Days,
     completionModesAllTime: report.completionModes.allTime,

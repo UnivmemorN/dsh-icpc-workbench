@@ -1394,3 +1394,21 @@ void test('a mid-registration failure releases earlier routes before rejecting',
   assert.deepEqual(released, [`${API_PREFIX}sync.page`, `${API_PREFIX}account.create`]);
   assert.equal(reported.length, 1);
 });
+
+void test('ability.calibrate saves honest per-account provenance and refuses stale, foreign-scale or cancelled writes', async () => {
+  await withBench({}, async bench => {
+    const account = (await ok(bench, 'account.create', { platform: 'codeforces', handle: 'alice' })).account;
+    const request = { accountId: account.id, expectedRevision: 0, range: { min: 1700, max: 2200 } };
+    const result = await ok(bench, 'ability.calibrate', request);
+    assert.equal(result.source, 'self_report');
+    assert.equal(result.revision, 1);
+    assert.deepEqual((await ok(bench, 'weakness', { accountId: account.id })).ability.trainingReference.range, request.range);
+    assert.equal((await bench.post('ability.calibrate', request)).status, 409);
+    assert.equal((await bench.post('ability.calibrate', { ...request, expectedRevision: 1, source: 'official' })).status, 400);
+    const luogu = (await ok(bench, 'account.create', { platform: 'luogu', handle: '123' })).account;
+    assert.equal((await bench.post('ability.calibrate', { ...request, accountId: luogu.id })).status, 400);
+    const abort = new AbortController(); abort.abort();
+    await bench.post('ability.calibrate', { ...request, expectedRevision: 1, range: null }, abort.signal);
+    assert.equal((await bench.store.getAbilityCalibration(account.id))!.revision, 1);
+  });
+});

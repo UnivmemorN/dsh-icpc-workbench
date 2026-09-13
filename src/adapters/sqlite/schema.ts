@@ -10,7 +10,7 @@
  * - **v0** means "no store tables yet": an empty file is initialized transactionally, a file
  *   with our marker table but no data tables is migrated after a consistent backup, and any
  *   other v0 layout is rejected instead of being migrated.
- * - **v1**, **v2** and **v3** (this build's previous versions) are recognized exactly — marker
+ * - **v1**, **v2**, **v3** and **v4** (this build's previous versions) are recognized exactly — marker
  *   plus their own table set — copied consistently and then migrated to the current version in one
  *   transaction that only adds tables. Existing rows are retained.
  * - A failure while initializing or migrating rolls back, so the original file stays readable.
@@ -19,7 +19,7 @@
  * {@link SCHEMA_DDL_V2}/{@link applySchemaV2} and {@link SCHEMA_DDL_V3}/{@link applySchemaV3} keep
  * creating exactly their own version's tables **and write exactly their own literal
  * `user_version`**, so a fixture built with them is a real older database and the migration under
- * test is the real one. The current version adds {@link SCHEMA_DDL_V4} on top.
+ * test is the real one. The current version adds {@link SCHEMA_DDL_V5} on top.
  *
  * All metadata the adapter writes are immutable JSON bodies plus indexed identity columns.
  */
@@ -30,7 +30,8 @@ import { StorageError } from './errors.js';
 export const STORE_MARKER = 'dsh-icpc-workbench/training-store';
 
 /** Schema version this build reads and writes. */
-export const STORE_SCHEMA_VERSION = 4;
+export const STORE_SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION_V4 = 4;
 
 /** Version of an uninitialized or pre-store database. */
 export const SCHEMA_VERSION_EMPTY = 0;
@@ -348,7 +349,12 @@ export const SCHEMA_DDL_V4: readonly string[] = [
  * `v1`/`v2`/`v3` are recognizable older stores that must be copied and migrated; `current` is
  * this build's own version. Anything else is refused.
  */
-export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'v3' | 'current';
+export const STORE_TABLES_V5: readonly string[] = [...STORE_TABLES_V4, 'ability_calibrations'];
+/** Append-only account self-assessment history. No existing row is rewritten. */
+export const SCHEMA_DDL_V5: readonly string[] = [
+  'CREATE TABLE ability_calibrations (account_id TEXT NOT NULL REFERENCES accounts(id), revision INTEGER NOT NULL CHECK(revision > 0), body TEXT NOT NULL, PRIMARY KEY(account_id, revision))',
+];
+export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'v3' | 'v4' | 'current';
 
 function pragmaRow(db: DatabaseSync, sql: string): Record<string, unknown> | undefined {
   return db.prepare(sql).get() as Record<string, unknown> | undefined;
@@ -406,8 +412,13 @@ export function detectSchemaState(db: DatabaseSync): SchemaState {
   const tables = tableNames(db);
   if (version === STORE_SCHEMA_VERSION) {
     requireStoreMarker(db, version);
-    requireTables(tables, STORE_TABLES_V4, version);
+    requireTables(tables, STORE_TABLES_V5, version);
     return 'current';
+  }
+  if (version === SCHEMA_VERSION_V4) {
+    requireStoreMarker(db, version);
+    requireTables(tables, STORE_TABLES_V4, version);
+    return 'v4';
   }
   if (version === SCHEMA_VERSION_V3) {
     requireStoreMarker(db, version);
@@ -500,7 +511,7 @@ export function applySchemaV3(db: DatabaseSync): void {
 }
 
 /**
- * Apply the v4 additions and move `user_version` to this build's current version.
+ * Apply the frozen v4 additions and write exactly user_version 4.
  *
  * Additive only: `plan_attempts` and its indexes are created empty. No existing table is
  * rewritten and no existing row is touched.
@@ -509,7 +520,7 @@ export function applySchemaV4(db: DatabaseSync): void {
   for (const statement of SCHEMA_DDL_V4) {
     db.exec(statement);
   }
-  db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION_V4}`);
 }
 
 /**
@@ -632,6 +643,18 @@ export function migrateSchemaV1ToV2(db: DatabaseSync): void {
  */
 export function initializeSchemaV1(db: DatabaseSync): void {
   inTransaction(db, () => applySchemaV1(db), 'schema initialization');
+}
+
+/** Add schema v5 while keeping all historical DDL and helpers frozen. Caller already backed up. */
+export function migrateToSchemaV5(db: DatabaseSync, from: number): void {
+  inTransaction(db, () => {
+    if (from < 1) applySchemaV1(db);
+    if (from < 2) applySchemaV2(db);
+    if (from < 3) applySchemaV3(db);
+    if (from < 4) applySchemaV4(db);
+    for (const statement of SCHEMA_DDL_V5) db.exec(statement);
+    db.exec('PRAGMA user_version = 5');
+  }, 'schema v5 migration');
 }
 
 function inTransaction(db: DatabaseSync, work: () => void, label: string): void {

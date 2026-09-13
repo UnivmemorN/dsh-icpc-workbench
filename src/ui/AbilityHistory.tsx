@@ -4,10 +4,10 @@ import { abilityHistoryLabel, abilityPeriodValue } from './ability-history-view.
 /** Always-visible whole-history/recent/earlier assessments; no period hides another period. */
 export function AbilityHistory({ history, platform }: { history: AbilityHistoryComparison; platform: SourcePlatform }) {
   return (
-    <section aria-label="历史与近期能力对照">
-      <h3>历史与近期能力对照</h3>
+    <section aria-label="历史与近期练习分布">
+      <h3>历史与近期练习分布</h3>
       <p className="icpc-muted">
-        全部记录会持续参与评估，即使近期样本已足够。按每题首次已知 AC 时间划分；
+        全部记录持续保留为训练证据，各期中位数只描述练习选题，不能作为能力评级。按每题首次已知 AC 时间划分；
         旧题重复 AC 不会变成新题。各期所有有效题目均参与，已知使用提示或题解的题目排除。
       </p>
       <div className="icpc-history-grid">
@@ -19,7 +19,7 @@ export function AbilityHistory({ history, platform }: { history: AbilityHistoryC
             <p>其中有效独立记录 {period.independentEligibleDistinct} 题</p>
             <p className="icpc-muted">已排除辅助 / 题解 {period.excludedDistinct} 题；其余缺少或无效难度 {period.missingOrInvalidRatingDistinct} 题。</p>
             {period.estimateStatus === 'estimated' && <p className="icpc-muted">
-              估计样本四分位 {period.quartileBand?.min}–{period.quartileBand?.max}；
+              练习样本四分位 {period.quartileBand?.min}–{period.quartileBand?.max}；
               {period.independentlyConfirmed ? '均有独立复盘' : '包含独立状态未知的 AC'}。
             </p>}
             <details>

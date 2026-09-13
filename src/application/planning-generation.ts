@@ -29,7 +29,7 @@ import type { ModelCallResult } from './ports.js';
 import { MAX_PLANNING_CANDIDATES, type PlanAttemptSettings, type PlanAttemptWeakTag } from './planning-types.js';
 
 /** Prompt identity this build records for planning calls; the service reuses it when reserving. */
-export const PLANNING_PROMPT_VERSION = 'planning-v2-history';
+export const PLANNING_PROMPT_VERSION = 'planning-v3-calibration';
 
 /** Approved reasoning effort of every planning call; v1 never runs a lower effort. */
 export const PLANNING_EFFORT = 'max';

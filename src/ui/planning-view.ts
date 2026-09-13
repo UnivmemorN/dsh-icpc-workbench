@@ -11,7 +11,7 @@
  * attempt into a retry, or a non-Codeforces report into "insufficient data".
  */
 import type { PlanAttemptStatus } from '../application/planning-types.js';
-import { ABILITY_BASIS_LABELS, ABILITY_CONFIDENCE_LABELS } from './ability-view.js';
+import { ABILITY_BASIS_LABELS } from './ability-view.js';
 
 // ---------------------------------------------------------------------------------------
 // Mode and scheduling bounds
@@ -457,6 +457,7 @@ export interface PlanningAbilityRange {
 
 /** Structural view of the identifier-free ability aggregate a preparation carries. */
 export interface PlanningAbilityView {
+  readonly trainingReference?: import('../domain/ability-calibration.js').AbilityTrainingReference;
   readonly platform: string;
   readonly estimateStatus: 'estimated' | 'unknown';
   readonly estimateBasis: 'recent_independent' | 'recent_observed' | 'historical' | null;
@@ -498,18 +499,18 @@ function rangeText(range: PlanningAbilityRange | null): string {
  */
 export function planningAbilitySummary(ability: PlanningAbilityView): PlanningAbilitySummary {
   const nativeCount = ability.nativeDifficulty.reduce((total, row) => total + row.count, 0);
-  const estimated = ability.estimateStatus === 'estimated' && ability.baselineTrainingLevel !== null;
-  const headline = estimated
-    ? `训练难度参考 ${ability.baselineTrainingLevel} 左右`
+  const reference = ability.trainingReference;
+  const headline = reference?.range
+    ? 'CF 水平 ' + rangeText(reference.range) + '（用户自评）'
     : ability.platform !== 'codeforces' && nativeCount > 0
       ? '原生刻度评估（CF 估计不适用）'
-      : `未知（有效样本 ${ability.sampleSize} / ${ability.minimumSampleSize}）`;
-  const basis = ability.estimateBasis === null ? '无可用样本' : ABILITY_BASIS_LABELS[ability.estimateBasis];
+      : '个人水平待校准';
+  const basis = ability.estimateBasis === null ? '描述性练习样本' : ABILITY_BASIS_LABELS[ability.estimateBasis];
   return {
     headline,
     sample: `${ability.sampleSize} / ${ability.minimumSampleSize} 题（${basis}）`,
     band: rangeText(ability.quartileBand),
-    confidence: ability.confidence === null ? '未知' : ABILITY_CONFIDENCE_LABELS[ability.confidence],
+    confidence: reference?.range ? '用户自评（非官方 rating）' : '未校准',
     native: ability.nativeDifficulty.map((row) =>
       row.count === 0
         ? `${row.dimension}：暂无可用的原生数值样本（${row.missing} 题缺失）`

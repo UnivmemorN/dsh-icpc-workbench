@@ -29,7 +29,7 @@ function fixture() {
 test('host composition keeps activation free, persists settings/accounts and creates a restorable backup',async()=>{
  const f=fixture();let runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.calls(),0);assert.equal(f.routes.size,40); // 34 stage-06 routes + problem.mergedBrowse (stage 08b) + the 5 AI-planning routes (stage 11d)
+  assert.equal(f.calls(),0);assert.equal(f.routes.size,41); // Includes the account-scoped ability.calibrate operation.
   const boot=await f.call('bootstrap');assert.equal(boot.status,200);assert.equal(boot.body.value.settings.revision,1);assert.equal(boot.body.value.sources.length,2);assert.equal(boot.body.value.hydro.implemented,false);assert.equal(boot.body.value.hostVersion,'0.1.5-rc.2');
   assert.equal(f.calls(),0);
   const account=await f.call('account.create',{platform:'codeforces',handle:'Tourist'});assert.equal(account.status,200);

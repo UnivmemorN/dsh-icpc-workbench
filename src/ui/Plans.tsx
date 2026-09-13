@@ -171,12 +171,12 @@ export function Plans(){
    <p className="icpc-muted">数据披露：{view.disclosure}。一次生成只发起一次模型调用，费用取决于输入和输出用量；候选原始标签只是临时参考。</p>
    <Stats items={[
     {label:'能力评估（聚合）',value:summary.headline},
-    {label:'四分位区间',value:summary.band},
+    {label:'练习样本 P25–P75',value:summary.band},
     {label:'样本',value:summary.sample},
-    {label:'置信度',value:summary.confidence},
+    {label:'水平来源',value:summary.confidence},
    ]}/>
    {summary.native.length>0&&<ul className="icpc-diagnosis">{summary.native.map(line=><li key={line}>{line}</li>)}</ul>}
-   {view.ability.history && <p className="icpc-muted">AI 同时读取历史与近期对照：
+   {view.ability.history && <p className="icpc-muted">AI 同时读取历史与近期练习分布：
     {view.ability.history.periods.map(period => abilityHistoryLabel(period.period, view.ability.history!.recentWindowDays) + '：' + abilityPeriodValue(period, view.ability.platform) + '（有效 ' + period.eligibleDistinct + ' 题）').join('；')}。
    </p>}
    <div className="icpc-actions"><button type="button" onClick={()=>navigate('weakness')}>查看完整能力评估</button></div>

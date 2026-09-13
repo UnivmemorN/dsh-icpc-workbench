@@ -96,6 +96,7 @@ import {
   mapPlatformFailure,
   requireCallToken,
   validateAccountCreate,
+  validateAbilityCalibrate,
   validateImportApply,
   validateImportPreview,
   validateMaterialRefresh,
@@ -466,6 +467,10 @@ function businessRoutes(context: ApiContext): readonly BusinessRouteEntry[] {
       method: 'POST',
       validate: validateRetroRecord,
       handle: async (input, token) => context.workbench.recordRetrospective(input, token),
+    }),
+    businessRoute(WORKBENCH_API_OPERATIONS.abilityCalibrate, {
+      method: 'POST', validate: validateAbilityCalibrate,
+      handle: async (input, token) => context.workbench.calibrateAbility(input, token),
     }),
     businessRoute(WORKBENCH_API_OPERATIONS.weakness, {
       method: 'POST',

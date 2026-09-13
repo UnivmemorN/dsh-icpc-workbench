@@ -536,8 +536,8 @@ void test('the planning aggregate carries no account, handle or row identifiers'
   });
   const aggregate = aggregateAbilityForPlanning(report);
 
-  assert.equal(aggregate.estimateStatus, 'estimated');
-  assert.equal(aggregate.baselineTrainingLevel, 1600);
+  assert.equal(aggregate.estimateStatus, 'unknown', 'practice statistics do not estimate player ability');
+  assert.equal(aggregate.baselineTrainingLevel, null);
   assert.equal(aggregate.platform, 'codeforces');
   assert.ok(aggregate.caveats.length > 0);
   const serialized = JSON.stringify(aggregate);
@@ -631,4 +631,25 @@ void test('non-CF history remains native and an empty recent period never borrow
   assert.equal(period.nativeDifficulty[0]!.median, 2.5);
   assert.equal(period.baselineTrainingLevel, null);
   assert.equal(period.estimateStatus, 'unknown');
+});
+
+void test('self-assessment survives easy practice without relabelling the median as ability', () => {
+  const problems = Array.from({ length: 30 }, (_, i) => problem('easy-' + i, { ratings: [rating(1100)] }));
+  const input = { problems, submissions: problems.map((p, i) => submission(ALICE, p, 'cal-' + i, 'accepted', RECENT)) };
+  const calibration = { accountId: ALICE, revision: 1, recordedAt: NOW, source: 'self_report' as const, scale: 'codeforces' as const, range: { min: 1700, max: 2200 } };
+  const report = assess({ ...input, calibration });
+  assert.equal(report.estimate.medianRating, 1100, 'raw descriptive statistics stay truthful');
+  assert.deepEqual(report.trainingReference.range, { min: 1700, max: 2200 });
+  assert.equal(report.trainingReference.source, 'self_report');
+  const aggregate = aggregateAbilityForPlanning(report);
+  assert.deepEqual(aggregate.trainingReference, report.trainingReference);
+  assert.equal(aggregate.baselineTrainingLevel, null);
+  assert.equal(aggregate.baselinePool, null);
+  assert.equal(aggregate.stretchPool, null);
+  assert.equal(JSON.stringify(aggregate).includes(ALICE), false);
+  assert.equal(JSON.stringify(aggregate).includes(NOW), false);
+  assert.equal(assess(input).trainingReference.source, 'uncalibrated', 'abundant samples do not magically calibrate ability');
+  assert.throws(() => assess({ ...input, calibration: { ...calibration, accountId: BOB } }), /another account/);
+  const withdrawn = assess({ ...input, calibration: { ...calibration, revision: 2, range: null } });
+  assert.deepEqual(withdrawn.trainingReference, { source: 'uncalibrated', scale: 'codeforces', range: null, revision: 2 });
 });

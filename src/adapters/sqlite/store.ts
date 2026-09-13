@@ -36,6 +36,7 @@
  * - **Bounded reads.** List methods enforce the port's `1..500` page bound and return an
  *   opaque cursor; ordering is by the domain's stable ids, so paging is deterministic.
  */
+import { validateAbilityCalibration, type AbilityCalibration } from '../../domain/ability-calibration.js';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
@@ -173,6 +174,8 @@ import {
 } from './entities.js';
 import {
   SCHEMA_VERSION_EMPTY,
+  SCHEMA_VERSION_V4,
+  migrateToSchemaV5,
   SCHEMA_VERSION_V1,
   SCHEMA_VERSION_V2,
   SCHEMA_VERSION_V3,
@@ -181,10 +184,6 @@ import {
   backupFileName,
   configureConnection,
   detectSchemaState,
-  initializeSchemaV4,
-  migrateSchemaV1ToV4,
-  migrateSchemaV2ToV4,
-  migrateSchemaV3ToV4,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -528,6 +527,31 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
           ],
         );
       }
+    });
+  }
+
+  async getAbilityCalibration(accountId: string): Promise<AbilityCalibration | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT account_id, revision, body FROM ability_calibrations WHERE account_id = ? ORDER BY revision DESC LIMIT 1', [requireId('account id', accountId)]);
+      if (row === null) return null;
+      try {
+        const value = validateAbilityCalibration(JSON.parse(textColumn(row, 'body')));
+        invariant(value.accountId === accountId && value.revision === intColumn(row, 'revision'), 'invalid_input', 'calibration identity mismatch');
+        return value;
+      } catch (error) { throw new StorageError('corrupt_row', 'invalid ability calibration body', { cause: String(error) }); }
+    });
+  }
+
+  async saveAbilityCalibration(record: AbilityCalibration, expectedRevision: number): Promise<void> {
+    this.assertOpen();
+    const value = validateAbilityCalibration(record);
+    invariant(Number.isSafeInteger(expectedRevision) && expectedRevision >= 0 && value.revision === expectedRevision + 1, 'invalid_input', 'calibration must append the next revision');
+    return this.withWrite(() => {
+      invariant(this.find('SELECT id FROM accounts WHERE id = ?', [value.accountId]) !== null, 'missing_reference', 'calibration account is not stored');
+      const current = this.find('SELECT revision FROM ability_calibrations WHERE account_id = ? ORDER BY revision DESC LIMIT 1', [value.accountId]);
+      invariant((current === null ? 0 : intColumn(current, 'revision')) === expectedRevision, 'invalid_transition', 'calibration revision changed');
+      this.write('INSERT INTO ability_calibrations (account_id, revision, body) VALUES (?, ?, ?)', [value.accountId, value.revision, canonicalJson(value)]);
     });
   }
 
@@ -2434,20 +2458,18 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
    *
    * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
    *    switched into another journal mode or otherwise touched.
-   * 2. A supported older database (v0, v1, v2 or v3) is backed up **before** `configureConnection`,
+   * 2. A supported older database (v0, v1, v2, v3 or v4) is backed up **before** `configureConnection`,
    *    so the backup is the database as it was found and switching the journal mode is not part
    *    of the pre-migration state. The copy is verified before migration starts.
-   * 3. Migration adds tables only and runs in one transaction: `initializeSchemaV4` applies
-   *    v1+v2+v3+v4 for an empty or metadata-only database, `migrateSchemaV1ToV4` applies v2+v3+v4 to
-   *    a real v1 store, `migrateSchemaV2ToV4` adds v3+v4 to a v2 store and `migrateSchemaV3ToV4`
-   *    adds v4 to a v3 store; every row is kept and exactly one pre-migration backup is taken.
+   * 3. migrateToSchemaV5 applies only missing versions in one transaction; every existing row
+   *    is retained, and exactly one pre-migration backup was already taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
    *    succeeded, so a failed migration leaves the original file — including its original
    *    journal mode — untouched.
    */
   private openSchema(inMemory: boolean): void {
     const state = detectSchemaState(this.connection);
-    if (state === 'legacy_v0' || state === 'v1' || state === 'v2' || state === 'v3') {
+    if (state === 'legacy_v0' || state === 'v1' || state === 'v2' || state === 'v3' || state === 'v4') {
       // Keep a consistent copy of the database as found before any migration writes to it.
       const from =
         state === 'legacy_v0'
@@ -2456,22 +2478,14 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
             ? SCHEMA_VERSION_V1
             : state === 'v2'
               ? SCHEMA_VERSION_V2
-              : SCHEMA_VERSION_V3;
+              : state === 'v3' ? SCHEMA_VERSION_V3 : SCHEMA_VERSION_V4;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
       this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        if (state === 'v3') {
-          migrateSchemaV3ToV4(this.connection);
-        } else if (state === 'v2') {
-          migrateSchemaV2ToV4(this.connection);
-        } else if (state === 'v1') {
-          migrateSchemaV1ToV4(this.connection);
-        } else {
-          initializeSchemaV4(this.connection);
-        }
+        migrateToSchemaV5(this.connection, readUserVersion(this.connection));
       } catch (error) {
         if (error instanceof StorageError) {
           throw error;

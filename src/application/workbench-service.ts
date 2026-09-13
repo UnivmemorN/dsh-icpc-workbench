@@ -22,6 +22,7 @@
  * after every awaited write, so a cancelled review or preview rolls its transaction back instead of
  * leaving a half-recorded one.
  */
+import { validateAbilityCalibration, validateCalibrationRange, type AbilityCalibration, type AbilityCalibrationRange } from '../domain/ability-calibration.js';
 import {
   COMPLETION_MODES,
   DomainError,
@@ -886,6 +887,24 @@ export class WorkbenchService {
   // weakness
   // -------------------------------------------------------------------------------------
 
+  /** Save an explicit user range without touching platform records, retrospectives or earlier revisions. */
+  async calibrateAbility(request: { readonly accountId: string; readonly expectedRevision: number; readonly range: AbilityCalibrationRange | null }, token: CancellationToken): Promise<AbilityCalibration> {
+    requireToken(token); token.throwIfCancelled();
+    const accountId = requireRequiredId('accountId', request.accountId);
+    invariant(Number.isSafeInteger(request.expectedRevision) && request.expectedRevision >= 0, 'invalid_input', 'calibration expectedRevision must be nonnegative');
+    const range = validateCalibrationRange(request.range);
+    return this.store.transaction(async () => {
+      const account = await this.requireAccount(accountId, token);
+      const source = await this.store.getSourceInstance(account.sourceInstanceId);
+      invariant(source?.platform === 'codeforces', 'invalid_input', 'CF self-assessment requires a Codeforces account');
+      const record = validateAbilityCalibration({ accountId, revision: request.expectedRevision + 1, recordedAt: this.now(), source: 'self_report', scale: 'codeforces', range });
+      token.throwIfCancelled();
+      await this.store.saveAbilityCalibration(record, request.expectedRevision);
+      token.throwIfCancelled();
+      return record;
+    });
+  }
+
   /**
    * Distinct-problem weakness statistics for one account.
    *
@@ -907,8 +926,8 @@ export class WorkbenchService {
    * store read and leaves the formal report untouched.
    *
    * `ability` (Sprint 11a) is the fourth additive projection over that same read: a versioned local
-   * training-difficulty heuristic whose sample, coverage and Chinese caveats travel with the number.
-   * It adds no store read either, calls no model, and never claims an official Codeforces rating.
+   * practice summary plus a separately stored, account-scoped self-assessment. One additional
+   * calibration read is performed; no platform or model is called.
    */
   async weakness(request: WorkbenchWeaknessRequest, token: CancellationToken): Promise<WorkbenchWeaknessResult> {
     requireToken(token);
@@ -948,9 +967,10 @@ export class WorkbenchService {
         minimumIndependentProblems: WORKBENCH_MIN_WEAKNESS_SAMPLE,
       });
       // The ability assessment is a fourth pure projection over the very same evidence and the
-      // injected clock. It adds no store, platform or model read and never claims an official
-      // rating: its Codeforces training band is a versioned local heuristic with explicit caveats.
+      // injected clock. The account calibration is loaded separately; it never rewrites practice
+      // evidence or turns an imported AC into an independently completed solve.
       const ability = computeAbilityAssessment({
+        calibration: await this.store.getAbilityCalibration(account.id),
         accountId: account.id,
         sourceInstanceId: account.sourceInstanceId,
         platform: source.platform,
@@ -1296,6 +1316,7 @@ export class WorkbenchService {
       const report = this.weaknessReportOf(account, evidence);
       const ability = aggregateAbilityForPlanning(
         computeAbilityAssessment({
+          calibration: await this.store.getAbilityCalibration(account.id),
           accountId: account.id,
           sourceInstanceId: account.sourceInstanceId,
           platform: source.platform,
@@ -1406,6 +1427,7 @@ export class WorkbenchService {
     // is deliberately not ignored.
     const ability = aggregateAbilityForPlanning(
       computeAbilityAssessment({
+        calibration: await this.store.getAbilityCalibration(account.id),
         accountId: account.id,
         sourceInstanceId: account.sourceInstanceId,
         platform: source.platform,

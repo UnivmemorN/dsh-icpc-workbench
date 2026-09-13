@@ -125,8 +125,8 @@ function noRatingsReport(): AbilityAssessment {
 
 void test('estimate labels state the band, the sample and the heuristic caveat', () => {
   const ability = estimatedReport();
-  assert.equal(abilityStatValue(ability), '训练 1600 左右');
-  assert.match(abilityEstimateHeadline(ability), /训练难度参考 1600 左右/);
+  assert.equal(abilityStatValue(ability), '个人水平待校准');
+  assert.match(abilityEstimateHeadline(ability), /练习难度中位数 1600（不是实力评分）/);
   assert.match(abilityEstimateHeadline(ability), /1400 – 1800/);
   assert.equal(abilityPoolText(ability.estimate.baselinePool), '1500 – 1700');
   assert.equal(abilityPoolText(ability.estimate.stretchPool), '1700 – 1900');
@@ -151,7 +151,7 @@ void test('missing data prints unknown and named gaps instead of numbers', () =>
     retrospectives: [],
     now: NOW,
   });
-  assert.equal(abilityStatValue(empty), '数据不足');
+  assert.equal(abilityStatValue(empty), '个人水平待校准');
   assert.match(abilityEstimateHeadline(empty), /有效样本 0 \/ 5/);
   assert.equal(abilityEstimateHeadline(empty).includes('训练难度参考 0'), false);
   assert.equal(abilityBasisLabel(null), '无可用样本');
@@ -185,7 +185,7 @@ void test('historical samples are labelled as possibly stale and modes stay expl
   const ability = historicalReport();
   assert.equal(ability.estimate.basis, 'historical');
   assert.match(abilitySampleText(ability), /可能过时/);
-  assert.match(abilityEstimateHeadline(ability), /1800 左右/);
+  assert.match(abilityEstimateHeadline(ability), /练习难度中位数 1800/);
   assert.equal(abilityModeText(ability.completionModes.allTime), '独立完成 0 · 提示辅助 0 · 参考题解 0 · 无复盘（独立状态未知） 5');
   assert.equal(ABILITY_MODE_LABELS.unknown.includes('未知'), true);
   assert.equal(ABILITY_MODE_LABELS.assisted, '提示辅助');
@@ -202,7 +202,7 @@ void test('native quantiles stay native and the no-conversion statement stays ex
   assert.equal(ability.officialRating.status, 'not_loaded');
   assert.equal(ability.officialRating.apiHelpUrl, CF_OFFICIAL_RATING_API_HELP_URL);
   assert.match(ability.officialRating.note, /未加载官方账号 rating/);
-  assert.ok(ability.reasons.some((reason) => reason.includes('启发式')));
+  assert.ok(ability.reasons.some((reason) => reason.includes('不能作为选手实力')));
 });
 
 void test('a non-Codeforces report with real native values says native-scale-only, never "insufficient data"', () => {
@@ -245,6 +245,6 @@ void test('a non-Codeforces report with real native values says native-scale-onl
     retrospectives: [],
     now: NOW,
   });
-  assert.equal(abilityStatValue(empty), '数据不足');
+  assert.equal(abilityStatValue(empty), '个人水平待校准');
   assert.match(abilityEstimateHeadline(empty), /有效样本 0 \/ 5/);
 });

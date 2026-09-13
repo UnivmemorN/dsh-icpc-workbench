@@ -53,21 +53,16 @@ export function abilityNativeScaleOnly(ability: AbilityViewData): boolean {
 
 /** Compact summary value for the page-level Stats row. */
 export function abilityStatValue(ability: AbilityViewData): string {
-  const estimate = ability.estimate;
-  if (estimate.status === 'estimated' && estimate.baselineTrainingLevel !== null) {
-    return `训练 ${estimate.baselineTrainingLevel} 左右`;
-  }
-  if (abilityNativeScaleOnly(ability)) {
-    return '原生刻度评估（CF 估计不适用）';
-  }
-  return '数据不足';
+  if (ability.trainingReference.range) return abilityPoolText(ability.trainingReference.range) + '（用户自评）';
+  if (abilityNativeScaleOnly(ability)) return '原生刻度评估（CF 估计不适用）';
+  return '个人水平待校准';
 }
 
 /** One headline; the unknown branch names the sample instead of inventing a band. */
 export function abilityEstimateHeadline(ability: AbilityViewData): string {
   const estimate = ability.estimate;
   if (estimate.status === 'estimated' && estimate.baselineTrainingLevel !== null) {
-    return `训练难度参考 ${estimate.baselineTrainingLevel} 左右（四分位区间 ${abilityPoolText(estimate.quartileBand)}）`;
+    return `练习难度中位数 ${estimate.baselineTrainingLevel}（不是实力评分）（四分位区间 ${abilityPoolText(estimate.quartileBand)}）`;
   }
   if (abilityNativeScaleOnly(ability)) {
     const native = ability.nativeDifficulty.reduce((total, row) => total + row.count, 0);

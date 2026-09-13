@@ -17,6 +17,8 @@
  * (page limits are the store's own, manual text is the parser's own), so a boundary refusal happens
  * before an unbounded read, an oversized paste or a partially applied document.
  */
+import { validateCalibrationRange } from '../domain/ability-calibration.js';
+import type { ApiRequest } from '../application/workbench-api.js';
 import {
   COMPLETION_MODES,
   TRAINING_TASK_KINDS,
@@ -836,6 +838,16 @@ export function validateRetroRecord(value: unknown): ApiRetroRecordRequest {
       ? {}
       : { note: nullableString('note', object['note'], MAX_REVIEW_NOTE_CHARS) }),
   };
+}
+
+/** Strict self-assessment write; client cannot invent provenance or overwrite a stale revision. */
+export function validateAbilityCalibrate(value: unknown): ApiRequest<'ability.calibrate'> {
+  invariant(typeof value === 'object' && value !== null && !Array.isArray(value), 'invalid_input', 'calibration request required');
+  const row = value as Record<string, unknown>;
+  invariant(Object.keys(row).length === 3 && ['accountId', 'expectedRevision', 'range'].every(k => Object.hasOwn(row, k)), 'invalid_input', 'invalid calibration request fields');
+  const account = validateWeakness({ accountId: row['accountId'] });
+  invariant(Number.isSafeInteger(row['expectedRevision']) && (row['expectedRevision'] as number) >= 0, 'invalid_input', 'expectedRevision must be nonnegative');
+  return { accountId: account.accountId, expectedRevision: row['expectedRevision'] as number, range: validateCalibrationRange(row['range']) };
 }
 
 export function validateWeakness(value: unknown): ApiWeaknessRequest {
