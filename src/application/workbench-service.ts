@@ -77,6 +77,7 @@ import {
   type TrainingTaskKind,
 } from '../domain/index.js';
 import { currentDecisionPerTag } from '../domain/tags.js';
+import { MergedBankService, type MergedBankBrowseRequest } from './merged-bank-service.js';
 import {
   BROWSE_PAGE_LIMITS,
   MAX_RATING_DIMENSION_CHARS,
@@ -103,6 +104,7 @@ import type {
   WorkbenchPlanTaskView,
   WorkbenchPlanView,
   WorkbenchPlatformTagStatsView,
+  WorkbenchMergedBrowsePage,
   WorkbenchProblemBrowsePage,
   WorkbenchProblemDetail,
   WorkbenchProblemPage,
@@ -358,6 +360,8 @@ export class WorkbenchService {
   private readonly taxonomy: TaxonomyIndex;
   private readonly now: () => string;
   private readonly uniqueId: () => string;
+  /** Merged cross-site bank; it borrows this service's own summary projection. */
+  private readonly merged: MergedBankService;
 
   constructor(options: WorkbenchServiceOptions) {
     if (options === null || typeof options !== 'object') {
@@ -380,6 +384,15 @@ export class WorkbenchService {
     this.taxonomy = options.taxonomy;
     this.now = options.now;
     this.uniqueId = options.uniqueId;
+    // The merged bank is composed here, with this service's own summary projection as a callback: a
+    // merged member row therefore applies exactly the same spoiler rule as a `problem.browse` row,
+    // and the merged service stays a small delegate instead of a second spoiler implementation.
+    this.merged = new MergedBankService({
+      store: this.store,
+      uniqueId: this.uniqueId,
+      projectSummary: (problem, solved, visible, pendingReview, token) =>
+        this.projectSummary(problem, solved, visible, pendingReview, token),
+    });
   }
 
   // -------------------------------------------------------------------------------------
@@ -533,6 +546,26 @@ export class WorkbenchService {
       reveal: filters.reveal,
       pendingReviewOnly: filters.needsReviewOnly,
     };
+  }
+
+  // -------------------------------------------------------------------------------------
+  // browseMergedProblems
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * One numbered page of the merged cross-site bank (Sprint Contract 08b).
+   *
+   * A thin delegate: {@link MergedBankService} owns the grouped read, the re-validation of every
+   * store claim and the linked-evidence projection, and borrows this service's own summary
+   * projection, so a member row is byte-identical to a `problem.browse` row and a linked solve can
+   * never reveal a member's tags on its own. `problem.browse`/`problem.list` and their solved-state
+   * semantics are untouched by this operation.
+   */
+  async browseMergedProblems(
+    request: MergedBankBrowseRequest,
+    token: CancellationToken,
+  ): Promise<WorkbenchMergedBrowsePage> {
+    return this.merged.browse(request, token);
   }
 
   // -------------------------------------------------------------------------------------

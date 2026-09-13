@@ -3,6 +3,7 @@ import{useState}from'react';
 import type{ApiMaterialRefreshResult,ApiSupplementEditorial}from'../application/workbench-api.js';
 import{api}from'./api.js';
 import{Panel,Empty,Notice,ErrorNotice,ExternalLink,useWorkbench,useRequest,useAction,tagName}from'./common.js';
+import{nativeSolvedText}from'./merged.js';
 export function ProblemView({problemKey,onChange}:{problemKey:string;onChange:()=>void}){
  const {boot,accountId}=useWorkbench(),[reveal,setReveal]=useState(false),read=useRequest('problem.detail',{problemKey,accountId,reveal}),action=useAction();
  const [tutorial,setTutorial]=useState(''),[refreshed,setRefreshed]=useState<ApiMaterialRefreshResult|null>(null),[statement,setStatement]=useState(''),[materialMode,setMaterialMode]=useState<'statement'|'found'|'absent'>('statement');
@@ -11,7 +12,7 @@ export function ProblemView({problemKey,onChange}:{problemKey:string;onChange:()
  const changed=()=>{read.refresh();onChange();};
  if(!problem)return <Panel title="题目详情"><ErrorNotice error={read.error}/>{read.pending?<p>正在读取题目…</p>:<button onClick={read.refresh}>重试</button>}</Panel>;
  return <Panel title={problem.externalKey+' · '+problem.title} tools={<ExternalLink href={problem.url}>原题</ExternalLink>}>
- <div className="icpc-tags">{problem.rawRatings.map((r,i)=><span key={i} className="icpc-tag">{r.dimension}：{r.raw??r.value}</span>)}<span className="icpc-tag">{problem.solvedByAccount?'该账号已通过':'尚未确认通过'}</span></div>
+ <div className="icpc-tags">{problem.rawRatings.map((r,i)=><span key={i} className="icpc-tag">{r.dimension}：{r.raw??r.value}</span>)}<span className="icpc-tag">{nativeSolvedText(problem.solvedByAccount,accountId)}</span></div>
  <ErrorNotice error={action.error}/><h3>题面</h3>{problem.statement?<pre>{problem.statement}</pre>:<Empty>本地尚无完整题面，可刷新平台材料或手工补充。</Empty>}
  <p className="icpc-muted">{problem.snapshot?'快照 v'+problem.snapshot.version+' · '+problem.snapshot.sourceCount+' 个来源 · '+problem.snapshot.solutionCount+' 个解法':'尚未建立材料快照'}{problem.staleAnalysisCount?' · '+problem.staleAnalysisCount+' 份旧分析已过期':''}</p>
  {!problem.spoilersVisible?<Notice>算法标签和题解默认隐藏。<button onClick={()=>setReveal(true)}>显示算法标签与题解</button></Notice>:<>

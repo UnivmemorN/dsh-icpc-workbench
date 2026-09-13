@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { JUMP_HINT, jumpHint, pagerDisplay, parseJumpPage } from '../../src/ui/pager.js';
+import { JUMP_HINT, jumpHint, pageNumbers, pagerDisplay, parseJumpPage } from '../../src/ui/pager.js';
 
 void test('the jump field accepts only a positive safe-integer page', () => {
   assert.equal(parseJumpPage('7'), 7);
@@ -53,4 +53,14 @@ void test('a confirmed empty page displays 第 0 / 0 页 and stays non-navigable
     currentPage: 3,
     navigable: true,
   });
+});
+
+void test('the numbered pager keeps the first, last and current page reachable', () => {
+  assert.deepEqual(pageNumbers(1, 3), [1, 2, 3]);
+  assert.deepEqual(pageNumbers(1, 7), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(pageNumbers(50, 500), [1, null, 48, 49, 50, 51, 52, null, 500]);
+  assert.deepEqual(pageNumbers(1, 500), [1, 2, 3, null, 500]);
+  assert.deepEqual(pageNumbers(500, 500), [1, null, 498, 499, 500]);
+  // No confirmed response means no page numbers at all, never a fabricated first page.
+  assert.deepEqual(pageNumbers(1, 0), []);
 });

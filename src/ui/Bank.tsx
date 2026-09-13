@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Panel, Empty, Notice, ErrorNotice, useWorkbench, useRequest, tagName } from './common.js';
 import { ImportPanel } from './Imports.js';
-import { jumpHint, pagerDisplay, parseJumpPage } from './pager.js';
+import { MergedBank } from './MergedBank.js';
+import { jumpHint, pageNumbers, pagerDisplay, parseJumpPage } from './pager.js';
 import { ProblemView } from './Problem.js';
 
 /** Page sizes the bank offers; the API accepts any size within 1..100. */
@@ -64,34 +65,6 @@ const DIMENSION_BLANK_WARNING = '难度维度不能为空，已保留上一个�
 const DIMENSION_TOO_LONG_WARNING = `难度维度最多 ${MAX_DIMENSION_LENGTH} 个字符，已保留上一个维度。`;
 
 /**
- * Nearby numbered pages around `current`, with `null` marking an elided gap.
- *
- * Only the first page, the last page, the current page and two neighbours on each side are offered,
- * so a 500-page bank stays a handful of buttons instead of one control per page.
- */
-function pageNumbers(current: number, total: number): readonly (number | null)[] {
-  if (total <= 7) {
-    return Array.from({ length: total }, (_, index) => index + 1);
-  }
-  const wanted = new Set<number>([1, total, current]);
-  for (let offset = 1; offset <= 2; offset += 1) {
-    wanted.add(current - offset);
-    wanted.add(current + offset);
-  }
-  const pages = [...wanted].filter((page) => page >= 1 && page <= total).sort((left, right) => left - right);
-  const out: (number | null)[] = [];
-  let previous = 0;
-  for (const page of pages) {
-    if (page - previous > 1) {
-      out.push(null);
-    }
-    out.push(page);
-    previous = page;
-  }
-  return out;
-}
-
-/**
  * Problem bank (and the review queue when `reviewOnly`).
  *
  * The list is read through `problem.browse`: one numbered database page plus the filtered total, so
@@ -109,8 +82,13 @@ function pageNumbers(current: number, total: number): readonly (number | null)[]
  * that dimension sorts last in both directions, and its editable value stays inside the API's
  * 1..100 bound: a blank or over-long draft keeps the previous committed dimension and explains
  * itself inline. The inline problem detail below the table never disturbs this state.
+ *
+ * The header account is created before a refreshed bootstrap can contain it, so the first render may
+ * already have fallen back to the first source. Once the account appears, this component adopts that
+ * account's own source instance exactly once (see the reconciliation effect below) instead of leaving
+ * a source the API would refuse as `source_mismatch`.
  */
-export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
+export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
   const { boot, accountId, problemKey, navigate, selectedKeys, setSelectedKeys } = useWorkbench();
   const account = boot.accounts.find((entry) => entry.id === accountId);
   const [sourceId, setSourceId] = useState(account?.sourceInstanceId ?? boot.sources[0]?.id ?? '');
@@ -118,6 +96,33 @@ export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
   const platformDimension = knownRatingDimension(
     boot.sources.find((entry) => entry.id === sourceId)?.platform ?? '',
   );
+
+  // `account.create` selects the new account immediately, before the refreshed bootstrap contains
+  // it, so the initial render may have had no account and defaulted to the first source. Once the
+  // account appears, adopt its own source exactly once: with an account selected every foreign
+  // source option is disabled, so browsing another source could only answer `source_mismatch`. The
+  // per-source dimension, the page and the open detail are reset with it, and nothing else in this
+  // component (search, status, sort, selection) is touched.
+  const reconciledAccountId = useRef<string | null>(null);
+  useEffect(() => {
+    if (account === undefined || reconciledAccountId.current === account.id) {
+      return;
+    }
+    reconciledAccountId.current = account.id;
+    if (account.sourceInstanceId === sourceId) {
+      return;
+    }
+    const nextDimension =
+      knownRatingDimension(
+        boot.sources.find((entry) => entry.id === account.sourceInstanceId)?.platform ?? '',
+      ) ?? FALLBACK_RATING_DIMENSION;
+    setSourceId(account.sourceInstanceId);
+    setDimension(nextDimension);
+    setDimensionDraft(nextDimension);
+    setDimensionWarning(null);
+    setPage(1);
+    navigate('bank', '');
+  }, [account, boot.sources, navigate, sourceId]);
   const [query, setQuery] = useState('');
   const [search, setSearch] = useState('');
   const [reveal, setReveal] = useState(false);
@@ -580,6 +585,42 @@ export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
       ) : (
         <Notice>点击题目查看题面；未完成题目的标签与题解保持隐藏，直到你明确选择查看。</Notice>
       )}
+    </>
+  );
+}
+
+/**
+ * Bank page: the prominent view switch between the original single-platform bank and the merged
+ * cross-site bank.
+ *
+ * The review queue (`reviewOnly`) renders the original bank directly and never shows the toggle: it
+ * is a per-problem review workflow of one platform's account, so a cross-site view would have nothing
+ * to review. The two modes are separate components, so switching between them cannot change either
+ * one's hook order, and each keeps its own filters while it is mounted.
+ */
+export function Bank({ reviewOnly = false }: { reviewOnly?: boolean }) {
+  return reviewOnly ? <PlatformBank reviewOnly /> : <BankModes />;
+}
+
+/** The two bank views plus the switch that owns which one is visible. */
+function BankModes() {
+  const [mode, setMode] = useState<'platform' | 'merged'>('platform');
+  return (
+    <>
+      <nav className="icpc-viewswitch" aria-label="题库视图">
+        <button type="button" aria-pressed={mode === 'platform'} onClick={() => setMode('platform')}>
+          分平台题库
+        </button>
+        <button type="button" aria-pressed={mode === 'merged'} onClick={() => setMode('merged')}>
+          合并题库（跨站去重）
+        </button>
+        <span className="icpc-muted">
+          {mode === 'platform'
+            ? '按具体平台浏览、导入、审核与选题。'
+            : '汇总各平台题目及通过记录。'}
+        </span>
+      </nav>
+      {mode === 'platform' ? <PlatformBank /> : <MergedBank onSwitchToPlatform={() => setMode('platform')} />}
     </>
   );
 }

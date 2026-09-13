@@ -31,6 +31,35 @@ export function jumpHint(text: string): string | null {
   return text.trim().length > 0 && parseJumpPage(text) === null ? JUMP_HINT : null;
 }
 
+/**
+ * Nearby numbered pages around `current`, with `null` marking an elided gap.
+ *
+ * Only the first page, the last page, the current page and two neighbours on each side are offered,
+ * so a 500-page bank stays a handful of buttons instead of one control per page. Shared by the
+ * single-platform bank and the merged bank, so both number their pages identically.
+ */
+export function pageNumbers(current: number, total: number): readonly (number | null)[] {
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, index) => index + 1);
+  }
+  const wanted = new Set<number>([1, total, current]);
+  for (let offset = 1; offset <= 2; offset += 1) {
+    wanted.add(current - offset);
+    wanted.add(current + offset);
+  }
+  const pages = [...wanted].filter((page) => page >= 1 && page <= total).sort((left, right) => left - right);
+  const out: (number | null)[] = [];
+  let previous = 0;
+  for (const page of pages) {
+    if (page - previous > 1) {
+      out.push(null);
+    }
+    out.push(page);
+    previous = page;
+  }
+  return out;
+}
+
 /** Display state of one pager, derived from the confirmed response alone. */
 export interface PagerDisplay {
   /** True only after a response for the current query has arrived. */

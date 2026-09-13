@@ -17,3 +17,12 @@ test('browser API reports cancellation and expired authentication explicitly',as
  const abort=new AbortController();abort.abort();const client=new ApiClient(async()=>{throw Error('network cancellation');});await assert.rejects(()=>client.request('bootstrap',{},abort.signal),e=>e instanceof ApiClientError&&e.code==='cancelled');
  const auth=new ApiClient(async()=>new Response('unauthorized',{status:401}));await assert.rejects(()=>auth.request('bootstrap',{}),e=>e instanceof ApiClientError&&e.code==='unauthorized');
 });
+test('merged bank transport retains the account selection and exact authenticated endpoint',async()=>{
+ const input={accountIds:['selected-account'],sourceInstanceId:'luogu:www.luogu.com.cn',status:'solved' as const,page:3,limit:25};
+ let called=false;const controller=new AbortController();
+ const client=new ApiClient(async(url,init)=>{
+  called=true;assert.equal(url,'/api/icpc/v1/problem.mergedBrowse');assert.equal(init?.method,'POST');assert.equal(init?.credentials,'same-origin');assert.equal(init?.signal,controller.signal);assert.deepEqual(JSON.parse(init?.body as string),input);
+  return Response.json({apiVersion:1,ok:true,value:{items:[],page:3}});
+ });
+ await client.request('problem.mergedBrowse',input,controller.signal);assert.equal(called,true);
+});

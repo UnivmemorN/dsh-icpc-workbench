@@ -428,6 +428,14 @@ export const MAX_RATING_DIMENSION_CHARS = 100;
 export const BROWSE_PAGE_LIMITS = { minPageSize: 1, maxPageSize: 100 } as const;
 
 /**
+ * Distinct accounts one merged-bank read accepts; more is refused instead of truncated.
+ *
+ * The bound is part of the contract, not a tuning knob: a merged read resolves every selected
+ * account, so an unbounded selection would turn one request into an unbounded number of lookups.
+ */
+export const MAX_MERGED_BANK_ACCOUNTS = 32;
+
+/**
  * One numbered page of the bank: page number and size instead of a cursor.
  *
  * Every predicate is applied in SQL before both the count and the selected page, so `items` and the
@@ -468,6 +476,100 @@ export interface BrowsedProblem {
 /** One numbered bank page plus the totals of exactly the same filter set. */
 export interface ProblemBrowsePage {
   readonly items: readonly BrowsedProblem[];
+  /** Page actually returned: `1` when nothing matched, otherwise within `1..totalPages`. */
+  readonly page: number;
+  readonly pageSize: number;
+  readonly totalItems: number;
+  readonly totalPages: number;
+  readonly fetchedAt: string;
+}
+
+/**
+ * One merged-bank read (Sprint Contract 08b): the same bank, grouped by problem identity across the
+ * selected accounts' source instances.
+ *
+ * `accountIds` is a *selection*, bounded by {@link MAX_MERGED_BANK_ACCOUNTS} and holding at most one
+ * account per source instance: two accounts of one instance would describe one person twice, and the
+ * solved state of a group is a statement about the selected accounts only. An empty selection is
+ * legal for the unfiltered read, but `status` and `onlyAttempted` are statements about selected
+ * accounts and are refused without at least one.
+ *
+ * `sourceInstanceId` is a *display filter*, not an account scope: it keeps groups that have a member
+ * from that instance, while accepted evidence may still come from any selected account on an
+ * equivalent source (that is what makes a Luogu group solved by a Codeforces account observable).
+ * A difficulty sort additionally reads its raw dimension from the member of that same instance.
+ *
+ * The implementation groups stored problems before it counts, filters or pages, so `totalItems` and
+ * `items` always describe the same grouping, and it never returns more members than the selected
+ * page's groups can hold.
+ */
+export interface MergedProblemBrowseQuery {
+  readonly accountIds: readonly string[];
+  readonly sourceInstanceId?: string | null;
+  /** Solved/attempted statements about the selected accounts; refused without at least one. */
+  readonly status?: ProblemSolvedFilter | null;
+  readonly onlyAttempted?: boolean | null;
+  /** Literal case-insensitive substring over ANY member's title or external key. */
+  readonly query?: string | null;
+  readonly sort?: ProblemSort | null;
+  /** Raw rating dimension of a difficulty sort; required exactly for {@link RATING_SORTS}. */
+  readonly ratingDimension?: string | null;
+  /** 1-based page number; a page beyond the last group is clamped to the last valid page. */
+  readonly page: number;
+  readonly limit: number;
+}
+
+/** One stored problem of a merged group, plus this row's own direct solved verdict. */
+export interface MergedProblemMemberRow {
+  readonly problem: NormalizedProblem;
+  /** Selected account of this problem's own source instance, or `null` when none is selected. */
+  readonly accountId: string | null;
+  /**
+   * True only when `accountId` has an accepted submission for **this** problem's own identity.
+   * A linked solve of an equivalent problem on the other site never sets it.
+   */
+  readonly solvedByAccount: boolean;
+}
+
+/**
+ * One canonical accepted submission behind a group's solved state.
+ *
+ * One row per `(accountId, problemKey)`: the earliest accepted submission of that account for that
+ * problem identity, ordered by `submittedAt, submissionId`. It carries identity and time only —
+ * never a verdict body, a source code or a score.
+ */
+export interface MergedProblemEvidenceRow {
+  readonly accountId: string;
+  readonly problemKey: string;
+  readonly sourceInstanceId: string;
+  readonly externalKey: string;
+  readonly submissionId: string;
+  readonly submittedAt: string;
+}
+
+/** How one merged group was formed: a recognized cross-site identity, or a single problem key. */
+export type MergedProblemMappingKind = 'luogu_cf_identifier' | 'single';
+
+/**
+ * One merged group.
+ *
+ * `solved` is true exactly when `acceptedEvidence` is non-empty, and `attempted` is true when any
+ * selected account submitted to any equivalent problem identity. Members are the stored problem rows
+ * of the group (at most one per recognized mirror spelling): a recognized group with only one member
+ * is legal, because the other site's metadata may simply never have been fetched.
+ */
+export interface MergedProblemGroupRow {
+  readonly groupKey: string;
+  readonly members: readonly MergedProblemMemberRow[];
+  readonly solved: boolean;
+  readonly attempted: boolean;
+  readonly acceptedEvidence: readonly MergedProblemEvidenceRow[];
+  readonly mappingKind: MergedProblemMappingKind;
+}
+
+/** One numbered page of merged groups plus the totals of exactly the same grouped filter set. */
+export interface MergedProblemBrowsePage {
+  readonly items: readonly MergedProblemGroupRow[];
   /** Page actually returned: `1` when nothing matched, otherwise within `1..totalPages`. */
   readonly page: number;
   readonly pageSize: number;
@@ -520,6 +622,19 @@ export interface TrainingStore {
    */
   browseProblems(query: ProblemBrowseQuery): Promise<ProblemBrowsePage>;
   /**
+   * One numbered page of the merged bank: stored problems grouped by problem identity.
+   *
+   * The implementation groups the stored bank **before** it counts, filters and pages, so the
+   * totals and the returned page describe the same groups; it applies the merge rule as a pure
+   * scalar SQL function over each stored reference (never by title, tag or rating), reduces the
+   * selected accounts' submissions to one accepted evidence per `(account, problem)` plus an attempt
+   * flag, and returns only the members and evidence of the selected page's groups. Accepted evidence
+   * is found even when the accepted problem has no stored metadata row, because it is derived from
+   * the canonical submission identity. A page beyond the last group is clamped to the last valid
+   * page, and an empty filter set reports `page: 1` with `totalPages: 0`.
+   */
+  browseMergedProblems(query: MergedProblemBrowseQuery): Promise<MergedProblemBrowsePage>;
+  /**
    * One problem by its canonical key, without a scan.
    *
    * The adapter/pipeline resolves a job's problem through this method instead of paging
@@ -528,6 +643,14 @@ export interface TrainingStore {
   getProblem(key: string): Promise<NormalizedProblem | null>;
   upsertSubmissions(submissions: readonly Submission[]): Promise<void>;
   listSubmissions(accountId: string, query: PageRequest): Promise<Page<Submission>>;
+  /**
+   * One submission by its own stable id, without a scan.
+   *
+   * The merged bank re-reads the exact submission behind every accepted evidence row, so a broken or
+   * hostile port cannot make a fabricated evidence record reveal a linked solve; `null` means the
+   * submission is not stored.
+   */
+  getSubmission(submissionId: string): Promise<Submission | null>;
 
   // Snapshots
   getCurrentSnapshotHead(ref: ProblemRef): Promise<SnapshotHead | null>;

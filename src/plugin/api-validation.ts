@@ -29,7 +29,7 @@ import {
   type DomainError,
 } from '../domain/index.js';
 import { PlatformError } from '../application/platform-errors.js';
-import { MAX_RATING_DIMENSION_CHARS, PROBLEM_SOLVED_FILTERS, PROBLEM_SORTS } from '../application/ports.js';
+import { MAX_RATING_DIMENSION_CHARS, PROBLEM_SOLVED_FILTERS, PROBLEM_SORTS, MAX_MERGED_BANK_ACCOUNTS } from '../application/ports.js';
 import { STORAGE_PAGE_LIMITS } from '../application/storage-types.js';
 import {
   MAX_BROWSE_PAGE_SIZE,
@@ -63,6 +63,7 @@ import {
   type ApiProblemBrowseRequest,
   type ApiProblemDetailRequest,
   type ApiProblemListRequest,
+  type ApiProblemMergedBrowseRequest,
   type ApiRetroRecordRequest,
   type ApiReviewTagRequest,
   type ApiSupplementEditorial,
@@ -661,6 +662,64 @@ export function validateProblemBrowse(value: unknown): ApiProblemBrowseRequest {
       : {
           ratingDimension: nullableString('ratingDimension', object['ratingDimension'], MAX_RATING_DIMENSION_CHARS),
         }),
+    page: pageNumber('page', object['page']),
+    limit: boundedInteger('limit', object['limit'], 1, MAX_BROWSE_PAGE_SIZE),
+  };
+}
+
+/**
+ * `problem.mergedBrowse` request (Sprint Contract 08b): the additive merged cross-site bank page.
+ *
+ * The request is strict in the same way as `problem.browse`: `page`/`limit` are required, there is no
+ * `cursor`, and an unknown field is refused. `status` and `sort` are closed enums (omitting them
+ * means the default; `null` is not accepted for either, because neither has a nullable meaning here),
+ * while `sourceInstanceId`, `query` and `ratingDimension` accept `null` as "no filter/dimension".
+ * `accountIds` is a bounded, shape-checked array of ids; whether every id is stored, and whether two
+ * of them share a source instance, is the service's rule (it must resolve each account to answer).
+ */
+export function validateProblemMergedBrowse(value: unknown): ApiProblemMergedBrowseRequest {
+  const object = plainObject('problem.mergedBrowse', value);
+  requireKeys('problem.mergedBrowse', object, ['page', 'limit'], [
+    'accountIds',
+    'sourceInstanceId',
+    'status',
+    'onlyAttempted',
+    'query',
+    'sort',
+    'ratingDimension',
+    'reveal',
+  ]);
+  return {
+    ...(object['accountIds'] === undefined
+      ? {}
+      : {
+          accountIds: arrayValue(
+            'accountIds',
+            object['accountIds'],
+            MAX_MERGED_BANK_ACCOUNTS,
+            (entry, path) => requiredString(path, entry, MAX_API_ID_CHARS),
+            { allowEmpty: true },
+          ),
+        }),
+    ...(object['sourceInstanceId'] === undefined
+      ? {}
+      : { sourceInstanceId: nullableString('sourceInstanceId', object['sourceInstanceId'], MAX_API_ID_CHARS) }),
+    ...(object['status'] === undefined
+      ? {}
+      : { status: enumValue('status', object['status'], PROBLEM_SOLVED_FILTERS) }),
+    ...(object['onlyAttempted'] === undefined
+      ? {}
+      : { onlyAttempted: booleanValue('onlyAttempted', object['onlyAttempted']) }),
+    ...(object['query'] === undefined
+      ? {}
+      : { query: nullableString('query', object['query'], MAX_PROBLEM_QUERY_CHARS) }),
+    ...(object['sort'] === undefined ? {} : { sort: enumValue('sort', object['sort'], PROBLEM_SORTS) }),
+    ...(object['ratingDimension'] === undefined
+      ? {}
+      : {
+          ratingDimension: nullableString('ratingDimension', object['ratingDimension'], MAX_RATING_DIMENSION_CHARS),
+        }),
+    ...(object['reveal'] === undefined ? {} : { reveal: booleanValue('reveal', object['reveal']) }),
     page: pageNumber('page', object['page']),
     limit: boundedInteger('limit', object['limit'], 1, MAX_BROWSE_PAGE_SIZE),
   };

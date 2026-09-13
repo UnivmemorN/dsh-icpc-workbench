@@ -13,6 +13,7 @@ import type {
   AccountWeaknessReport,
   AnalysisStatus,
   CandidateRejectionReason,
+  CF_MIRROR_RULE_ID,
   CompletionMode,
   DecisionReason,
   EditorialAvailability,
@@ -20,6 +21,7 @@ import type {
   ManualTagAction,
   ModelRole,
   ModelUsage,
+  ProblemMappingKind,
   TagDecisionOrigin,
   TagDecisionStatus,
   TrainingEvidenceLevel,
@@ -89,6 +91,85 @@ export interface WorkbenchProblemBrowsePage {
   readonly reveal: boolean;
   readonly pendingReviewOnly: boolean;
   readonly fetchedAt: string;
+}
+
+// ---------------------------------------------------------------------------------------
+// Merged bank (Stage 08b)
+// ---------------------------------------------------------------------------------------
+
+/** One member of a merged group: the bank summary plus the selected account it belongs to. */
+export interface WorkbenchMergedProblemMember {
+  /**
+   * Bank summary of this member's own stored record.
+   *
+   * `problem.solvedByAccount` is this member's **own** direct accepted submission and is never
+   * overwritten with a linked cross-site solve; that link lives on the group's `solved`/evidence.
+   */
+  readonly problem: WorkbenchProblemSummary;
+  /** Selected account of this member's source instance, or `null` when none is selected. */
+  readonly accountId: string | null;
+}
+
+/**
+ * Safe metadata of one accepted submission behind a group's solved state.
+ *
+ * Identity and time only: no verdict body, no source code and no score. `problemKey`,
+ * `sourceInstanceId` and `externalKey` name the exact problem the accepted submission belongs to,
+ * which may have no stored metadata row of its own.
+ */
+export interface WorkbenchAcceptedEvidenceView {
+  readonly accountId: string;
+  readonly problemKey: string;
+  readonly sourceInstanceId: string;
+  readonly externalKey: string;
+  readonly submissionId: string;
+  readonly submittedAt: string;
+}
+
+/** How one group was formed; a `single` group is never merged with anything. */
+export type WorkbenchMergedMappingKind = ProblemMappingKind;
+
+/**
+ * One merged group of the bank.
+ *
+ * `solved` means at least one **selected** account has an accepted submission for an equivalent
+ * problem identity ({@link WorkbenchAcceptedEvidenceView}), which may be the other site's record; it
+ * is therefore a banner and never reveals a member's tags on its own. `attempted` means a selected
+ * account submitted to an equivalent identity without necessarily being accepted.
+ */
+export interface WorkbenchMergedProblemGroup {
+  readonly groupKey: string;
+  readonly members: readonly WorkbenchMergedProblemMember[];
+  readonly solved: boolean;
+  readonly attempted: boolean;
+  readonly acceptedEvidence: readonly WorkbenchAcceptedEvidenceView[];
+  readonly mappingKind: WorkbenchMergedMappingKind;
+}
+
+/** One known equivalence rule, so a response can explain how its groups were formed. */
+export interface WorkbenchMergedEquivalenceRuleView {
+  readonly ruleId: typeof CF_MIRROR_RULE_ID;
+  readonly explanation: string;
+  readonly referenceExampleUrl: string;
+}
+
+/**
+ * One numbered page of the merged bank.
+ *
+ * `equivalenceRules` states the recognized rules once for the whole page; a group's `mappingKind`
+ * names the rule that formed it, and every member carries its own exact original URL and identifiers.
+ */
+export interface WorkbenchMergedBrowsePage {
+  readonly pageId: string;
+  readonly items: readonly WorkbenchMergedProblemGroup[];
+  readonly page: number;
+  readonly pageSize: number;
+  readonly totalItems: number;
+  readonly totalPages: number;
+  readonly fetchedAt: string;
+  /** True when the caller asked for spoilers explicitly; a member's own AC reveals independently. */
+  readonly reveal: boolean;
+  readonly equivalenceRules: readonly WorkbenchMergedEquivalenceRuleView[];
 }
 
 /** One editorial source; `contentHash` is a digest, never the body. */

@@ -66,6 +66,27 @@ export {
   type RawTag,
 } from './problem.js';
 
+export {
+  CF_MIRROR_GROUP_KEY_PREFIX,
+  CF_MIRROR_REFERENCE_EXAMPLE_URL,
+  CF_MIRROR_RULE_EXPLANATION,
+  CF_MIRROR_RULE_ID,
+  CODEFORCES_MAIN_INSTANCE_ID,
+  LUOGU_OFFICIAL_INSTANCE_ID,
+  MAX_CF_MIRROR_CONTEST_ID,
+  cfMirrorIdentity,
+  cfMirrorIdentityOf,
+  cfMirrorProblemKeys,
+  mergedGroupKeyOf,
+  mergedGroupMemberKeys,
+  parseMergedGroupKey,
+  problemGroupingOf,
+  type CfMirrorIdentity,
+  type ParsedMergedGroupKey,
+  type ProblemGrouping,
+  type ProblemMappingKind,
+} from './problem-equivalence.js';
+
 export { compareNaturalKeys, naturalSortKey, numericRatingValue, numericText } from './sorting.js';
 
 export {

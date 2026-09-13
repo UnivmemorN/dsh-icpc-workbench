@@ -33,4 +33,26 @@ export const styles=`
 .icpc-coverage .icpc-actions{margin-top:12px}
 @media(max-width:640px){.icpc-hist-bar{width:110px;max-width:26vw}}
 @media(prefers-color-scheme:dark){.icpc-root .icpc-viewswitch button[aria-pressed=true]{color:#17221f}.icpc-hist-unknown .icpc-hist-fill{background:#e9a184}}
+.icpc-add-account{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;align-items:start;padding:16px 28px;background:var(--icpc-soft);border-bottom:1px solid var(--icpc-line)}
+.icpc-add-account .icpc-field{display:flex;flex-direction:column;gap:6px;min-width:0}
+.icpc-add-account .icpc-field-help,.icpc-add-account .icpc-form-note,.icpc-add-account .icpc-field-example{margin:0;font-size:12px;color:var(--icpc-muted);line-height:1.55}
+.icpc-add-account .icpc-field-example{overflow-wrap:anywhere}
+.icpc-add-account .icpc-field-error{margin:0;font-size:12px;font-weight:600;color:#b05532}
+.icpc-add-account .icpc-actions{display:flex;flex-direction:row;gap:8px;align-items:center;margin-top:2px}
+.icpc-add-account input[aria-invalid=true]{border-color:#b05532}
+@media(max-width:640px){.icpc-add-account{grid-template-columns:1fr;padding:14px 18px}}
+@media(prefers-color-scheme:dark){.icpc-root .icpc-add-account .icpc-field-error{color:#e9a184}.icpc-root .icpc-add-account input[aria-invalid=true]{border-color:#e9a184}}
+.icpc-viewswitch .icpc-muted{flex:1 1 220px;align-self:center;min-width:0;font-size:12px}
+.icpc-merged-accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:14px 0;min-width:0}
+.icpc-merged-account{min-width:0}
+.icpc-merged-members,.icpc-merged-evidence{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;min-width:0}
+.icpc-merged-members li{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;min-width:0;overflow-wrap:anywhere}
+.icpc-merged-evidence{margin-top:6px}
+.icpc-merged-evidence li{overflow-wrap:anywhere}
+.icpc-merged-evidence small{display:block}
+.icpc-merged-rules{margin-top:14px}
+.icpc-merged-rules p{overflow-wrap:anywhere}
+.icpc-merged-detail{margin-top:16px}
+@media(max-width:640px){.icpc-merged-accounts{grid-template-columns:1fr}.icpc-merged-members li{flex-direction:column;gap:2px}}
+.icpc-root .icpc-viewswitch button[aria-pressed=true]{background:var(--icpc-accent);border-color:var(--icpc-accent);color:var(--icpc-card)}
 `;

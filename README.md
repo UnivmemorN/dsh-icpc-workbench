@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件。独立工作区、独立 SQLite 数据库；基于题解证据补全标签，保留原始标签、人工决定和分析版本。
 
-**0.1.2 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与规则训练计划。已完成隔离宿主和浏览器流程验收；模型效果及已知限制见 [验收报告](docs/reports/stage-05-acceptance.md)。
+**0.1.3 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与规则训练计划。已完成隔离宿主和浏览器流程验收；模型效果及已知限制见 [验收报告](docs/reports/stage-05-acceptance.md)。
 
 ## 构建和隔离安装
 
@@ -14,7 +14,7 @@ npm run check
 npm pack
 # 首次创建隔离的 Web 配置，保持日常配置独立
 dsh --profile icpc-acceptance --from-default-profile web --help
-dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.2.tgz
+dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.3.tgz
 ```
 
 插件不需要位于 harness 源码树中，构建也不依赖相邻的 harness checkout。默认数据目录为系统应用数据目录中的 `dsh-icpc-workbench`。如需自定义，在宿主的配置覆盖文件中设置绝对路径：
@@ -33,6 +33,10 @@ dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
 
 在 dsh 侧栏点击 **ICPC 训练** 进入工作台，点击 **返回对话** 退出。依次在题库导入材料、选择题目并准备分析；核对调用上限后再启动。个人训练记录可按 [JSON/CSV 格式](docs/manual-import.md) 导入。
 
+
+添加账号时会说明 **Codeforces Handle（用户名）** 和 **洛谷 UID（数字用户号）** 的查找方法，可直接粘贴官方个人主页链接。保存后需在题库导入或同步记录。
+
+在「题库」切换到 **合并题库（跨站去重）**，可统一浏览各平台已导入题目，按各站选定账号联动显示 AC 来源。当前识别 CF 原题与洛谷 CF 镜像编号（如 `1A` ↔ `CF1A`），同题按一组计数；各站题号、难度、题解与原始提交仍分别保留。详见 [账号与合并题库说明](docs/merged-bank.md)。
 
 题库支持按当前账号筛选 **全部 / 已通过 / 未确认通过**，可与「仅看该账号尝试过的题」叠加。列表上下均可翻页，支持首页、末页、页码跳转及每页 25/50/100 题；总数按已导入本地目录的筛选结果计算。未选择账号时，通过状态筛选不可用。
 

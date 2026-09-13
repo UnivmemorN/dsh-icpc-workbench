@@ -46,7 +46,10 @@ import {
   contentHashOf,
   invariant,
   isLeaseExpired,
+  mergedGroupKeyOf,
+  mergedGroupMemberKeys,
   naturalSortKey,
+  parseMergedGroupKey,
   problemKey,
   recoverAfterRestart,
   transitionJob,
@@ -67,10 +70,16 @@ import {
 } from '../../domain/index.js';
 import {
   BROWSE_PAGE_LIMITS,
+  MAX_MERGED_BANK_ACCOUNTS,
   MAX_RATING_DIMENSION_CHARS,
   PROBLEM_SOLVED_FILTERS,
   PROBLEM_SORTS,
   RATING_SORTS,
+  type MergedProblemBrowsePage,
+  type MergedProblemBrowseQuery,
+  type MergedProblemEvidenceRow,
+  type MergedProblemGroupRow,
+  type MergedProblemMemberRow,
   type Page,
   type PageRequest,
   type ProblemBrowsePage,
@@ -167,6 +176,18 @@ import {
   readUserVersion,
 } from './schema.js';
 import { NATURAL_KEY_FUNCTION, RATING_VALUE_FUNCTION, ratingValueFromBody } from './sorting.js';
+import {
+  MERGED_GROUP_KEY_FUNCTION,
+  MERGED_REF_KEY_FUNCTION,
+  mergedCountQuery,
+  mergedEvidenceQuery,
+  mergedGroupKeyOfColumns,
+  mergedMembersQuery,
+  mergedPageQuery,
+  mergedRefKeyOfColumns,
+  planMergedBrowse,
+  type MergedSelectedAccount,
+} from './merged-bank.js';
 
 /** Values this adapter binds into prepared statements. */
 type SqlValue = null | number | string;
@@ -718,6 +739,169 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
     });
   }
 
+  /**
+   * One numbered page of the merged bank: stored problems grouped by the domain's identity rule.
+   *
+   * The read is one serialized pass built from {@link planMergedBrowse}: the bank is grouped by the
+   * deterministic merged group-key function BEFORE the filtered total is counted and one
+   * `LIMIT/OFFSET` page of group keys is taken, so `totalItems` and `items` always describe the same
+   * groups. Members of the page are then fetched by primary key from the page's group keys, and their
+   * accepted evidence comes from a bounded CTE over the *selected accounts'* own submissions (joined
+   * to the account's stored source instance), reduced to one earliest accepted submission per
+   * `(group, account, problem)` plus a `DISTINCT group` attempt flag.
+   *
+   * Accepted evidence is derived from the submission's canonical identity, so a solve is found even
+   * when the accepted problem has no stored metadata row: the example that matters is a local Luogu
+   * `CF1A` row plus a selected Codeforces account's AC for `1A` with no Codeforces `1A` row. Nothing
+   * is fetched or invented to fill that gap — the evidence carries the cross-site identity itself.
+   * A member's `solvedByAccount` stays its own direct accepted submission; a linked solve never sets
+   * it. Incoherent stored submissions (a key that does not re-derive from its own columns) are
+   * excluded from evidence and attempts, exactly like the indexed `browseProblems` path. An
+   * out-of-range page clamps to the last valid page, and an empty group set reports `page: 1` with
+   * `totalPages: 0`.
+   */
+  async browseMergedProblems(query: MergedProblemBrowseQuery): Promise<MergedProblemBrowsePage> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const limit = browsePageLimit(query.limit);
+      const requestedPage = browsePageNumber(query.page);
+      const status = browseStatus(query.status);
+      const onlyAttempted = browseAttemptedFlag(query.onlyAttempted);
+      const accountIds = mergedAccountIds(query.accountIds);
+      // Both predicates are answered from the selected accounts' own submissions; without one they
+      // have no meaning, so the adapter refuses them instead of quietly dropping the filter.
+      invariant(
+        status === 'all' || accountIds.length > 0,
+        'invalid_input',
+        'a solved-state filter needs at least one selected account id',
+        { status },
+      );
+      invariant(
+        !onlyAttempted || accountIds.length > 0,
+        'invalid_input',
+        'an attempt filter needs at least one selected account id',
+        {},
+      );
+      const selected = this.resolveMergedAccounts(accountIds);
+      const sourceInstanceId =
+        query.sourceInstanceId === undefined || query.sourceInstanceId === null
+          ? null
+          : requireId('source instance id', query.sourceInstanceId);
+      const search = problemSearchTerm(query.query);
+      const sort = mergedSort(query.sort);
+      const ratingDimension = optionalRatingDimension(query.ratingDimension);
+      if (RATING_SORTS.includes(sort)) {
+        invariant(
+          sourceInstanceId !== null,
+          'invalid_input',
+          'a difficulty sort needs an explicit source instance id; a rating is only comparable inside one',
+          { sort, reason: 'rating_source_required' },
+        );
+        invariant(
+          ratingDimension !== null,
+          'invalid_input',
+          `a difficulty sort needs a rating dimension of 1..${MAX_RATING_DIMENSION_CHARS} characters`,
+          { sort, reason: 'rating_dimension_required' },
+        );
+      }
+      const plan = planMergedBrowse({
+        accounts: selected,
+        sourceInstanceId,
+        status,
+        onlyAttempted,
+        search,
+        sort,
+        ratingDimension: RATING_SORTS.includes(sort) ? ratingDimension : null,
+      });
+      const counted = mergedCountQuery(plan);
+      const totalRow = this.find(counted.sql, counted.params);
+      const totalItems = totalRow === null ? 0 : intColumn(totalRow, 'total');
+      const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
+      const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
+      const pageQuery = mergedPageQuery(plan, limit, (page - 1) * limit);
+      const groupRows = this.all(pageQuery.sql, pageQuery.params);
+      const groupKeys = groupRows.map((row) => textColumn(row, 'group_key'));
+      const attemptedByGroup = new Map<string, boolean>();
+      for (const row of groupRows) {
+        attemptedByGroup.set(textColumn(row, 'group_key'), intColumn(row, 'attempted') === 1);
+      }
+
+      // A recognized group has at most the two mirror spellings, so members are fetched by primary
+      // key: no second pass over the bank and no bank-wide row set leaves SQLite.
+      const memberKeys = [...new Set(groupKeys.flatMap((groupKey) => mergedGroupMemberKeys(groupKey)))];
+      const memberRows =
+        memberKeys.length === 0 ? [] : this.allFrom(mergedMembersQuery(memberKeys));
+      const evidenceRows = groupKeys.length === 0 ? [] : this.allFrom(mergedEvidenceQuery(plan, groupKeys));
+
+      const evidenceByGroup = new Map<string, MergedProblemEvidenceRow[]>();
+      for (const groupKey of groupKeys) {
+        evidenceByGroup.set(groupKey, []);
+      }
+      for (const row of evidenceRows) {
+        const groupKey = textColumn(row, 'group_key');
+        const bucket = evidenceByGroup.get(groupKey);
+        invariant(
+          bucket !== undefined,
+          'invalid_input',
+          `stored accepted evidence names group ${groupKey}, which is not on this page`,
+          { reason: 'merged_group_mismatch', groupKey },
+        );
+        bucket.push({
+          accountId: textColumn(row, 'account_id'),
+          problemKey: textColumn(row, 'problem_key'),
+          sourceInstanceId: textColumn(row, 'source_instance_id'),
+          externalKey: textColumn(row, 'external_key'),
+          submissionId: textColumn(row, 'submission_id'),
+          submittedAt: textColumn(row, 'submitted_at'),
+        });
+      }
+      const accountBySource = new Map(selected.map((account) => [account.sourceInstanceId, account.id]));
+      const membersByGroup = new Map<string, MergedProblemMemberRow[]>();
+      for (const groupKey of groupKeys) {
+        membersByGroup.set(groupKey, []);
+      }
+      for (const row of memberRows) {
+        const { problem, groupKey } = this.decodeMergedMember(row);
+        const bucket = membersByGroup.get(groupKey);
+        invariant(
+          bucket !== undefined,
+          'invalid_input',
+          `stored problem ${problem.key} is not a member of its own group ${groupKey}`,
+          { reason: 'merged_group_mismatch', groupKey, problemKey: problem.key },
+        );
+        const accountId = accountBySource.get(problem.ref.sourceInstanceId) ?? null;
+        const evidence = evidenceByGroup.get(groupKey) ?? [];
+        bucket.push({
+          problem,
+          accountId,
+          // Direct evidence only: this account's own accepted submission for exactly this problem.
+          solvedByAccount:
+            accountId !== null && evidence.some((row) => row.accountId === accountId && row.problemKey === problem.key),
+        });
+      }
+
+      const items: MergedProblemGroupRow[] = groupKeys.map((groupKey) => {
+        const members = membersByGroup.get(groupKey) ?? [];
+        invariant(
+          members.length > 0,
+          'invalid_input',
+          `merged group ${groupKey} has no stored member`,
+          { reason: 'merged_group_without_member', groupKey },
+        );
+        const acceptedEvidence = evidenceByGroup.get(groupKey) ?? [];
+        return {
+          groupKey,
+          members,
+          solved: acceptedEvidence.length > 0,
+          attempted: attemptedByGroup.get(groupKey) ?? false,
+          acceptedEvidence,
+          mappingKind: parseMergedGroupKey(groupKey).kind,
+        };
+      });
+      return { items, page, pageSize: limit, totalItems, totalPages, fetchedAt: this.clock() };
+    });
+  }
+
   /** One problem by canonical key; the deterministic lookup the pipeline and adapters use. */
   async getProblem(problemKeyValue: string): Promise<NormalizedProblem | null> {
     this.assertOpen();
@@ -728,16 +912,19 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
   }
 
   /**
-   * Register the two deterministic scalar functions the bank sorts use.
+   * Register the deterministic scalar functions the bank reads use.
    *
-   * Both are `deterministic: true`, so SQLite may evaluate them inside an `ORDER BY` (and would let
-   * them appear in an index expression). They take only bound values — never a SQL fragment — and
-   * are pure: the same input always produces the same output, which is what makes a page built from
-   * them repeatable. They live as long as the connection; `close()` releases the connection (and
-   * with it the function table) and clears the prepared-statement cache that referenced them.
+   * All four are `deterministic: true`, so SQLite may evaluate them inside an `ORDER BY`/`GROUP BY`
+   * (and would let them appear in an index expression). They take only bound values — never a SQL
+   * fragment — and are pure: the same input always produces the same output, which is what makes a
+   * page built from them repeatable. They live as long as the connection; `close()` releases the
+   * connection (and with it the function table) and clears the prepared-statement cache that
+   * referenced them.
    *
-   * A host whose `DatabaseSync` predates `function()` cannot serve a sorted bank, and that is
-   * reported here as a typed refusal instead of letting the first sorted request fail with a raw
+   * The two merged-bank functions return `NULL` for columns that cannot name a problem, so an
+   * incoherent stored row is excluded from grouping and evidence instead of failing a whole read.
+   * A host whose `DatabaseSync` predates `function()` cannot serve a sorted or merged bank, and that
+   * is reported here as a typed refusal instead of letting the first request fail with a raw
    * `no such function` error.
    */
   private registerSortFunctions(): void {
@@ -754,6 +941,18 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
     );
     this.connection.function(RATING_VALUE_FUNCTION, { deterministic: true }, (body: unknown, dimension: unknown) =>
       ratingValueFromBody(body, dimension),
+    );
+    this.connection.function(
+      MERGED_REF_KEY_FUNCTION,
+      { deterministic: true },
+      (sourceInstanceId: unknown, domain: unknown, externalKey: unknown) =>
+        mergedRefKeyOfColumns(sourceInstanceId, domain, externalKey),
+    );
+    this.connection.function(
+      MERGED_GROUP_KEY_FUNCTION,
+      { deterministic: true },
+      (sourceInstanceId: unknown, domain: unknown, externalKey: unknown) =>
+        mergedGroupKeyOfColumns(sourceInstanceId, domain, externalKey),
     );
   }
 
@@ -786,6 +985,23 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
         nextCursor: rows.length > limit && last !== undefined ? encodeCursor('submission', last.id) : null,
         fetchedAt: this.clock(),
       };
+    });
+  }
+
+  /**
+   * One submission by its own stable id, without a scan.
+   *
+   * Read-only primary-key lookup used by the merged bank to re-validate accepted evidence against
+   * storage: the stored body is the record, so the caller re-derives its identity, verdict and time
+   * from the row itself instead of trusting a claimed evidence record.
+   */
+  async getSubmission(submissionId: string): Promise<Submission | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM submissions WHERE id = ?', [
+        requireId('submission id', submissionId),
+      ]);
+      return row === null ? null : entityFromRow<Submission>('submissions.body', row);
     });
   }
 
@@ -1821,6 +2037,81 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
     return row === null ? null : entityFromRow<AnalysisJobState>('jobs.body', row);
   }
 
+  /**
+   * Resolve the selected accounts from the store itself.
+   *
+   * The stored `source_instance_id` — never a caller-supplied pair — is what the submission CTE joins
+   * on, so an account that was repointed (or a caller that lied about the instance) cannot widen the
+   * evidence scope; two accounts of one source instance are refused because a merged read would
+   * otherwise count one person twice.
+   */
+  private resolveMergedAccounts(accountIds: readonly string[]): readonly MergedSelectedAccount[] {
+    const selected: MergedSelectedAccount[] = [];
+    const byInstance = new Map<string, string>();
+    for (const accountId of accountIds) {
+      const row = this.find('SELECT source_instance_id FROM accounts WHERE id = ?', [accountId]);
+      invariant(row !== null, 'missing_reference', `account ${accountId} is not stored`, { accountId });
+      const sourceInstanceId = textColumn(row, 'source_instance_id');
+      const existing = byInstance.get(sourceInstanceId);
+      invariant(
+        existing === undefined,
+        'invalid_input',
+        `accounts ${existing ?? ''} and ${accountId} both belong to ${sourceInstanceId}; a merged read selects at most one account per source instance`,
+        {
+          reason: 'duplicate_account_source',
+          sourceInstanceId,
+          accountIds: [existing ?? null, accountId],
+        },
+      );
+      byInstance.set(sourceInstanceId, accountId);
+      selected.push({ id: accountId, sourceInstanceId });
+    }
+    return selected;
+  }
+
+  /**
+   * Decode one stored problem row of a merged page and prove it is exactly the identity its key
+   * column names.
+   *
+   * The row's body must agree with its own key AND with its reference columns, and the domain's
+   * grouping rule must place it in some group; otherwise the row is refused instead of being
+   * projected under a borrowed identity (a silently different member would misdescribe the group).
+   */
+  private decodeMergedMember(row: Row): { readonly problem: NormalizedProblem; readonly groupKey: string } {
+    const key = textColumn(row, 'key');
+    const problem = entityFromRow<NormalizedProblem>('problems.body', row);
+    invariant(
+      problem.key === key,
+      'invalid_input',
+      `stored problem row ${key} carries a body for ${problem.key}`,
+      { reason: 'problem_key_mismatch', rowKey: key, bodyKey: problem.key },
+    );
+    invariant(
+      problem.ref.sourceInstanceId === textColumn(row, 'source_instance_id') &&
+        problem.ref.domain === nullableTextColumn(row, 'domain') &&
+        problem.ref.externalKey === textColumn(row, 'external_key'),
+      'invalid_input',
+      `stored problem row ${key} disagrees with its own reference columns`,
+      { reason: 'problem_key_mismatch', rowKey: key, bodyKey: problem.key },
+    );
+    let groupKey: string;
+    try {
+      groupKey = mergedGroupKeyOf(problem.ref);
+    } catch (error) {
+      throw new DomainError('invalid_input', `stored problem ${key} is not a canonical problem reference`, {
+        reason: 'problem_key_mismatch',
+        rowKey: key,
+        cause: String(error),
+      });
+    }
+    return { problem, groupKey };
+  }
+
+  /** Run one query planned by `merged-bank` (SQL text plus its own bound parameters). */
+  private allFrom(query: { readonly sql: string; readonly params: readonly SqlValue[] }): Row[] {
+    return this.all(query.sql, query.params);
+  }
+
   private readManualRevision(problemKeyValue: string): number {
     const row = this.find('SELECT revision FROM manual_revisions WHERE problem_key = ?', [problemKeyValue]);
     return row === null ? 0 : intColumn(row, 'revision');
@@ -2239,6 +2530,52 @@ function browseAttemptedFlag(value: boolean | null | undefined): boolean {
     return false;
   }
   invariant(typeof value === 'boolean', 'invalid_input', 'onlyAttempted must be a boolean when present', { value });
+  return value;
+}
+
+/**
+ * Validate the selected accounts of {@link MergedProblemBrowseQuery.accountIds}.
+ *
+ * Bounded and distinct before anything is read: a repeated id is refused instead of collapsed,
+ * because a caller that named one account twice is describing a different request than the one the
+ * store can answer.
+ */
+function mergedAccountIds(value: readonly string[] | null | undefined): readonly string[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  invariant(Array.isArray(value), 'invalid_input', 'accountIds must be an array of account ids', { value });
+  invariant(
+    value.length <= MAX_MERGED_BANK_ACCOUNTS,
+    'invalid_input',
+    `accountIds must hold at most ${MAX_MERGED_BANK_ACCOUNTS} ids`,
+    { reason: 'too_many_accounts', length: value.length, bound: MAX_MERGED_BANK_ACCOUNTS },
+  );
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    const id = requireId('account id', entry);
+    invariant(!seen.has(id), 'invalid_input', `accountIds names account ${id} twice`, {
+      reason: 'duplicate_account',
+      accountId: id,
+    });
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+/** Validate the optional sort of a merged read; omitted/`null` is the canonical-key ascending order. */
+function mergedSort(value: ProblemSort | null | undefined): ProblemSort {
+  if (value === undefined || value === null) {
+    return 'default';
+  }
+  invariant(
+    typeof value === 'string' && PROBLEM_SORTS.includes(value),
+    'invalid_input',
+    `unknown merged bank sort ${String(value)}`,
+    { sort: value },
+  );
   return value;
 }
 

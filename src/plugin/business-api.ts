@@ -101,6 +101,7 @@ import {
   validateProblemBrowse,
   validateProblemDetail,
   validateProblemList,
+  validateProblemMergedBrowse,
   validateRetroRecord,
   validateReviewTag,
   validateSyncPage,
@@ -435,6 +436,13 @@ function businessRoutes(context: ApiContext): readonly BusinessRouteEntry[] {
       method: 'POST',
       validate: validateProblemBrowse,
       handle: async (input, token) => context.workbench.browseProblems(input, token),
+    }),
+    // Additive merged cross-site bank page (Stage 08b). `problem.browse`/`problem.list` above keep
+    // their exact requests, responses and semantics; this operation is the only new route.
+    businessRoute(WORKBENCH_API_OPERATIONS.problemMergedBrowse, {
+      method: 'POST',
+      validate: validateProblemMergedBrowse,
+      handle: async (input, token) => context.workbench.browseMergedProblems(input, token),
     }),
     businessRoute(WORKBENCH_API_OPERATIONS.problemDetail, {
       method: 'POST',

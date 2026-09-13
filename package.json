@@ -1,6 +1,6 @@
 {
   "name": "dsh-icpc-workbench",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Personal ICPC training workbench plugin: normalized problems, evidence-checked tag analysis, weakness statistics and training plans.",
   "license": "MIT",
   "type": "module",
@@ -43,7 +43,12 @@
     "docs/reports/stage-06-bank-navigation.md",
     "docs/reports/stage-07a-bank-sorting.md",
     "docs/reports/stage-07b-training-statistics.md",
-    "docs/reports/stage-07-acceptance.md"
+    "docs/reports/stage-07-acceptance.md",
+    "docs/merged-bank.md",
+    "docs/reports/stage-08a-account-guidance.md",
+    "docs/reports/stage-08b-merged-bank-backend.md",
+    "docs/reports/stage-08c-merged-bank-ui.md",
+    "docs/reports/stage-08-acceptance.md"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

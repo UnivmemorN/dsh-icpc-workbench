@@ -32,3 +32,5 @@ Uninstall preserves user data. Test in an isolated profile before installing in 
 ## Reference
 NovaPhy supplies the ideas of explicit data ownership, immutable model inputs, caller-owned state and capability-bearing interchangeable backends.
 Do not mechanically translate its physics-specific classes or C++ build layout.
+## Merged bank
+The additive problem.mergedBrowse read model groups canonical CF/Luogu mirror identifiers while retaining each native problem key. Selected accounts are explicit and limited to one per source instance. Linked AC is attributed to stored accepted submissions and never written into another platform's history or substituted into native spoiler/weakness/plan rules. SQL groups before counting and paging; materialized member identities prevent correlated source/search filters from repeatedly scanning the bank. No schema migration is required. See docs/merged-bank.md for current mapping boundaries.

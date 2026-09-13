@@ -51,6 +51,7 @@ import type {
   WorkbenchPlanListResult,
   WorkbenchPlanPreviewResult,
   WorkbenchPlanView,
+  WorkbenchMergedBrowsePage,
   WorkbenchProblemBrowsePage,
   WorkbenchProblemDetail,
   WorkbenchProblemPage,
@@ -58,6 +59,7 @@ import type {
   WorkbenchTagReviewResult,
   WorkbenchWeaknessResult,
 } from './workbench-types.js';
+import type { MergedBankBrowseRequest } from './merged-bank-service.js';
 
 // ---------------------------------------------------------------------------------------
 // Endpoint vocabulary
@@ -111,6 +113,7 @@ export const WORKBENCH_API_OPERATIONS = {
   materialSupplement: 'material.supplement',
   problemList: 'problem.list',
   problemBrowse: 'problem.browse',
+  problemMergedBrowse: 'problem.mergedBrowse',
   problemDetail: 'problem.detail',
   reviewTag: 'review.tag',
   retroRecord: 'retro.record',
@@ -466,6 +469,17 @@ export type ApiProblemListResult = WorkbenchProblemPage;
 export type ApiProblemBrowseRequest = ApiRequestOf<WorkbenchBrowseRequest>;
 export type ApiProblemBrowseResult = WorkbenchProblemBrowsePage;
 
+/**
+ * Merged cross-site bank page request (additive; `problem.browse` and `problem.list` are unchanged).
+ *
+ * `accountIds` selects at most 32 distinct accounts with at most one per source instance; an empty
+ * selection is legal for the unfiltered read, while `status`/`onlyAttempted` need at least one.
+ * `sourceInstanceId` is a display filter (groups having a member from that source) and the
+ * difficulty source of a difficulty sort — never an account scope.
+ */
+export type ApiProblemMergedBrowseRequest = ApiRequestOf<MergedBankBrowseRequest>;
+export type ApiProblemMergedBrowseResult = WorkbenchMergedBrowsePage;
+
 /** Problem detail request; `reveal` and `accountId` are the service's own spoiler context. */
 export type ApiProblemDetailRequest = ApiRequestOf<WorkbenchGetProblemRequest>;
 export type ApiProblemDetailResult = WorkbenchProblemDetail;
@@ -533,6 +547,7 @@ export interface WorkbenchApiMap {
   'material.supplement': ApiEndpoint<ApiMaterialSupplementRequest, ApiMaterialSupplementResult>;
   'problem.list': ApiEndpoint<ApiProblemListRequest, ApiProblemListResult>;
   'problem.browse': ApiEndpoint<ApiProblemBrowseRequest, ApiProblemBrowseResult>;
+  'problem.mergedBrowse': ApiEndpoint<ApiProblemMergedBrowseRequest, ApiProblemMergedBrowseResult>;
   'problem.detail': ApiEndpoint<ApiProblemDetailRequest, ApiProblemDetailResult>;
   'review.tag': ApiEndpoint<ApiReviewTagRequest, ApiReviewTagResult>;
   'retro.record': ApiEndpoint<ApiRetroRecordRequest, ApiRetroRecordResult>;
