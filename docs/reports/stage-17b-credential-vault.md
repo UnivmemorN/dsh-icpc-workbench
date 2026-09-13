@@ -96,3 +96,53 @@ the native path; the coordinator will rerun it after these bridge changes.
 - The bridge still waits for `close` indefinitely if an OS-level child object never reports `close`
   after a kill. This is intentional per the contract (only `close` proves the process is gone) and
   the timeout timer remains armed; no fallback such as `taskkill` was added.
+
+## Sprint 17f — CI portability of the real-directory vault test (this invocation)
+
+Contract: `.local/contract-17f.md`. CI run
+[34768766956](https://github.com/UnivmemorN/dsh-icpc-workbench/actions/runs/34768766956), commit
+`404ad5f`: Windows Node 22/24 passed, Ubuntu Node 22/24 failed exactly one portable test —
+`tests/vault/credential-vault.test.ts` "the vault writes no file …", with
+`LocalCredentialVaultError invalid_input 'the credential vault data directory must be an absolute
+Windows path'`. The test forced `platform: 'win32'` while passing a real POSIX temporary directory,
+so the test — not the production validation — was wrong. No production file, path rule or error code
+changed; the Windows path validation is untouched and no plaintext fallback was added.
+
+Changed (tests/docs only):
+
+- `tests/vault/credential-vault.test.ts` — the single unconditional real-directory test is split at
+  the platform seam into two branches, and the file header records the seam:
+  - native Windows (`skip` when `process.platform !== 'win32'`): the successful
+    write/read/remove through the injected bridge against a real Windows temporary directory, with
+    the directory still empty afterwards. If a Windows host's temporary directory were not
+    drive-absolute (UNC-rooted), the branch fails with an explicit message instead of skipping, so
+    the coverage gap can never be silent;
+  - non-Windows (skipped on Windows, so it runs on the Ubuntu CI job): the vault reports
+    `implemented: false`, `write`/`read`/`remove` all reject with `unsupported`, the injected bridge
+    records zero calls, and the real temporary directory stays empty.
+  The unused `resolve` import was removed.
+- `docs/reports/stage-17-acceptance.md` — one CI note; the Linux result is claimed only as the
+  contract's intent, to be confirmed by the coordinator's CI run (no Linux execution was performed
+  here).
+
+### Commands actually run (worker, Windows, workspace-write sandbox)
+
+```
+node --experimental-strip-types --import ./tests/loader.mjs --test --experimental-test-isolation=none "tests/vault/credential-vault.test.ts" "tests/vault/credential-vault-windows.test.ts"
+  → tests 15, pass 13, fail 0, cancelled 0, skipped 2, todo 0 (duration 120.25 ms)
+
+npm run typecheck    → exit 0
+```
+
+The two skips are explicit and reported, not silent: the Windows-native branch of the split test
+runs and passes here; the non-Windows branch correctly skips on Windows with its reason; the real
+Credential Manager roundtrip in `credential-vault-windows.test.ts` skipped as documented above
+(worker sandbox denies a child process with piped stdio, `spawn EPERM`). The Windows branch of the
+portable test executed against a real temporary directory, so the no-file-fallback behavior is
+verified on this host without weakening any path validation.
+
+### Open issue for the coordinator
+
+- The non-Windows branch was **not** executed locally (this host is Windows). Its correctness on
+  Ubuntu Node 22/24 must be confirmed by the coordinator's CI run; CI must be the basis for any
+  statement that Linux passes.

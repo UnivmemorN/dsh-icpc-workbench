@@ -39,3 +39,9 @@ Windows 本地会话连接、检查、断开；提交历史首次回溯与断点
 - 包文件清单预检：无本地数据库、会话、凭据或施工日志；保留上游 MIT 声明及使用指南。未发布公共二进制 release。
 
 真实洛谷会话连接与实际提交历史仍待用户在本地面板完成，以上离线与浏览器证据不代表已验证当前站点的鉴权响应。持续集成配置为 Ubuntu/Windows × Node 22/24，提交后的状态见 [GitHub Actions](https://github.com/UnivmemorN/dsh-icpc-workbench/actions)。
+
+## CI 说明（Sprint 17f）
+
+CI 运行 [34768766956](https://github.com/UnivmemorN/dsh-icpc-workbench/actions/runs/34768766956)（提交 `404ad5f`）在 Windows Node 22/24 通过，Ubuntu Node 22/24 各失败一项可移植用例：`tests/vault/credential-vault.test.ts` 的"真实数据目录不落盘"用例把 `platform: 'win32'` 与真实 POSIX 临时目录混用，触发了正确的"必须是绝对 Windows 路径"校验。该失败属于用例缺陷，不涉及生产代码：Windows 路径校验未放宽，也未添加明文回退。修复只改测试与该报告：该用例按平台拆成 Windows 原生成功分支（真实临时目录写入/读取/删除后仍为空）与非 Windows 分支（能力为 `implemented: false`，三个操作均以 `unsupported` 拒绝、桥接调用为零、真实目录保持为空）。本机为 Windows，仅执行了聚焦 vault 测试与类型检查；**Ubuntu 是否通过以协调端后续 CI 结果为准，本轮不作通过结论。**
+
+协调端复验（Windows）：凭据相关两文件 **14 通过、0 失败、1 个非 Windows 专用分支按平台跳过**，真实 Windows Credential Manager 的合成存取用例实际执行成功。此修复仅改变测试和报告，已安装的生产构建及哈希未变；后续 CI 会在 Ubuntu 执行新增的非 Windows 拒绝与不落盘分支。

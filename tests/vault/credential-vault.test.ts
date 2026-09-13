@@ -5,12 +5,24 @@
  * namespace derivation, reference validation, UTF-8 capacity, lifecycle, cancellation and error
  * projection are exercised without touching a real credential store. All secret strings are
  * synthetic values generated inside this file; none is a real credential.
+ *
+ * One platform seam is explicit instead of hidden (Sprint 17f): the vault backend is Windows Credential
+ * Manager, so "a real data directory receives no plaintext file" cannot be a single unconditional
+ * statement. On Windows (`process.platform === 'win32'`) the real temporary directory is exercised
+ * through a successful write/read/remove with the injected bridge — and fails loudly, never skips, if
+ * that directory is not a drive-absolute Windows path, because the production namespace rule
+ * deliberately refuses POSIX/UNC-rooted spellings. On any other platform the vault reports an honest
+ * unsupported capability and every credential operation must be refused before the bridge is consulted,
+ * so the test asserts that rejection plus the untouched real directory instead of constructing a
+ * Windows-namespaced vault over a POSIX path (which the production path validation correctly refuses).
+ * Neither branch is skipped on its own platform, so the no-file-fallback purpose is preserved
+ * everywhere.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import {
   CREDENTIAL_REFERENCE_PATTERN,
   MAX_CREDENTIAL_REFERENCE_CHARS,
@@ -372,16 +384,63 @@ test('cancellation is refused before the backend, observed during it, and never 
 // No file fallback
 // ---------------------------------------------------------------------------------------
 
-test('the vault writes no file: a real data directory stays empty across write, read and remove', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'dsh-icpc-vault-'));
-  try {
-    const memory = createMemoryBridge();
-    const vault = createWindowsCredentialVault({ dataDir: resolve(directory), platform: 'win32', bridge: memory.bridge });
-    await vault.write('luogu-session', 'synthetic-secret', token());
-    assert.equal(await vault.read('luogu-session', token()), 'synthetic-secret');
-    await vault.remove('luogu-session', token());
-    assert.deepEqual(readdirSync(directory), [], 'the vault has no plaintext file fallback');
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
+/**
+ * Real-directory no-fallback check, native branch.
+ *
+ * An actual directory of this Windows host is the vault's data directory, so a successful
+ * write/read/remove through the injected bridge can be checked against the real file system. The
+ * synthetic secret lives only in the in-memory store, and the directory must still be empty
+ * afterwards: there is no plaintext fallback.
+ */
+test(
+  'the vault writes no file: a real data directory stays empty across write, read and remove',
+  { skip: process.platform === 'win32' ? false : 'the Windows-only success branch needs a real Windows data directory' },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-icpc-vault-'));
+    try {
+      assert.match(
+        directory,
+        /^[A-Za-z]:[\\/]/u,
+        'the Windows branch needs a drive-absolute temporary directory; a POSIX/UNC-rooted host path cannot carry this check because the namespace rule correctly refuses it',
+      );
+      const memory = createMemoryBridge();
+      const vault = createWindowsCredentialVault({ dataDir: directory, platform: 'win32', bridge: memory.bridge });
+      await vault.write('luogu-session', 'synthetic-secret', token());
+      assert.equal(await vault.read('luogu-session', token()), 'synthetic-secret');
+      await vault.remove('luogu-session', token());
+      assert.deepEqual(readdirSync(directory), [], 'the vault has no plaintext file fallback');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+/**
+ * Real-directory no-fallback check, non-Windows branch.
+ *
+ * This host has no OS-protected credential backend, so an injected bridge must never be consulted
+ * and no credential operation may appear to succeed — independently of the data directory. A real
+ * temporary directory is the vault's data directory here, and it must stay empty: an unsupported
+ * platform is an explicit capability gap, not a reason to fall back to a file.
+ */
+test(
+  'no plaintext fallback on a host without the OS vault: a real directory stays empty while every operation is refused',
+  { skip: process.platform === 'win32' ? 'this host has the Windows vault; the non-Windows honesty branch covers the unsupported case' : false },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-icpc-vault-unsupported-'));
+    try {
+      const memory = createMemoryBridge();
+      const vault = createWindowsCredentialVault({ dataDir: directory, platform: process.platform, bridge: memory.bridge });
+      const capabilities = vault.capabilities();
+      assert.equal(capabilities.implemented, false, 'this host has no OS-protected credential backend');
+      assert.equal(capabilities.platform, process.platform);
+      await rejectsWithCode(vault.write('luogu-session', 'synthetic-secret', token()), 'unsupported');
+      await rejectsWithCode(vault.read('luogu-session', token()), 'unsupported');
+      await rejectsWithCode(vault.remove('luogu-session', token()), 'unsupported');
+      assert.equal(memory.calls.length, 0, 'an unsupported host never consults the backend');
+      assert.deepEqual(readdirSync(directory), [], 'the vault has no plaintext file fallback');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
