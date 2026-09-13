@@ -15,11 +15,12 @@
  * - raw difficulty and raw numeric tag ids are preserved; a tag dictionary is optional and
  *   explicit, adds names next to the raw ids, and a dictionary failure is surfaced instead of
  *   producing zero-tag problems;
- * - submissions and editorial require a Luogu session. The authenticated shapes are not
- *   implemented, so the anonymous endpoints are probed and their observed answers reported:
- *   HTTP 401 / `data.errorCode=401` becomes the typed `auth_required` result, 403 `forbidden`,
- *   429 `rate_limited`, a successful but unverified payload `changed_response`. An authentication
- *   wall is never an empty submission history and never an `absent` editorial.
+ * - submissions and editorial require a Luogu session. `listSubmissions` delegates to an injected
+ *   authenticated session reader (Sprint 17a) when one is configured; without one the anonymous
+ *   endpoints are probed and their observed answers reported: HTTP 401 / `data.errorCode=401`
+ *   becomes the typed `auth_required` result, 403 `forbidden`, 429 `rate_limited`, a successful
+ *   but unverified payload `changed_response`. An authentication wall is never an empty submission
+ *   history and never an `absent` editorial.
  * - every request goes through the shared {@link HttpTransport} (FIFO pacing, timeouts, retries,
  *   byte cap, official-origin redirect policy, no cookies) and every await is followed by a
  *   cancellation check on the caller's token.
@@ -37,6 +38,7 @@ import {
   type SourceInstance,
   type Submission,
 } from '../../domain/index.js';
+import type { LuoguSessionReader } from '../../application/luogu-session.js';
 import {
   DEFAULT_PLATFORM_LIMITS,
   type EditorialFetchResult,
@@ -117,6 +119,13 @@ export interface LuoguAdapterOptions {
   readonly tagDictionary?: ReadonlyMap<number, string>;
   /** Load `/_lfe/tags` on demand so raw ids are accompanied by dictionary names. */
   readonly resolveTagNames?: boolean;
+  /**
+   * Authenticated submission reader (Sprint 17a). When supplied, `listSubmissions` delegates to
+   * it and the capabilities advertise submission history; without one the adapter keeps probing
+   * the anonymous endpoint and reports the observed authentication wall instead of inventing a
+   * history. Session material lives behind the reader; nothing credential-bearing appears here.
+   */
+  readonly sessionReader?: LuoguSessionReader | null;
 }
 
 function invalidInput(operation: PlatformOperation, detail: string): PlatformError {
@@ -155,15 +164,22 @@ export function luoguSourceInstance(): SourceInstance {
   });
 }
 
-function assertLuoguInstance(instance: SourceInstance): void {
+/**
+ * Validate a Luogu source instance: platform, exact official origin (no path, port or embedded
+ * credentials), official domain and the derived instance id.
+ *
+ * Exported because every Luogu implementation (the adapter, the authenticated session reader)
+ * must refuse a foreign instance before it issues a request.
+ */
+export function requireLuoguInstance(instance: SourceInstance, operation: PlatformOperation = 'catalog'): void {
   if (!instance || instance.platform !== 'luogu') {
-    throw invalidInput('catalog', 'the Luogu adapter requires a luogu source instance');
+    throw invalidInput(operation, 'the Luogu adapter requires a luogu source instance');
   }
   let parsed: URL;
   try {
     parsed = new URL(instance.baseUrl);
   } catch (cause) {
-    throw invalidInput('catalog', `baseUrl must be an absolute URL: ${cause instanceof Error ? cause.message : String(cause)}`);
+    throw invalidInput(operation, `baseUrl must be an absolute URL: ${cause instanceof Error ? cause.message : String(cause)}`);
   }
   if (
     parsed.origin !== LUOGU_BASE_URL ||
@@ -174,13 +190,13 @@ function assertLuoguInstance(instance: SourceInstance): void {
     parsed.search.length > 0 ||
     parsed.hash.length > 0
   ) {
-    throw invalidInput('catalog', `the Luogu adapter serves exactly ${LUOGU_BASE_URL} with no path, port or credentials`);
+    throw invalidInput(operation, `the Luogu adapter serves exactly ${LUOGU_BASE_URL} with no path, port or credentials`);
   }
   if (instance.domain !== LUOGU_DOMAIN) {
-    throw invalidInput('catalog', `the Luogu instance domain must be ${LUOGU_DOMAIN}, got ${String(instance.domain)}`);
+    throw invalidInput(operation, `the Luogu instance domain must be ${LUOGU_DOMAIN}, got ${String(instance.domain)}`);
   }
   if (instance.id !== sourceInstanceIdOf('luogu', LUOGU_DOMAIN)) {
-    throw invalidInput('catalog', 'the source instance id does not match its platform and domain');
+    throw invalidInput(operation, 'the source instance id does not match its platform and domain');
   }
 }
 
@@ -207,10 +223,11 @@ export class LuoguAdapter implements PlatformAdapter {
   private readonly transport: HttpTransport;
   private readonly clock: ClockFn;
   private readonly resolveTagNames: boolean;
+  private readonly sessionReader: LuoguSessionReader | null;
   private dictionary: ReadonlyMap<number, string> | null;
 
   constructor(options: LuoguAdapterOptions) {
-    assertLuoguInstance(options.sourceInstance);
+    requireLuoguInstance(options.sourceInstance);
     this.sourceInstance = options.sourceInstance;
     const transport =
       options.transport ??
@@ -231,23 +248,31 @@ export class LuoguAdapter implements PlatformAdapter {
     this.clock = options.clock ?? (() => Date.now());
     this.resolveTagNames = options.resolveTagNames === true;
     this.dictionary = options.tagDictionary ? normalizeDictionary(options.tagDictionary) : null;
+    const reader = options.sessionReader ?? null;
+    if (reader !== null && typeof reader.listSubmissions !== 'function') {
+      throw invalidInput('submissions', 'sessionReader must expose listSubmissions(request)');
+    }
+    this.sessionReader = reader;
   }
 
   capabilities(): PlatformCapabilities {
+    const authenticated = this.sessionReader !== null;
     return {
       platform: 'luogu',
       implemented: true,
       problems: true,
-      submissions: false,
+      submissions: authenticated,
       editorial: false,
       pagedProblems: true,
-      pagedSubmissions: false,
+      pagedSubmissions: authenticated,
       requiresAuth: true,
-      supportsAccountHistory: false,
+      supportsAccountHistory: authenticated,
       minRequestIntervalMs: null,
       notes: [
         'anonymous Lentille content-only requests to the official origin only',
-        'submissions and account history need a Luogu session; the authenticated record shape is not implemented',
+        authenticated
+          ? 'authenticated submission history runs through the injected Luogu session reader; its record envelope is structurally validated and has not been verified against a live authenticated response'
+          : 'submissions and account history need a Luogu session; the authenticated record shape is not implemented',
         'editorials need a Luogu session; the anonymous solutions endpoint answers HTTP 401 UserUnloginException',
         'raw difficulty and raw tag ids (luogu-tag:<id>) are preserved; names need an explicit tag dictionary',
       ],
@@ -373,13 +398,25 @@ export class LuoguAdapter implements PlatformAdapter {
   }
 
   /**
-   * Luogu submission history requires a session. The anonymous record endpoint is probed so its
-   * answer stays visible (`auth_required`/`forbidden`/`rate_limited`), and any unexpected success
-   * is reported as `changed_response` instead of a fabricated page.
+   * Submission history.
+   *
+   * With an injected {@link LuoguSessionReader} the call is delegated to the authenticated reader,
+   * which owns the session, the scope-bound cursor and the record-shape validation; the adapter
+   * re-checks the account scope before the delegate and the token after it, so a cancellation
+   * observed while the reader was resolving is never handed back as a successful page. Without a
+   * reader, the anonymous record endpoint is probed so its answer stays visible
+   * (`auth_required`/`forbidden`/`rate_limited`), and any unexpected success is reported as
+   * `changed_response` instead of a fabricated page.
    */
   async listSubmissions(request: ListSubmissionsRequest): Promise<Page<Submission>> {
     const operation = 'submissions' as const;
     request.token.throwIfCancelled();
+    if (this.sessionReader !== null) {
+      this.requireAccountHandle(request.account, operation);
+      const page = await this.sessionReader.listSubmissions(request);
+      request.token.throwIfCancelled();
+      return page;
+    }
     const handle = this.requireAccountHandle(request.account, operation);
     const http = this.httpLimits(request.limits, operation);
     requireListLimit(request.limit, request.limits, operation);

@@ -10,7 +10,7 @@
  * - **v0** means "no store tables yet": an empty file is initialized transactionally, a file
  *   with our marker table but no data tables is migrated after a consistent backup, and any
  *   other v0 layout is rejected instead of being migrated.
- * - **v1**, **v2**, **v3** and **v4** (this build's previous versions) are recognized exactly — marker
+ * - **v1** … **v6** (the previous versions of this build) are recognized exactly — marker
  *   plus their own table set — copied consistently and then migrated to the current version in one
  *   transaction that only adds tables. Existing rows are retained.
  * - A failure while initializing or migrating rolls back, so the original file stays readable.
@@ -19,7 +19,7 @@
  * {@link SCHEMA_DDL_V2}/{@link applySchemaV2} and {@link SCHEMA_DDL_V3}/{@link applySchemaV3} keep
  * creating exactly their own version's tables **and write exactly their own literal
  * `user_version`**, so a fixture built with them is a real older database and the migration under
- * test is the real one. The current version adds {@link SCHEMA_DDL_V6} on top.
+ * test is the real one. The current version adds {@link SCHEMA_DDL_V7} on top.
  *
  * All metadata the adapter writes are immutable JSON bodies plus indexed identity columns.
  */
@@ -30,7 +30,8 @@ import { StorageError } from './errors.js';
 export const STORE_MARKER = 'dsh-icpc-workbench/training-store';
 
 /** Schema version this build reads and writes. */
-export const STORE_SCHEMA_VERSION = 6;
+export const STORE_SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION_V6 = 6;
 export const SCHEMA_VERSION_V5 = 5;
 export const SCHEMA_VERSION_V4 = 4;
 
@@ -360,7 +361,73 @@ export const SCHEMA_DDL_V6 = [`CREATE TABLE official_rating_snapshots (
   account_id TEXT NOT NULL REFERENCES accounts(id), revision INTEGER NOT NULL CHECK(revision > 0),
   body TEXT NOT NULL, PRIMARY KEY(account_id, revision)
 )`];
-export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'v3' | 'v4' | 'v5' | 'current';
+
+/**
+ * Schema v7 — durable Luogu synchronization state (Sprint 17c).
+ *
+ * Five additive tables, none of which has any secret column: `luogu_connections` stores one
+ * account's **opaque credential reference**, its connection status and the check instants;
+ * `luogu_connection_generations` is the per-account tombstone counter that keeps connection
+ * revisions monotonic across a deletion, so a revision is never reissued after the row is removed;
+ * `luogu_connection_journal` holds the opaque reference of a credential written *before* it could
+ * be linked (the write-ahead half of `connect`); `luogu_sync_states` stores the revision-guarded
+ * durable progress of one account; and `luogu_sync_settings` stores one account's automatic-sync
+ * configuration. Settings are **per account**, not a singleton: enabling automation for one
+ * account never enables another, and disconnecting an account only turns off that account's own
+ * automation. Every table is keyed by `account_id`; the state/settings/connection rows are guarded
+ * by a revision, so a stale writer can never resurrect a disconnected job or overwrite newer
+ * progress. No cookie, session value or credential blob is representable here — the session itself
+ * lives only in the OS-protected credential store.
+ *
+ * v7 was never shipped, so the generation counter and the journal were added **to v7** instead of a
+ * new version; every recognized schema through v6 is byte-for-byte unchanged. A v7 file created by
+ * an earlier unshipped build of this same work-in-progress lacks those two tables and is therefore
+ * refused as an unrecognized layout rather than silently adopted (the store never repairs a
+ * database it does not recognize).
+ */
+export const STORE_TABLES_V7: readonly string[] = [
+  ...STORE_TABLES_V6,
+  'luogu_connection_generations',
+  'luogu_connection_journal',
+  'luogu_connections',
+  'luogu_sync_states',
+  'luogu_sync_settings',
+];
+export const SCHEMA_DDL_V7: readonly string[] = [
+  `CREATE TABLE luogu_connections (
+     account_id TEXT PRIMARY KEY NOT NULL,
+     source_instance_id TEXT NOT NULL,
+     reference TEXT NOT NULL,
+     status TEXT NOT NULL,
+     revision INTEGER NOT NULL,
+     checked_at TEXT NOT NULL,
+     body TEXT NOT NULL
+   )`,
+  `CREATE INDEX luogu_connections_by_instance ON luogu_connections (source_instance_id, account_id)`,
+  `CREATE TABLE luogu_connection_generations (
+     account_id TEXT PRIMARY KEY NOT NULL,
+     revision INTEGER NOT NULL CHECK (revision > 0)
+   )`,
+  `CREATE TABLE luogu_connection_journal (
+     account_id TEXT NOT NULL,
+     reference TEXT NOT NULL,
+     recorded_at TEXT NOT NULL,
+     PRIMARY KEY (account_id, reference)
+   )`,
+  `CREATE TABLE luogu_sync_states (
+     account_id TEXT PRIMARY KEY NOT NULL,
+     source_instance_id TEXT NOT NULL,
+     revision INTEGER NOT NULL,
+     body TEXT NOT NULL
+   )`,
+  `CREATE INDEX luogu_sync_states_by_instance ON luogu_sync_states (source_instance_id, account_id)`,
+  `CREATE TABLE luogu_sync_settings (
+     account_id TEXT PRIMARY KEY NOT NULL,
+     revision INTEGER NOT NULL,
+     body TEXT NOT NULL
+   )`,
+];
+export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'v3' | 'v4' | 'v5' | 'v6' | 'current';
 
 function pragmaRow(db: DatabaseSync, sql: string): Record<string, unknown> | undefined {
   return db.prepare(sql).get() as Record<string, unknown> | undefined;
@@ -418,8 +485,13 @@ export function detectSchemaState(db: DatabaseSync): SchemaState {
   const tables = tableNames(db);
   if (version === STORE_SCHEMA_VERSION) {
     requireStoreMarker(db, version);
-    requireTables(tables, STORE_TABLES_V6, version);
+    requireTables(tables, STORE_TABLES_V7, version);
     return 'current';
+  }
+  if (version === SCHEMA_VERSION_V6) {
+    requireStoreMarker(db, version);
+    requireTables(tables, STORE_TABLES_V6, version);
+    return 'v6';
   }
   if (version === SCHEMA_VERSION_V5) {
     requireStoreMarker(db, version);
@@ -668,7 +740,13 @@ export function migrateToSchemaV5(db: DatabaseSync, from: number): void {
   }, 'schema v5 migration');
 }
 
-/** Add only missing versions; caller performs backup before any migration. */
+/**
+ * Add only missing versions and end at **v6**, whatever this build's current version is.
+ *
+ * Frozen historical helper: this is the step a real v6 file already went through, and the
+ * v6 -> v7 migration below calls it for a file older than v6, so it must keep writing the literal
+ * `user_version = 6` rather than {@link STORE_SCHEMA_VERSION} (which now names v7).
+ */
 export function migrateToSchemaV6(db: DatabaseSync, from: number): void {
   inTransaction(db, () => {
     if (from < 1) applySchemaV1(db);
@@ -679,6 +757,26 @@ export function migrateToSchemaV6(db: DatabaseSync, from: number): void {
     for (const statement of SCHEMA_DDL_V6) db.exec(statement);
     db.exec('PRAGMA user_version = 6');
   }, 'schema v6 migration');
+}
+
+/**
+ * Add exactly the missing versions and end at the current schema, in one transaction.
+ *
+ * The caller has already taken (and verified) the pre-migration backup. Every historical DDL helper
+ * keeps writing **its own** literal version, so a v6 fixture stays a genuine v6 database; only this
+ * function moves a file to the version this build writes.
+ */
+export function migrateToSchemaV7(db: DatabaseSync, from: number): void {
+  inTransaction(db, () => {
+    if (from < 1) applySchemaV1(db);
+    if (from < 2) applySchemaV2(db);
+    if (from < 3) applySchemaV3(db);
+    if (from < 4) applySchemaV4(db);
+    if (from < 5) for (const statement of SCHEMA_DDL_V5) db.exec(statement);
+    if (from < 6) for (const statement of SCHEMA_DDL_V6) db.exec(statement);
+    for (const statement of SCHEMA_DDL_V7) db.exec(statement);
+    db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+  }, 'schema v7 migration');
 }
 
 function inTransaction(db: DatabaseSync, work: () => void, label: string): void {

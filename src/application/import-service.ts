@@ -90,14 +90,16 @@ import {
   type ProblemPageCounts,
   type RefreshMaterialReport,
   type RefreshMaterialRequest,
+  type RefreshProblemMetadataReport,
+  type RefreshProblemMetadataRequest,
   type SnapshotWrite,
   type StatementRefreshOutcome,
   type SubmissionPageCounts,
   type SupplementMaterialReport,
   type SupplementMaterialRequest,
-  type SyncPageCounts,
   type SyncPageReport,
   type SyncPageRequest,
+  type SyncPageSource,
 } from './import-types.js';
 
 export interface ImportServiceOptions {
@@ -330,8 +332,15 @@ export class ImportService {
    * the stored cursor and requires the stored `since`; `restart` explicitly returns to the
    * first page (the caller/UI has already confirmed the user action) and keeps the bound of
    * the interrupted scan unless an explicit one is given.
+   *
+   * The source only has to serve the resource being synced: a full `PlatformAdapter` satisfies
+   * {@link SyncPageSource}, and so does the authenticated submissions-only Luogu reader. When
+   * `request.onPageCommitted` is supplied it is awaited **inside** the commit transaction, after the
+   * page rows and the checkpoint, so a hook failure rolls both back and a durable caller's progress
+   * record can never disagree with the page it describes. A cancellation observed after the hook
+   * rolls the page back the same way, so an aborted pass cannot leave a committed page behind.
    */
-  async syncPage(adapter: PlatformAdapter, request: SyncPageRequest): Promise<SyncPageReport> {
+  async syncPage(adapter: SyncPageSource, request: SyncPageRequest): Promise<SyncPageReport> {
     const token = request.token;
     throwIfCancelled(token);
     const sourceInstance = adapter.sourceInstance;
@@ -349,6 +358,11 @@ export class ImportService {
       request.mode === 'start' || request.mode === 'continue' || request.mode === 'restart',
       'invalid_input',
       `unknown sync mode ${String(request.mode)}`,
+    );
+    invariant(
+      request.onPageCommitted === undefined || typeof request.onPageCommitted === 'function',
+      'invalid_input',
+      'onPageCommitted must be a function when supplied',
     );
     invariant(
       Number.isInteger(request.limit) &&
@@ -403,7 +417,14 @@ export class ImportService {
     let nextCursor: string | null;
     let pageFetchedAt: string;
     if (request.resource === 'problems') {
-      const page = validatePage(await adapter.listProblems({ cursor, limit, token, limits, account }), limit);
+      const listProblems = adapter.listProblems;
+      invariant(
+        typeof listProblems === 'function',
+        'invalid_input',
+        'problem sync requires a source exposing listProblems; this source serves submissions only',
+        { sourceInstanceId: sourceInstance.id },
+      );
+      const page = validatePage(await listProblems.call(adapter, { cursor, limit, token, limits, account }), limit);
       problemItems = page.items;
       nextCursor = page.nextCursor;
       pageFetchedAt = page.fetchedAt;
@@ -441,7 +462,7 @@ export class ImportService {
     }
     const storedAt = assertIsoTimestamp('checkpoint updatedAt', this.now());
 
-    const committed = await this.store.transaction(async () => {
+    const report = await this.store.transaction(async () => {
       throwIfCancelled(token);
       const current = await this.store.getSyncCheckpoint(ref);
       throwIfCancelled(token);
@@ -460,30 +481,40 @@ export class ImportService {
         throwIfCancelled(token);
       }
 
-      const counts: SyncPageCounts =
+      const written =
         request.resource === 'problems'
           ? await this.writeProblems(problemItems, token)
-          : await this.writeSubmissions(submissionItems, token);
+          : { counts: await this.writeSubmissions(submissionItems, token), snapshots: [] as readonly SnapshotWrite[] };
 
       const checkpoint: SyncCheckpoint = { ...ref, cursor: nextCursor, since, updatedAt: storedAt };
       await this.store.saveSyncCheckpoint(checkpoint);
       throwIfCancelled(token);
-      return { counts, checkpoint };
+      const pageReport: SyncPageReport = {
+        resource: request.resource,
+        mode: request.mode,
+        sourceInstanceId: sourceInstance.id,
+        accountId: ref.accountId,
+        since,
+        cursor,
+        nextCursor,
+        complete: nextCursor === null,
+        counts: written.counts,
+        checkpoint,
+        pageFetchedAt,
+      };
+      // The caller's commit hook shares this transaction on purpose: a throw here rolls the page
+      // rows and the checkpoint back, so progress can never be recorded for a page that is not
+      // stored. It receives the report only — never a raw adapter payload.
+      if (request.onPageCommitted !== undefined) {
+        await request.onPageCommitted(pageReport);
+      }
+      // Cancellation observed after the hook (the hook itself may have awaited I/O) still rolls the
+      // page back: the commit below is the last instant at which that is possible.
+      throwIfCancelled(token);
+      return pageReport;
     });
 
-    return {
-      resource: request.resource,
-      mode: request.mode,
-      sourceInstanceId: sourceInstance.id,
-      accountId: ref.accountId,
-      since,
-      cursor,
-      nextCursor,
-      complete: nextCursor === null,
-      counts: committed.counts,
-      checkpoint: committed.checkpoint,
-      pageFetchedAt,
-    };
+    return report;
   }
 
   /**
@@ -631,6 +662,81 @@ export class ImportService {
     };
   }
 
+  /**
+   * Fetch and merge **only** a problem's metadata.
+   *
+   * This is the metadata-repair entry point behind an automatic history sync: a submission page can
+   * legitimately reference a problem whose catalog row does not exist yet, and the row must be
+   * filled in later without replaying the whole catalog. Unlike {@link refreshMaterial} it never
+   * requests a statement and never requests editorial material — an automatic sync must not fetch
+   * editorials (and must not trigger any reasoning call) — and it reuses the accepted
+   * `writeProblems` merge path, so a stored statement is preserved, the previous snapshot's sources
+   * and solutions are carried over, and a semantically unchanged body reuses the stored snapshot
+   * instead of saving a new version.
+   *
+   * The fetch happens outside the transaction; the merge and the snapshot are written in one
+   * transaction. A typed operational failure is returned as `status: 'failed'` (it never discards
+   * the stored problem or its submissions), while cancellation and a caller-contract violation are
+   * thrown. The identity of the fetched body is re-checked against the request before anything is
+   * written, so a foreign or renamed body can never be merged under this key.
+   */
+  async refreshProblemMetadata(
+    adapter: PlatformAdapter,
+    request: RefreshProblemMetadataRequest,
+  ): Promise<RefreshProblemMetadataReport> {
+    const token = request.token;
+    const problemRef = request.problemRef;
+    const key = problemKey(problemRef);
+    throwIfCancelled(token);
+    invariant(
+      problemRef.sourceInstanceId === adapter.sourceInstance.id,
+      'missing_reference',
+      `problem ref belongs to ${problemRef.sourceInstanceId}, not adapter source ${adapter.sourceInstance.id}`,
+      { problemKey: key, adapter: adapter.sourceInstance.id },
+    );
+    invariant(
+      request.limits !== null && typeof request.limits === 'object',
+      'unfilled_settings',
+      'refreshProblemMetadata requires explicit platform limits',
+    );
+
+    let fetched: NormalizedProblem;
+    try {
+      fetched = await adapter.fetchProblem({ problemRef, token, limits: request.limits });
+      throwIfCancelled(token);
+    } catch (error) {
+      const failure = describePlatformError(error, 'problem');
+      if (failure.code === 'cancelled' || failure.code === 'invalid_input') {
+        throw failure;
+      }
+      return { problemKey: key, status: 'failed', problem: null, error: failure, snapshot: null };
+    }
+    invariant(
+      fetched.key === key &&
+        problemKey(fetched.ref) === key &&
+        fetched.ref.sourceInstanceId === adapter.sourceInstance.id,
+      'invalid_input',
+      'fetched problem metadata does not match the requested reference',
+      { requested: key, fetched: fetched.key, reason: 'metadata_identity_mismatch' },
+    );
+
+    return this.store.transaction(async () => {
+      throwIfCancelled(token);
+      const written = await this.writeProblems([fetched], token);
+      throwIfCancelled(token);
+      const problem = await this.store.getProblem(key);
+      // A cancellation observed after the merge write rolls the whole metadata write back.
+      throwIfCancelled(token);
+      return {
+        problemKey: key,
+        status: 'fetched',
+        problem,
+        error: null,
+        snapshot: written.snapshots.at(-1) ?? null,
+      } satisfies RefreshProblemMetadataReport;
+    });
+  }
+
   /** Read the current snapshot body of a problem inside the caller's transaction. */
   private async readCurrentSnapshot(ref: ProblemRef, token: CancellationToken): Promise<ProblemSnapshot | null> {
     const head = await this.store.getCurrentSnapshotHead(ref);
@@ -694,7 +800,7 @@ export class ImportService {
   private async writeProblems(
     items: readonly NormalizedProblem[],
     token: CancellationToken,
-  ): Promise<ProblemPageCounts> {
+  ): Promise<{ readonly counts: ProblemPageCounts; readonly snapshots: readonly SnapshotWrite[] }> {
     const unique = new Map<string, NormalizedProblem>();
     for (const item of items) {
       unique.set(item.key, item);
@@ -735,7 +841,7 @@ export class ImportService {
       await this.store.upsertProblems(bodies);
       throwIfCancelled(token);
     }
-    return { kind: 'problems', fetched: items.length, inserted, updated, unchanged };
+    return { counts: { kind: 'problems', fetched: items.length, inserted, updated, unchanged }, snapshots };
   }
 
   /**

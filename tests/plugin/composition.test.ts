@@ -3,14 +3,16 @@ import {test} from 'node:test';
 import {mkdirSync,writeFileSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
 import type {ConnectionFetchRoute} from '@deepseek-ai/dsh-client-connection';
-import {activateHost,resolveHarnessHome,type PublicHost} from '../../src/plugin/index.js';
+import {activateHost,resolveHarnessHome,type ActivationEnvironment,type PublicHost} from '../../src/plugin/index.js';
 import {ModelCatalog} from '../../src/plugin/model-catalog.js';
 import {SqliteTrainingStore} from '../../src/adapters/sqlite/index.js';
+import {createLuoguAccount,luoguSourceInstance} from '../../src/adapters/luogu/index.js';
 import {defaultWorkbenchSettings} from '../../src/application/workbench-settings.js';
 import {createCancellationSource} from '../../src/domain/index.js';
 import * as fx from '../storage/fixtures.js';
+import * as sfx from '../sync/fixtures.js';
 
-function fixture() {
+function fixture(luogu?:ActivationEnvironment['luogu']) {
  const temp=fx.tempDatabase(),hostDir=join(temp.dir,'host'),dataDir=join(temp.dir,'training');
  mkdirSync(hostDir);writeFileSync(join(hostDir,'package.json'),JSON.stringify({name:'@deepseek-ai/dsh',version:'0.1.5-rc.2'}));
  const launcherPath=join(hostDir,'bin.js');writeFileSync(launcherPath,'// fixture');
@@ -21,7 +23,7 @@ function fixture() {
    async *stream(){calls++;throw Error('unexpected paid call');}},
   sessionPersistence:{create(){calls++;throw Error('unexpected persistence creation');}},
   sessions:{prepare(){calls++;throw Error('unexpected audit session');},create(){calls++;throw Error('unexpected audit session');},flush:async()=>{calls++;return true;}}} as unknown as PublicHost;
- const environment={nodeVersion:'24.15.0',launcherPath,dshHome:join(temp.dir,'dsh-home')};
+ const environment={nodeVersion:'24.15.0',launcherPath,dshHome:join(temp.dir,'dsh-home'),...(luogu===undefined?{}:{luogu})};
  return {temp,host,dataDir,environment,routes,calls:()=>calls,setFailure:(n:number)=>{failAt=n;},
   async call(operation:string,value?:unknown){const route=routes.get('/api/icpc/v1/'+operation)!;assert.ok(route,'registered route '+operation);const response=await route.fetch(new Request('http://localhost/api/icpc/v1/'+operation,value===undefined?{}:{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(value)}));return {status:response.status,body:await response.json() as any};},
   remove:()=>fx.removeDirectory(temp.dir)};
@@ -29,7 +31,7 @@ function fixture() {
 test('host composition keeps activation free, persists settings/accounts and creates a restorable backup',async()=>{
  const f=fixture();let runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.calls(),0);assert.equal(f.routes.size,42); // Includes the account-scoped ability.calibrate operation.
+  assert.equal(f.calls(),0);assert.equal(f.routes.size,49); // 42 business/model/bootstrap + 7 typed Luogu operations.
   const boot=await f.call('bootstrap');assert.equal(boot.status,200);assert.equal(boot.body.value.settings.revision,1);assert.equal(boot.body.value.sources.length,2);assert.equal(boot.body.value.hydro.implemented,false);assert.equal(boot.body.value.hostVersion,'0.1.5-rc.2');
   assert.equal(f.calls(),0);
   const account=await f.call('account.create',{platform:'codeforces',handle:'Tourist'});assert.equal(account.status,200);
@@ -134,5 +136,110 @@ test('activation migrates legacy models once, preserves limits, and rejects non-
   assert.equal((await f.call('bootstrap')).body.value.settings.revision,2);assert.equal(f.calls(),0);
   await runtime.dispose();runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
   assert.equal((await f.call('bootstrap')).body.value.settings.revision,2);assert.equal(f.calls(),0);
+ }finally{await runtime.dispose();f.remove();}
+});
+
+/** Synthetic interval seam: records every schedule so a test can prove it was stopped. */
+function timerSeam(){
+ const entries:{callback:()=>void;intervalMs:number;stopped:boolean;stop:()=>void}[]=[];
+ const interval=(callback:()=>void,ms:number)=>{const entry={callback,intervalMs:ms,stopped:false,stop:()=>{entry.stopped=true;}};entries.push(entry);return entry.stop;};
+ return {entries,interval};
+}
+/** Poll an async condition while letting timers and IO settle. */
+async function waitFor(predicate:()=>Promise<boolean>,label:string,limit=5000):Promise<void>{
+ for(let index=0;index<limit;index+=1){if(await predicate())return;await new Promise<void>(resolve=>{setImmediate(resolve);});}
+ throw new Error('condition was not reached: '+label);
+}
+test('the luogu host recovers durable state, keeps defaults offline and owns its timer',async()=>{
+ const clock=sfx.createClock(),waits=sfx.createWait(),feed=sfx.createRecordFeed(),vault=sfx.createMemoryVault(),timers=timerSeam();
+ const f=fixture({vault,now:clock.now,nowMs:clock.nowMs,wait:waits.wait,tickIntervalMs:1000,setInterval:timers.interval,
+  transport:{fetchImpl:feed.fetchImpl,clock:clock.nowMs,wait:waits.wait,setTimer:sfx.neverFireTimer}});
+ mkdirSync(f.dataDir,{recursive:true});
+ const instance=luoguSourceInstance(),account=createLuoguAccount(instance,'800001');
+ const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>sfx.START});
+ await seed.upsertSourceInstances([instance]);await seed.upsertAccounts([account]);await seed.close();
+ const runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+ try {
+  assert.equal(f.routes.size,49);
+  assert.equal(feed.calls.length,0,'default automation must not contact the platform on startup');
+  assert.equal(timers.entries.length,1,'exactly one owned periodic timer');
+  assert.equal(timers.entries[0]?.intervalMs,1000);
+  assert.equal(timers.entries[0]?.stopped,false);
+  const status=await f.call('luogu.status',{accountId:account.id});
+  assert.equal(status.status,200);
+  assert.equal(status.body.value.settings.automaticEnabled,false);
+  assert.equal(status.body.value.settingsRevision,1,'recovery materialized the contract defaults');
+  assert.equal(status.body.value.phase,'backfill');
+  assert.equal(status.body.value.connectionAvailable,vault.capabilities().implemented);
+  assert.equal(status.body.value.connectionPlatform,vault.capabilities().platform);
+  assert.equal(f.calls(),0);
+ }finally{await runtime.dispose();}
+ assert.equal(timers.entries[0]?.stopped,true,'disposal stops the owned timer');
+ assert.equal(f.routes.size,0,'disposal removes every route');
+ const inspect=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>sfx.START});
+ try {
+  assert.equal((await inspect.getLuoguSyncSettings(account.id))?.value.automaticEnabled,false);
+  assert.equal((await inspect.getLuoguSyncState(account.id))?.value.phase,'backfill');
+ }finally{await inspect.close();}
+ f.remove();
+});
+test('an enabled runOnStartup account syncs through the injected transport and metadata source',async()=>{
+ const clock=sfx.createClock(),waits=sfx.createWait(),vault=sfx.createMemoryVault(),timers=timerSeam();
+ const feed=sfx.createRecordFeed(new Map([['800001',sfx.toPages(sfx.buildRecords(60,['P1001','P1002']),50)]]));
+ const metadata=sfx.createMetadataAdapter(luoguSourceInstance(),clock.now);
+ const f=fixture({vault,now:clock.now,nowMs:clock.nowMs,wait:waits.wait,tickIntervalMs:1000,setInterval:timers.interval,
+  transport:{fetchImpl:feed.fetchImpl,clock:clock.nowMs,wait:waits.wait,setTimer:sfx.neverFireTimer},metadataSource:metadata.adapter});
+ mkdirSync(f.dataDir,{recursive:true});
+ const instance=luoguSourceInstance(),account=createLuoguAccount(instance,'800001'),reference='luogu.session.seeded-1';
+ vault.secrets.set(reference,sfx.cookieFor('800001'));
+ const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>clock.now()});
+ await seed.upsertSourceInstances([instance]);await seed.upsertAccounts([account]);
+ await seed.saveLuoguSyncSettings({accountId:account.id,automaticEnabled:true,runOnStartup:true,intervalMinutes:30,updatedAt:clock.now()},null);
+ await seed.saveLuoguConnection({accountId:account.id,sourceInstanceId:instance.id,reference,status:'connected',connectedAt:clock.now(),checkedAt:clock.now(),failureCode:null,staleReference:null},null);
+ await seed.close();
+ const runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+ try {
+  await waitFor(async()=>{const view=await f.call('luogu.status',{accountId:account.id});return view.body.value.phase==='incremental';},'the startup pass to complete');
+  const status=await f.call('luogu.status',{accountId:account.id});
+  assert.equal(status.body.value.historyComplete,true);
+  assert.equal(status.body.value.submissionsSeen,60);
+  assert.equal(status.body.value.connection.status,'connected');
+  assert.ok(feed.calls.length>0,'the authenticated reader really called the injected transport');
+  assert.deepEqual(metadata.calls.sort(),['P1001','P1002'],'metadata repair uses the injected anonymous source');
+  assert.equal(metadata.editorialCalls(),0,'the sync path never requests editorial material');
+  assert.equal(f.calls(),0,'no model call is made anywhere in this slice');
+ }finally{await runtime.dispose();}
+ assert.equal(timers.entries[0]?.stopped,true);
+ assert.equal(f.routes.size,0);
+ f.remove();
+});
+test('a failed route registration rolls the luogu host back without leaving routes or timers',async()=>{
+ const clock=sfx.createClock(),waits=sfx.createWait(),vault=sfx.createMemoryVault(),timers=timerSeam();
+ const f=fixture({vault,now:clock.now,nowMs:clock.nowMs,wait:waits.wait,tickIntervalMs:1000,setInterval:timers.interval});
+ f.setFailure(45); // The 46th registration is a Luogu operation, after the host already started.
+ try {
+  await assert.rejects(()=>activateHost(f.host,{dataDir:f.dataDir},f.environment),/injected registration failure/);
+  assert.equal(f.routes.size,0);
+  assert.equal(timers.entries.length,1);
+  assert.equal(timers.entries[0]?.stopped,true,'rollback stops the owned timer');
+ }finally{f.remove();}
+});
+test('an unsupported credential platform keeps bootstrap and the free business routes alive',async()=>{
+ const vault=sfx.createMemoryVault({implemented:false,platform:'linux'});
+ const f=fixture({vault});
+ const runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+ try {
+  const boot=await f.call('bootstrap');assert.equal(boot.status,200);assert.equal(boot.body.value.sources.length,2);
+  assert.ok(f.routes.has('/api/icpc/v1/import.apply'),'free business routes stay registered');
+  const created=await f.call('account.create',{platform:'luogu',handle:'800001'});assert.equal(created.status,200);
+  const accountId=created.body.value.account.id;
+  const status=await f.call('luogu.status',{accountId});
+  assert.equal(status.status,200);
+  assert.equal(status.body.value.connectionAvailable,false);
+  assert.equal(status.body.value.connectionPlatform,'linux');
+  const refused=await f.call('luogu.connect',{accountId,sessionCookie:'_uid=800001; __client_id=opaque'});
+  assert.equal(refused.status,409);
+  assert.match(refused.body.error.message,/安全凭据存储/);
+  assert.equal(f.calls(),0);
  }finally{await runtime.dispose();f.remove();}
 });

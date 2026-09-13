@@ -4,7 +4,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { SqliteTrainingStore } from '../../src/adapters/sqlite/store.js';
-import { migrateToSchemaV5, readUserVersion, STORE_TABLES_V5, tableNames } from '../../src/adapters/sqlite/schema.js';
+import { migrateToSchemaV5, readUserVersion, STORE_SCHEMA_VERSION, STORE_TABLES_V5, tableNames } from '../../src/adapters/sqlite/schema.js';
 import { officialFixture } from '../official-rating-fixtures.js';
 import * as fx from './fixtures.js';
 
@@ -28,7 +28,7 @@ test('v5 migration backs up old tables; official snapshots use append-only CAS a
     await store.saveOfficialRating({ ...snapshot, revision: 2, fetchedAt: fx.LATER }, 1);
     await assert.rejects(store.saveOfficialRating({ ...snapshot, revision: 3, rating: 9999 }, 2));
     assert.equal((await store.getOfficialRating(a.account.id))?.revision, 2);
-    db = new DatabaseSync(paths.path, { readOnly: true }); assert.equal(readUserVersion(db), 6);
+    db = new DatabaseSync(paths.path, { readOnly: true }); assert.equal(readUserVersion(db), STORE_SCHEMA_VERSION);
     const rows = db.prepare('SELECT body FROM official_rating_snapshots ORDER BY revision').all(); assert.equal(rows.length, 2); assert.deepEqual(JSON.parse(rows[0]!['body'] as string), snapshot); db.close();
     await store.close(); db = new DatabaseSync(paths.path); db.exec("UPDATE official_rating_snapshots SET body = '{}' WHERE revision = 2"); db.close();
     store = new SqliteTrainingStore({ path: paths.path }); await assert.rejects(store.getOfficialRating(a.account.id), { code: 'corrupt_row' });

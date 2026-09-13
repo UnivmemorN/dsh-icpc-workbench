@@ -16,6 +16,7 @@ import {
   type ManualMaterialInput,
 } from '../../src/application/import-types.js';
 import { PlatformError } from '../../src/application/platform-errors.js';
+import { emptyLuoguSyncState } from '../../src/application/luogu-sync-types.js';
 import type {
   EditorialFetchResult,
   FetchEditorialRequest,
@@ -33,6 +34,7 @@ import {
   createCancellationSource,
   createEditorialSolution,
   createEditorialSource,
+  createNormalizedProblem,
   DomainError,
   type EditorialSolution,
   type EditorialSource,
@@ -1112,5 +1114,168 @@ void test('material fetched against a superseded snapshot head is rejected, not 
     const stored = await store.getSnapshot(head.snapshotId);
     assert.equal(stored?.problem.statement, 'New manual statement.');
     assert.equal(stored?.sources.length, 0, 'stale material must not be written');
+  });
+});
+
+void test('a failing commit hook rolls back the page rows, the checkpoint and the hook own writes', async () => {
+  await withStore(async (store) => {
+    const scope = fx.makeScope('luogu', 'www.luogu.com.cn', '123456', 'P1001');
+    await store.upsertSourceInstances([scope.instance]);
+    await store.upsertAccounts([scope.account]);
+    const ref: SyncCheckpointRef = {
+      sourceInstanceId: scope.instance.id,
+      accountId: scope.account.id,
+      resource: 'submissions',
+    };
+    const adapter = new FakeAdapter(scope.instance);
+    adapter.submissionPages.push({
+      items: [fx.makeSubmission(scope.account, scope.problem.ref, 'S1', 'accepted')],
+      nextCursor: null,
+    });
+
+    await assert.rejects(
+      serviceFor(store).syncPage(adapter, {
+        resource: 'submissions',
+        account: scope.account,
+        mode: 'start',
+        limit: 10,
+        limits: LIMITS,
+        token: createCancellationSource().token,
+        onPageCommitted: async () => {
+          await store.saveLuoguSyncState(
+            emptyLuoguSyncState(scope.account.id, scope.instance.id, SERVICE_NOW),
+            null,
+          );
+          throw new Error('progress commit refused');
+        },
+      }),
+      /progress commit refused/u,
+    );
+
+    assert.equal(await store.getSyncCheckpoint(ref), null, 'the checkpoint rolled back with the hook');
+    assert.deepEqual((await store.listSubmissions(scope.account.id, { limit: 10, cursor: null })).items, []);
+    assert.equal(await store.getLuoguSyncState(scope.account.id), null, 'the hook own progress rolled back too');
+  });
+});
+
+void test('a cancellation observed after the commit hook rolls the page and the hook own writes back', async () => {
+  await withStore(async (store) => {
+    const scope = fx.makeScope('luogu', 'www.luogu.com.cn', '654321', 'P1002');
+    await store.upsertSourceInstances([scope.instance]);
+    await store.upsertAccounts([scope.account]);
+    const ref: SyncCheckpointRef = {
+      sourceInstanceId: scope.instance.id,
+      accountId: scope.account.id,
+      resource: 'submissions',
+    };
+    const adapter = new FakeAdapter(scope.instance);
+    adapter.submissionPages.push({
+      items: [fx.makeSubmission(scope.account, scope.problem.ref, 'S2', 'wrong_answer')],
+      nextCursor: null,
+    });
+    const source = createCancellationSource();
+
+    await assert.rejects(
+      serviceFor(store).syncPage(adapter, {
+        resource: 'submissions',
+        account: scope.account,
+        mode: 'start',
+        limit: 10,
+        limits: LIMITS,
+        token: source.token,
+        onPageCommitted: async () => {
+          await store.saveLuoguSyncState(
+            emptyLuoguSyncState(scope.account.id, scope.instance.id, SERVICE_NOW),
+            null,
+          );
+          source.cancel('the user left the page');
+        },
+      }),
+      isDomain('cancelled'),
+    );
+
+    assert.equal(await store.getSyncCheckpoint(ref), null, 'a late cancellation discards the committed page');
+    assert.deepEqual((await store.listSubmissions(scope.account.id, { limit: 10, cursor: null })).items, []);
+    assert.equal(await store.getLuoguSyncState(scope.account.id), null);
+  });
+});
+
+void test('metadata-only refresh never fetches editorial and preserves the stored statement and material', async () => {
+  await withStore(async (store) => {
+    const scope = fx.makeScope('manual', 'local.example.org', 'alice', 'P1');
+    const service = serviceFor(store);
+    await service.applyManual(
+      manualBundle(scope, [
+        foundMaterial(
+          scope.problem.key,
+          [found('editorial-1', 'https://editorial.example.org/P1')],
+          'https://editorial.example.org/P1',
+        ),
+      ]),
+      createCancellationSource().token,
+    );
+    const imported = await store.getCurrentSnapshotHead(scope.problem.ref);
+    assert.ok(imported);
+
+    const adapter = new FakeAdapter(scope.instance);
+    adapter.problemResults.push(
+      createNormalizedProblem({
+        ref: scope.problem.ref,
+        title: 'Renamed by the catalog',
+        url: scope.problem.url,
+        statement: null,
+        fetchedAt: SERVICE_NOW,
+        ratings: [{ dimension: 'rating', value: 2000, scale: { min: 800, max: 3500 }, raw: '2000' }],
+        rawTags: ['data structures'],
+      }),
+    );
+    const report = await service.refreshProblemMetadata(adapter, {
+      problemRef: scope.problem.ref,
+      token: createCancellationSource().token,
+      limits: LIMITS,
+    });
+
+    assert.equal(report.status, 'fetched');
+    assert.equal(report.problem?.title, 'Renamed by the catalog');
+    assert.equal(
+      report.problem?.statement,
+      scope.problem.statement,
+      'a metadata-only fetch never erases the stored statement',
+    );
+    assert.equal(
+      adapter.calls.some((call) => call.operation === 'fetchEditorial'),
+      false,
+      'a metadata-only refresh never requests editorial material',
+    );
+    assert.notEqual(report.snapshot?.snapshotId, imported.snapshotId);
+    const stored = await store.getSnapshot(report.snapshot!.snapshotId);
+    assert.equal(stored?.sources.length, 1, 'imported editorial material survives the metadata refresh');
+    assert.equal(stored?.solutions.length, 1);
+
+    // A body whose identity does not match the request is refused before anything is written.
+    const head = await store.getCurrentSnapshotHead(scope.problem.ref);
+    const other = fx.makeScope('manual', 'local.example.org', 'alice', 'P2');
+    adapter.problemResults.push(fx.makeProblem(other.problem.ref));
+    await assert.rejects(
+      service.refreshProblemMetadata(adapter, {
+        problemRef: scope.problem.ref,
+        token: createCancellationSource().token,
+        limits: LIMITS,
+      }),
+      isDomain('invalid_input'),
+    );
+    assert.deepEqual(await store.getCurrentSnapshotHead(scope.problem.ref), head, 'a mismatched body writes nothing');
+
+    // An operational failure is a typed report, never a fabricated problem.
+    adapter.problemResults.push(new PlatformError({ code: 'unavailable', operation: 'problem', detail: '503' }));
+    const failed = await service.refreshProblemMetadata(adapter, {
+      problemRef: scope.problem.ref,
+      token: createCancellationSource().token,
+      limits: LIMITS,
+    });
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.problem, null);
+    assert.equal(failed.snapshot, null);
+    assert.equal((await store.getProblem(scope.problem.key))?.title, 'Renamed by the catalog');
   });
 });

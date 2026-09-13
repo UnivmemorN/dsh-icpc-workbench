@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件。独立工作区、独立 SQLite 数据库；基于题解证据补全标签，保留原始标签、人工决定和分析版本。
 
-**0.1.11 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与训练计划（AI 计划：免费准备、显式付费生成；以及免费规则计划）。已完成隔离宿主和浏览器流程验收；本轮功能与已知限制见 [0.1.11 验收报告](docs/reports/stage-16-acceptance.md)，早期模型质量评测见 [30 题报告](docs/reports/stage-05-acceptance.md)。
+**0.1.12 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与训练计划（AI 计划：免费准备、显式付费生成；以及免费规则计划）。新增 Windows 本地会话连接、洛谷历史回溯和自动同步；本轮验收与已知限制见 [0.1.12 验收报告](docs/reports/stage-17-acceptance.md)，早期模型质量评测见 [30 题报告](docs/reports/stage-05-acceptance.md)。
 
 ## 构建和隔离安装
 
@@ -14,7 +14,7 @@ npm run check
 npm pack
 # 首次创建隔离的 Web 配置，保持日常配置独立
 dsh --profile icpc-acceptance --from-default-profile web --help
-dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.11.tgz
+dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.12.tgz
 ```
 
 插件不需要位于 harness 源码树中，构建也不依赖相邻的 harness checkout。默认数据目录为系统应用数据目录中的 `dsh-icpc-workbench`。如需自定义，在宿主的配置覆盖文件中设置绝对路径：
@@ -34,7 +34,7 @@ dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
 在 dsh 侧栏点击 **ICPC 训练** 进入工作台，点击 **返回对话** 退出。依次在题库导入材料、选择题目并准备分析；核对调用上限后再启动。个人训练记录可按 [JSON/CSV 格式](docs/manual-import.md) 导入。
 
 
-添加账号时会说明 **Codeforces Handle（用户名）** 和 **洛谷 UID（数字用户号）** 的查找方法，可直接粘贴官方个人主页链接。保存后需在题库导入或同步记录。
+添加账号时会说明 **Codeforces Handle（用户名）** 和 **洛谷 UID（数字用户号）** 的查找方法，可直接粘贴官方个人主页链接。保存后需在题库导入或同步记录。洛谷账号可在「题库 → 导入与同步 → 洛谷账号连接与同步」连接本地会话；首次回溯可续传，自动同步默认关闭，开启后默认每 30 分钟运行，仅在 dsh 打开期间生效。会话保存在 Windows 凭据管理器中，不要粘贴到 AI 对话。
 
 在「题库」切换到 **合并题库（跨站去重）**，可统一浏览各平台已导入题目，按各站选定账号联动显示 AC 来源。当前识别 CF 原题与洛谷 CF 镜像编号（如 `1A` ↔ `CF1A`），同题按一组计数；各站题号、难度、题解与原始提交仍分别保留。详见 [账号与合并题库说明](docs/merged-bank.md)。
 
@@ -73,7 +73,7 @@ dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
 ## 平台边界
 
 - Codeforces 公开 API：目录和提交历史；请求间隔至少 2 秒。HTML 题面/题解可能受到站点访问限制。
-- 洛谷：公开题目目录和题面；匿名题解可能要求登录。当前不宣称已支持鉴权后的提交历史，使用手工导入补充。
+- 洛谷：公开题目目录和题面；匿名题解可能要求登录。Windows 可连接本地会话，回溯账号提交历史并开启定时同步；真实登录态与当前站点响应仍需用户本地验收，站点验证或结构变化会暂停。详见 [洛谷同步指南](docs/luogu-sync.md)。
 - 手工 JSON/CSV 导入与题面/题解补充：预览后按内容哈希应用，失败不会被当作“没有题解”。
 - HydroOJ 校内 OJ 与学生记录导入为未来计划，当前尚未实现。
 

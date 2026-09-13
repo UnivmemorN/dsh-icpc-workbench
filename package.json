@@ -1,6 +1,6 @@
 {
   "name": "dsh-icpc-workbench",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Personal ICPC training workbench plugin: normalized problems, evidence-checked tag analysis, weakness statistics and training plans.",
   "license": "MIT",
   "type": "module",
@@ -75,7 +75,15 @@
     "docs/ability-calibration.md",
     "docs/reports/stage-15-acceptance.md",
     "docs/ability-scoring.md",
-    "docs/reports/stage-16-acceptance.md"
+    "docs/reports/stage-16-acceptance.md",
+    "docs/luogu-sync.md",
+    "docs/reports/stage-17a-luogu-reader.md",
+    "docs/reports/stage-17b-credential-vault.md",
+    "docs/reports/stage-17c1-sync-storage.md",
+    "docs/reports/stage-17c2-sync-service.md",
+    "docs/reports/stage-17d1-luogu-host.md",
+    "docs/reports/stage-17d2-luogu-ui.md",
+    "docs/reports/stage-17-acceptance.md"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

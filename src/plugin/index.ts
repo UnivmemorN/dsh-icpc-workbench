@@ -22,7 +22,7 @@ import { ImportService } from '../application/import-service.js';
 import { PlanningService } from '../application/planning-service.js';
 import { WorkbenchService } from '../application/workbench-service.js';
 import { defaultWorkbenchSettings, isFlashOnlySettings, withFlashOnlyModels } from '../application/workbench-settings.js';
-import type { PlatformAdapter } from '../application/ports.js';
+import { DEFAULT_PLATFORM_LIMITS, type PlatformAdapter } from '../application/ports.js';
 import { CURRENT_TAXONOMY, createCancellationSource, createTaxonomyIndex } from '../domain/index.js';
 import { checkHostCompatibility, type HostCompatibilityProbe } from './compatibility.js';
 import { parsePluginConfig, resolveDataDir } from './config.js';
@@ -31,6 +31,8 @@ import { ModelOperations } from './model-operations.js';
 import { registerBusinessApi } from './business-api.js';
 import { registerModelApi } from './model-api.js';
 import { registerBootstrapApi } from './bootstrap-api.js';
+import { registerLuoguApi } from './luogu-api.js';
+import { createLuoguHost, type LuoguHostSeam } from './luogu-host.js';
 import { disposeAll, rollback } from './lifecycle.js';
 export const name='icpc-workbench';
 export const inject=['connection','llm','sessions','sessionPersistence'];
@@ -43,6 +45,8 @@ export interface PublicHost extends DshAuditedHost {
 export interface ActivationEnvironment {
   readonly nodeVersion?:string; readonly launcherPath?:string; readonly dshHome?:string;
   readonly probe?:HostCompatibilityProbe; readonly closeWaitMs?:number;
+  /** Injected Luogu seams (vault, platform, clock, wait, timers, transport, metadata source). */
+  readonly luogu?:LuoguHostSeam;
 }
 export interface PluginRuntime {
   readonly dataDir:string; readonly controller:ModelOperations; readonly dispose:()=>Promise<void>;
@@ -97,6 +101,20 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
       ...(environment.closeWaitMs===undefined?{}:{closeWaitMs:environment.closeWaitMs}),
       createPipeline:r=>new AnalysisPipeline({store,gateway:new DshModelGateway({provider:r.value.provider,client,now}),taxonomy:CURRENT_TAXONOMY,roles:r.value.roles,limits:r.value.modelLimits,now,uniqueId})});
     const observer={onInternalError:reportFailure};
+    // Luogu authenticated synchronization (Sprint 17d1): one owned runtime composes the workspace OS
+    // vault, the shared source gate, the connection manager, the stored-session submissions source and
+    // the durable sync service. Durable state is recovered and the startup sweep runs *before* any
+    // route can accept work; its disposer stops the owned timer and drains the service, and it is
+    // registered before the API disposer so reverse-order disposal removes the routes first.
+    const workbenchSettings=await store.getWorkbenchSettings();
+    const luoguHost=createLuoguHost({store,imports,sourceInstance:sources[1]!,metadataSource:byId.get(sources[1]!.id)!,
+      dataDir,limits:workbenchSettings?.value.platformLimits??DEFAULT_PLATFORM_LIMITS,ownerId:uniqueId('luogu-sync'),
+      onInternalError:reportFailure,...(environment.luogu===undefined?{}:{seam:environment.luogu})});
+    disposers.push(async()=>{await luoguHost.dispose();});
+    await luoguHost.start(createCancellationSource().token);
+    disposers.push(await registerLuoguApi({registry:host.connection.fetch,store,service:luoguHost.service,
+      sourceInstance:sources[1]!,connectionAvailable:luoguHost.connectionAvailable,
+      connectionPlatform:luoguHost.connectionPlatform,now,...observer}));
     disposers.push(await registerBusinessApi({registry:host.connection.fetch,store,imports,workbench,sources:sources.map(instance=>({instance})),settings:()=>store.getWorkbenchSettings(),now,uniqueId:randomUUID,
       adapterFor:async id=>{const adapter=byId.get(id);if(!adapter)throw Error('ICPC_SOURCE_ADAPTER_UNSUPPORTED');return adapter;},...observer,onDisposeError:reportFailure}));
     disposers.push(await registerModelApi({registry:host.connection.fetch,controller,...observer}));

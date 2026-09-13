@@ -26,7 +26,13 @@ import {
   type Submission,
 } from '../domain/index.js';
 import type { PlatformError } from './platform-errors.js';
-import type { EditorialFetchResult, PlatformLimits } from './ports.js';
+import type {
+  EditorialFetchResult,
+  ListProblemsRequest,
+  ListSubmissionsRequest,
+  Page,
+  PlatformLimits,
+} from './ports.js';
 import { STORAGE_PAGE_LIMITS, type SyncCheckpoint, type SyncResource } from './storage-types.js';
 
 /**
@@ -227,6 +233,21 @@ export interface SupplementMaterialReport {
 /** How one sync page relates to the stored checkpoint. */
 export type SyncMode = 'start' | 'continue' | 'restart';
 
+/**
+ * The platform surface one sync page actually needs.
+ *
+ * A full {@link import('./ports.js').PlatformAdapter} satisfies this shape, and so does an
+ * authenticated submissions-only reader (Sprint 17a) that deliberately exposes no problem catalog
+ * or editorial operation. `listProblems` is therefore optional: it is required exactly when
+ * `SyncPageRequest.resource` is `problems`, and its absence for that resource is a typed refusal
+ * instead of a page that silently returns nothing.
+ */
+export interface SyncPageSource {
+  readonly sourceInstance: SourceInstance;
+  listProblems?(request: ListProblemsRequest): Promise<Page<NormalizedProblem>>;
+  listSubmissions(request: ListSubmissionsRequest): Promise<Page<Submission>>;
+}
+
 export interface SyncPageRequest {
   readonly resource: SyncResource;
   /** Required for `submissions`, optional account scope for `problems`. */
@@ -244,6 +265,18 @@ export interface SyncPageRequest {
   readonly limit: number;
   readonly limits: PlatformLimits;
   readonly token: CancellationToken;
+  /**
+   * Internal commit hook, invoked **inside** the page's transaction after the page rows and the
+   * checkpoint were written.
+   *
+   * It exists so a durable caller (the Sprint 17c synchronization service) can save its own
+   * progress and missing-metadata backlog atomically with the page: a throw from the hook aborts
+   * the whole transaction, so the page data and the checkpoint roll back together and no caller can
+   * ever observe a page that was written without its progress record. It is a plain function and is
+   * deliberately **not** part of any business-API DTO or UI input validation: no client can supply
+   * one, and `undefined` (the default) means the hook is simply not called.
+   */
+  readonly onPageCommitted?: (report: SyncPageReport) => Promise<void> | void;
 }
 
 export interface ProblemPageCounts {
@@ -340,5 +373,43 @@ export interface RefreshMaterialReport {
   /** Editorial merge outcome; null when no editorial request was made. */
   readonly material: MaterialReport | null;
   /** Committed snapshot; null when there was nothing to persist. */
+  readonly snapshot: SnapshotWrite | null;
+}
+
+// ---------------------------------------------------------------------------------------
+// Problem metadata refresh (metadata only)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Fetch one problem's **metadata** without touching its editorial material.
+ *
+ * This is the entry point an automatic history sync uses for the problems a submission page
+ * referenced before their catalog metadata existed. It is deliberately narrower than
+ * {@link RefreshMaterialRequest}: there is no `fetchStatement` flag and no editorial request at all,
+ * so a background sync can never turn into an editorial fetch (and never into a reasoning call).
+ * `refreshMaterial` keeps its own semantics, including its always-on editorial fetch, untouched.
+ */
+export interface RefreshProblemMetadataRequest {
+  readonly problemRef: ProblemRef;
+  readonly token: CancellationToken;
+  readonly limits: PlatformLimits;
+}
+
+/**
+ * Outcome of one metadata-only refresh.
+ *
+ * `fetched` means the adapter answered with a real problem whose identity matched the request and
+ * the write transaction committed; `failed` carries a typed operational error and wrote nothing.
+ * There is no third "nothing happened" success: a problem the adapter cannot answer for is a
+ * failure, never a fabricated body.
+ */
+export interface RefreshProblemMetadataReport {
+  readonly problemKey: string;
+  readonly status: 'fetched' | 'failed';
+  /** Effective metadata after merging the fetch over the stored body; null for a failure. */
+  readonly problem: NormalizedProblem | null;
+  /** Operational failure; set only for `failed` and never a fake success. */
+  readonly error: PlatformError | null;
+  /** Committed snapshot descriptor; null when the fetch failed. */
   readonly snapshot: SnapshotWrite | null;
 }

@@ -28,6 +28,15 @@ import { validateOfficialRating, type OfficialRatingSnapshot } from '../../domai
  * - **Settings are one CAS-guarded singleton row.** The value is validated and detached on the
  *   way in and re-validated on the way out; a save only advances the stored revision when its
  *   `expectedRevision` matches, so a stale caller rejects before any write.
+ * - **Luogu sync state is per account and revision-guarded.** One account's automatic-sync
+ *   settings, durable progress and opaque connection reference are separate rows; every save is a
+ *   compare-and-set against the revision the caller read, so a stale disconnect or a stale page
+ *   commit is refused instead of overwriting a newer session. Connection revisions come from a
+ *   per-account generation counter that survives deletion, so a revision is never reissued after a
+ *   disconnect, and the connection journal records an opaque reference *before* its secret is
+ *   written, so a crash cannot orphan a credential. Reads re-validate each stored body and
+ *   cross-check it against the row's own identity columns (`corrupt_row`), every record requires an
+ *   already stored official Luogu account, and no cookie or session value is representable here.
  * - **The head only moves forward.** `saveSnapshot` refuses to install an older version than
  *   the stored head, so an analysis of a newer snapshot can never be reverted by a late
  *   write of an old one.
@@ -43,6 +52,7 @@ import { dirname, resolve } from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import {
   DomainError,
+  LUOGU_OFFICIAL_INSTANCE_ID,
   assertIsoTimestamp,
   canonicalJson,
   contentHashOf,
@@ -139,6 +149,21 @@ import {
   type PlanAttemptStatus,
   type PlanningStore,
 } from '../../application/planning-types.js';
+import {
+  validateCredentialReference,
+  validateLuoguConnectionJournalEntry,
+  validateLuoguConnectionState,
+  validateLuoguSyncSettings,
+  validateLuoguSyncState,
+  type LuoguConnectionJournalEntry,
+  type LuoguConnectionRecord,
+  type LuoguConnectionState,
+  type LuoguSyncSettings,
+  type LuoguSyncSettingsRecord,
+  type LuoguSyncState,
+  type LuoguSyncStateRecord,
+  type LuoguSyncStore,
+} from '../../application/luogu-sync-types.js';
 import { FifoMutex, TransactionScopes, type TransactionScope } from './concurrency.js';
 import { StorageError } from './errors.js';
 import {
@@ -176,8 +201,8 @@ import {
 import {
   SCHEMA_VERSION_EMPTY,
   SCHEMA_VERSION_V4,
-  migrateToSchemaV6,
   SCHEMA_VERSION_V5,
+  SCHEMA_VERSION_V6,
   SCHEMA_VERSION_V1,
   SCHEMA_VERSION_V2,
   SCHEMA_VERSION_V3,
@@ -186,6 +211,7 @@ import {
   backupFileName,
   configureConnection,
   detectSchemaState,
+  migrateToSchemaV7,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -220,6 +246,16 @@ const SYNC_RESOURCE_VALUES: readonly string[] = SYNC_RESOURCES;
 /** Terminal or deliberately paused states a lease claim must not touch. */
 const UNCLAIMABLE: readonly AnalysisJobStatus[] = ['paused_quota', 'succeeded', 'failed', 'cancelled'];
 
+/**
+ * The one official Luogu origin whose accounts may hold synchronization state.
+ *
+ * Mirrors the Luogu adapter's official-origin check at the storage boundary: a stored source
+ * instance that calls itself Luogu but points anywhere else must not be able to carry durable sync
+ * state, a stored session reference or an automatic-sync configuration.
+ */
+const LUOGU_OFFICIAL_BASE_URL = 'https://www.luogu.com.cn';
+const LUOGU_OFFICIAL_DOMAIN = 'www.luogu.com.cn';
+
 export interface SqliteTrainingStoreOptions {
   /** Explicit database path. The parent directory is created when missing. */
   readonly path: string;
@@ -235,7 +271,34 @@ function requireId(label: string, value: string): string {
   return value;
 }
 
-export class SqliteTrainingStore implements TrainingStore, SettingsStore, CoachingStore, PlanningStore {
+/** Validate an optimistic-concurrency token: `null` (create) or the positive revision that was read. */
+function requireExpectedRevision(label: string, expectedRevision: number | null): void {
+  invariant(
+    expectedRevision === null || (Number.isSafeInteger(expectedRevision) && expectedRevision >= 1),
+    'invalid_input',
+    `${label} expectedRevision must be null (create) or an integer >= 1 (update)`,
+    { expectedRevision },
+  );
+}
+
+/**
+ * The origin of one stored base URL, or `null` when it is not an absolute URL.
+ *
+ * A stored source instance is compared by origin rather than by raw text, because URL
+ * normalization legitimately adds a trailing slash; an unparseable value is `null` and therefore
+ * never equal to the official origin the caller checks against.
+ */
+function originOf(value: string): string | null {
+  try {
+    return new URL(value).origin;
+  } catch (error) {
+    return null;
+  }
+}
+
+export class SqliteTrainingStore
+  implements TrainingStore, SettingsStore, CoachingStore, PlanningStore, LuoguSyncStore
+{
   readonly path: string;
 
   private readonly connection: DatabaseSync;
@@ -310,12 +373,13 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
       transactional: true,
       notes: [
         `node:sqlite DatabaseSync; schema marker ${STORE_MARKER}; one serialized connection`,
-        'Databases from a newer schema are rejected before any write; v0, v1, v2 and v3 databases are migrated after a verified consistent backup',
+        'Databases from a newer schema are rejected before any write; v0 through v6 databases are migrated after a verified consistent backup',
         'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
         'Batches are revision-guarded with monotonic counters; model-call attempts move reserved -> uncertain|settled and settled rows are immutable',
         'Workbench settings are a singleton row saved under revision CAS',
         'Coaching attempts are indexed audits: reserved -> uncertain|settled, settled rows immutable, bodies re-validated on read, bounded cursor pages over a three-valued account scope, global count',
         'AI planning attempts are indexed audits of their own: prepared (free, never charged) -> reserved (single in-flight call, lease recovery) | cancelled, reserved -> settled|uncertain, terminal rows immutable, bodies re-validated on read, account-scoped cursor pages and a global rolling-window count',
+        'Luogu sync settings, durable state and connection references are per-account rows saved under revision CAS; disconnecting must pass the revision it read, and no cookie or session value is representable',
       ],
     };
   }
@@ -1713,6 +1777,512 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
   }
 
   // -------------------------------------------------------------------------------------
+  // Luogu synchronization state (LuoguSyncStore)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Automatic-sync settings of one account, or `null` before that account's first save.
+   *
+   * Settings are per account, never a plugin-wide singleton: enabling automation for one account
+   * cannot enable another, and disconnecting one account only turns off its own automation.
+   */
+  async getLuoguSyncSettings(accountId: string): Promise<LuoguSyncSettingsRecord | null> {
+    this.assertOpen();
+    const id = requireId('account id', accountId);
+    return this.withRead(() => {
+      const row = this.find('SELECT revision, body FROM luogu_sync_settings WHERE account_id = ?', [id]);
+      if (row === null) {
+        return null;
+      }
+      const revision = this.luoguRevision('luogu_sync_settings', row);
+      const value = this.readLuoguRecord('luogu_sync_settings.body', row, validateLuoguSyncSettings, (settings) =>
+        settings.accountId === id ? null : `names account ${settings.accountId}, not its row ${id}`,
+      );
+      return { revision, value };
+    });
+  }
+
+  /** Save one account's settings under revision CAS; see {@link LuoguSyncStore.saveLuoguSyncSettings}. */
+  async saveLuoguSyncSettings(value: LuoguSyncSettings, expectedRevision: number | null): Promise<number> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      // Validation and the canonical-account proof run before any write: an unknown or foreign
+      // account is never granted a settings row.
+      const settings = validateLuoguSyncSettings(value);
+      this.requireStoredLuoguAccount(settings.accountId);
+      requireExpectedRevision('Luogu sync settings', expectedRevision);
+      const body = canonicalJson(settings);
+      const existing = this.find('SELECT revision FROM luogu_sync_settings WHERE account_id = ?', [
+        settings.accountId,
+      ]);
+      if (existing === null) {
+        invariant(
+          expectedRevision === null,
+          'invalid_transition',
+          `Luogu sync settings for ${settings.accountId} do not exist; a create must pass expectedRevision null`,
+          { accountId: settings.accountId, expectedRevision },
+        );
+        this.write('INSERT INTO luogu_sync_settings (account_id, revision, body) VALUES (?, 1, ?)', [
+          settings.accountId,
+          body,
+        ]);
+        return 1;
+      }
+      const storedRevision = this.luoguRevision('luogu_sync_settings', existing);
+      invariant(
+        expectedRevision !== null,
+        'duplicate_id',
+        `Luogu sync settings for ${settings.accountId} already exist at revision ${storedRevision}`,
+        { accountId: settings.accountId, storedRevision },
+      );
+      invariant(
+        expectedRevision === storedRevision,
+        'invalid_transition',
+        `Luogu sync settings for ${settings.accountId} are at revision ${storedRevision}, not ${expectedRevision}; re-read before saving`,
+        { accountId: settings.accountId, expectedRevision, storedRevision, reason: 'stale_revision' },
+      );
+      const next = storedRevision + 1;
+      this.write('UPDATE luogu_sync_settings SET revision = ?, body = ? WHERE account_id = ?', [
+        next,
+        body,
+        settings.accountId,
+      ]);
+      return next;
+    });
+  }
+
+  /** One account's durable sync state, or `null` when that account never synced. */
+  async getLuoguSyncState(accountId: string): Promise<LuoguSyncStateRecord | null> {
+    this.assertOpen();
+    const id = requireId('account id', accountId);
+    return this.withRead(() => {
+      const row = this.find('SELECT revision, source_instance_id, body FROM luogu_sync_states WHERE account_id = ?', [
+        id,
+      ]);
+      if (row === null) {
+        return null;
+      }
+      const revision = this.luoguRevision('luogu_sync_states', row);
+      const value = this.readLuoguRecord('luogu_sync_states.body', row, validateLuoguSyncState, (state) =>
+        state.accountId !== id
+          ? `names account ${state.accountId}, not its row ${id}`
+          : state.sourceInstanceId !== textColumn(row, 'source_instance_id')
+            ? `names source instance ${state.sourceInstanceId}, not its stored ${textColumn(row, 'source_instance_id')}`
+            : null,
+      );
+      return { revision, value };
+    });
+  }
+
+  /** Insert or update one account's state under revision CAS; see {@link LuoguSyncStore.saveLuoguSyncState}. */
+  async saveLuoguSyncState(value: LuoguSyncState, expectedRevision: number | null): Promise<number> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      const state = validateLuoguSyncState(value);
+      const account = this.requireStoredLuoguAccount(state.accountId);
+      invariant(
+        state.sourceInstanceId === account.sourceInstanceId,
+        'invalid_input',
+        `sync state names source instance ${state.sourceInstanceId}, but account ${state.accountId} belongs to ${account.sourceInstanceId}`,
+        { reason: 'luogu_source_mismatch', accountId: state.accountId, sourceInstanceId: state.sourceInstanceId },
+      );
+      requireExpectedRevision('Luogu sync state', expectedRevision);
+      const body = canonicalJson(state);
+      const existing = this.find('SELECT revision, source_instance_id FROM luogu_sync_states WHERE account_id = ?', [
+        state.accountId,
+      ]);
+      if (existing === null) {
+        invariant(
+          expectedRevision === null,
+          'invalid_transition',
+          `Luogu sync state for ${state.accountId} does not exist; a create must pass expectedRevision null`,
+          { accountId: state.accountId, expectedRevision },
+        );
+        this.write(
+          'INSERT INTO luogu_sync_states (account_id, source_instance_id, revision, body) VALUES (?, ?, 1, ?)',
+          [state.accountId, state.sourceInstanceId, body],
+        );
+        return 1;
+      }
+      invariant(
+        textColumn(existing, 'source_instance_id') === state.sourceInstanceId,
+        'invalid_transition',
+        `Luogu sync state for ${state.accountId} belongs to source instance ${textColumn(existing, 'source_instance_id')}`,
+        { reason: 'luogu_source_mismatch', accountId: state.accountId },
+      );
+      const storedRevision = this.luoguRevision('luogu_sync_states', existing);
+      invariant(
+        expectedRevision !== null,
+        'duplicate_id',
+        `Luogu sync state for ${state.accountId} already exists at revision ${storedRevision}`,
+        { accountId: state.accountId, storedRevision },
+      );
+      invariant(
+        expectedRevision === storedRevision,
+        'invalid_transition',
+        `Luogu sync state for ${state.accountId} is at revision ${storedRevision}, not ${expectedRevision}; re-read before saving`,
+        { accountId: state.accountId, expectedRevision, storedRevision, reason: 'stale_revision' },
+      );
+      const next = storedRevision + 1;
+      this.write('UPDATE luogu_sync_states SET revision = ?, body = ? WHERE account_id = ?', [
+        next,
+        body,
+        state.accountId,
+      ]);
+      return next;
+    });
+  }
+
+  /** One account's stored connection reference, or `null` when it has no stored session. */
+  async getLuoguConnection(accountId: string): Promise<LuoguConnectionRecord | null> {
+    this.assertOpen();
+    const id = requireId('account id', accountId);
+    return this.withRead(() => {
+      const row = this.find(
+        'SELECT account_id, source_instance_id, reference, status, checked_at, revision, body FROM luogu_connections WHERE account_id = ?',
+        [id],
+      );
+      if (row === null) {
+        return null;
+      }
+      const revision = this.luoguRevision('luogu_connections', row);
+      const value = this.readLuoguRecord('luogu_connections.body', row, validateLuoguConnectionState, (state) =>
+        this.luoguConnectionMismatch(row, state),
+      );
+      return { revision, value };
+    });
+  }
+
+  /** Insert or update one account's connection reference; see {@link LuoguSyncStore.saveLuoguConnection}. */
+  async saveLuoguConnection(value: LuoguConnectionState, expectedRevision: number | null): Promise<number> {
+    this.assertOpen();
+    return this.withWrite(() => {
+      const connection = validateLuoguConnectionState(value);
+      const account = this.requireStoredLuoguAccount(connection.accountId);
+      invariant(
+        connection.sourceInstanceId === account.sourceInstanceId,
+        'invalid_input',
+        `connection names source instance ${connection.sourceInstanceId}, but account ${connection.accountId} belongs to ${account.sourceInstanceId}`,
+        { reason: 'luogu_source_mismatch', accountId: connection.accountId },
+      );
+      requireExpectedRevision('Luogu connection', expectedRevision);
+      const body = canonicalJson(connection);
+      const existing = this.find('SELECT revision, source_instance_id FROM luogu_connections WHERE account_id = ?', [
+        connection.accountId,
+      ]);
+      if (existing === null) {
+        invariant(
+          expectedRevision === null,
+          'invalid_transition',
+          `Luogu connection for ${connection.accountId} does not exist; a create must pass expectedRevision null`,
+          { accountId: connection.accountId, expectedRevision },
+        );
+        const next = this.issueLuoguConnectionRevision(connection.accountId, 0);
+        this.write(
+          `INSERT INTO luogu_connections (account_id, source_instance_id, reference, status, revision, checked_at, body)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            connection.accountId,
+            connection.sourceInstanceId,
+            connection.reference,
+            connection.status,
+            next,
+            connection.checkedAt,
+            body,
+          ],
+        );
+        return next;
+      }
+      invariant(
+        textColumn(existing, 'source_instance_id') === connection.sourceInstanceId,
+        'invalid_transition',
+        `Luogu connection of ${connection.accountId} belongs to source instance ${textColumn(existing, 'source_instance_id')}`,
+        { reason: 'luogu_source_mismatch', accountId: connection.accountId },
+      );
+      const storedRevision = this.luoguRevision('luogu_connections', existing);
+      invariant(
+        expectedRevision !== null,
+        'duplicate_id',
+        `Luogu connection of ${connection.accountId} already exists at revision ${storedRevision}`,
+        { accountId: connection.accountId, storedRevision },
+      );
+      invariant(
+        expectedRevision === storedRevision,
+        'invalid_transition',
+        `Luogu connection of ${connection.accountId} is at revision ${storedRevision}, not ${expectedRevision}; re-read before saving`,
+        { accountId: connection.accountId, expectedRevision, storedRevision, reason: 'stale_revision' },
+      );
+      // The generation counter is raised together with the row, so a later delete can never hand
+      // this revision to a fresh connection.
+      const next = this.issueLuoguConnectionRevision(connection.accountId, storedRevision);
+      this.write(
+        `UPDATE luogu_connections SET source_instance_id = ?, reference = ?, status = ?, revision = ?, checked_at = ?,
+           body = ? WHERE account_id = ?`,
+        [
+          connection.sourceInstanceId,
+          connection.reference,
+          connection.status,
+          next,
+          connection.checkedAt,
+          body,
+          connection.accountId,
+        ],
+      );
+      return next;
+    });
+  }
+
+  /**
+   * Delete one account's connection row under revision CAS.
+   *
+   * Deleting a row that is already gone is a successful no-op (a disconnect is idempotent), but a
+   * row that exists at another revision is refused: the caller's disconnect was prepared against an
+   * older read, and removing the row would destroy the session reference that replaced it.
+   */
+  async deleteLuoguConnection(accountId: string, expectedRevision: number | null): Promise<void> {
+    this.assertOpen();
+    const id = requireId('account id', accountId);
+    return this.withWrite(() => {
+      requireExpectedRevision('Luogu connection', expectedRevision);
+      const existing = this.find('SELECT revision FROM luogu_connections WHERE account_id = ?', [id]);
+      if (existing === null) {
+        return;
+      }
+      const storedRevision = this.luoguRevision('luogu_connections', existing);
+      invariant(
+        expectedRevision === storedRevision,
+        'invalid_transition',
+        `Luogu connection of ${id} is at revision ${storedRevision}, not ${String(expectedRevision)}; a stale disconnect must not remove a replaced session`,
+        { accountId: id, expectedRevision, storedRevision, reason: 'stale_revision' },
+      );
+      this.write('DELETE FROM luogu_connections WHERE account_id = ?', [id]);
+    });
+  }
+
+  /**
+   * Every stored connection in account-id order.
+   *
+   * Only the non-secret connection metadata leaves this method: the opaque vault reference, the
+   * status and the instants. The credential store itself is never read, listed or enumerated here.
+   */
+  async listLuoguConnections(): Promise<readonly LuoguConnectionState[]> {
+    this.assertOpen();
+    return this.withRead(() =>
+      this.all(
+        'SELECT account_id, source_instance_id, reference, status, checked_at, body FROM luogu_connections ORDER BY account_id ASC',
+      ).map((row) =>
+        this.readLuoguRecord('luogu_connections.body', row, validateLuoguConnectionState, (state) =>
+          this.luoguConnectionMismatch(row, state),
+        ),
+      ),
+    );
+  }
+
+  /**
+   * Every unlinked credential reference of one account, in recorded order.
+   *
+   * This is the read half of the write-ahead journal: the connection adapter records a fresh opaque
+   * reference here *before* it writes the secret, so a crash between the vault write and the
+   * connection save leaves a reference that later recovery can remove instead of an unreachable
+   * credential. The journal holds no secret, so nothing credential-shaped leaves this method.
+   */
+  async listLuoguConnectionJournal(accountId: string): Promise<readonly LuoguConnectionJournalEntry[]> {
+    this.assertOpen();
+    const id = requireId('account id', accountId);
+    return this.withRead(() =>
+      this.all(
+        `SELECT account_id, reference, recorded_at FROM luogu_connection_journal
+         WHERE account_id = ? ORDER BY recorded_at ASC, reference ASC`,
+        [id],
+      ).map((row) => this.readLuoguJournalEntry(row)),
+    );
+  }
+
+  /**
+   * Record one opaque reference before its secret is written.
+   *
+   * Idempotent for an existing `(account, reference)` pair, because a retried write-ahead step must
+   * not create a second entry. The account must already be stored and official, exactly like every
+   * other Luogu record, and the reference is validated with the vault's own pattern, so no cookie
+   * or other secret can ever be journaled.
+   */
+  async appendLuoguConnectionJournal(accountId: string, reference: string): Promise<void> {
+    this.assertOpen();
+    const id = requireId('account id', accountId);
+    return this.withWrite(() => {
+      this.requireStoredLuoguAccount(id);
+      const opaque = validateCredentialReference(reference);
+      this.write(
+        `INSERT INTO luogu_connection_journal (account_id, reference, recorded_at) VALUES (?, ?, ?)
+         ON CONFLICT(account_id, reference) DO NOTHING`,
+        [id, opaque, this.clock()],
+      );
+    });
+  }
+
+  /**
+   * Forget one journal entry after its credential was adopted or removed.
+   *
+   * Idempotent: removing an entry that is already gone is a successful no-op, so a retried cleanup
+   * can finish. Only the exact `(account, reference)` pair is addressed.
+   */
+  async removeLuoguConnectionJournalEntry(accountId: string, reference: string): Promise<void> {
+    this.assertOpen();
+    const id = requireId('account id', accountId);
+    return this.withWrite(() => {
+      const opaque = validateCredentialReference(reference);
+      this.write('DELETE FROM luogu_connection_journal WHERE account_id = ? AND reference = ?', [id, opaque]);
+    });
+  }
+
+  /** Highest connection revision ever issued for one account; `0` when none was issued yet. */
+  private luoguConnectionGeneration(accountId: string): number {
+    const row = this.find('SELECT revision FROM luogu_connection_generations WHERE account_id = ?', [accountId]);
+    return row === null ? 0 : this.luoguRevision('luogu_connection_generations', row);
+  }
+
+  /**
+   * Issue the next connection revision and remember it durably in the same transaction.
+   *
+   * The counter is a tombstone: deleting the connection row never deletes it, so a revision is
+   * never reissued. A stale writer prepared against a removed row — or against a row a later
+   * reconnect replaced — therefore fails its compare-and-set instead of mutating the new session.
+   */
+  private issueLuoguConnectionRevision(accountId: string, atLeast: number): number {
+    const next = Math.max(atLeast, this.luoguConnectionGeneration(accountId)) + 1;
+    this.write(
+      `INSERT INTO luogu_connection_generations (account_id, revision) VALUES (?, ?)
+       ON CONFLICT(account_id) DO UPDATE SET revision = excluded.revision`,
+      [accountId, next],
+    );
+    return next;
+  }
+
+  /** Decode one journal row; a hand-edited row is `corrupt_row`, never a servable reference. */
+  private readLuoguJournalEntry(row: Row): LuoguConnectionJournalEntry {
+    try {
+      return validateLuoguConnectionJournalEntry({
+        accountId: textColumn(row, 'account_id'),
+        reference: textColumn(row, 'reference'),
+        recordedAt: textColumn(row, 'recorded_at'),
+      });
+    } catch (error) {
+      throw new StorageError('corrupt_row', 'stored luogu_connection_journal is not a valid entry', {
+        cause: String(error),
+      });
+    }
+  }
+
+  /** The stored revision column of one Luogu row; a non-positive value is a corrupt row. */
+  private luoguRevision(label: string, row: Row): number {
+    const revision = intColumn(row, 'revision');
+    if (revision < 1) {
+      throw new StorageError('corrupt_row', `stored ${label} revision ${revision} is not a positive integer`, {
+        reason: 'luogu_revision_invalid',
+      });
+    }
+    return revision;
+  }
+
+  /**
+   * Decode one stored Luogu record and prove it belongs to the row it was read from.
+   *
+   * Every Luogu body is re-validated on read: a body that parses as JSON but is not a valid record
+   * (hand-edited, written by a buggy build, or carrying a credential-shaped key) is `corrupt_row`,
+   * and a record whose identity disagrees with its own columns is refused as well, so no row can be
+   * handed out under a borrowed identity.
+   */
+  private readLuoguRecord<T>(
+    label: string,
+    row: Row,
+    validate: (value: unknown) => T,
+    mismatch: (value: T) => string | null,
+  ): T {
+    let value: T;
+    try {
+      value = validate(parseBody<unknown>(label, textColumn(row, 'body')));
+    } catch (error) {
+      throw new StorageError('corrupt_row', `stored ${label} is not a valid record`, { cause: String(error) });
+    }
+    const problem = mismatch(value);
+    if (problem !== null) {
+      throw new StorageError('corrupt_row', `stored ${label} ${problem}`, { reason: 'luogu_row_mismatch' });
+    }
+    return value;
+  }
+
+  /** Describe how one stored connection body disagrees with its own row, or `null` when it agrees. */
+  private luoguConnectionMismatch(row: Row, state: LuoguConnectionState): string | null {
+    const accountId = textColumn(row, 'account_id');
+    if (state.accountId !== accountId) {
+      return `names account ${state.accountId}, not its row ${accountId}`;
+    }
+    const sourceInstanceId = textColumn(row, 'source_instance_id');
+    if (state.sourceInstanceId !== sourceInstanceId) {
+      return `names source instance ${state.sourceInstanceId}, not its stored ${sourceInstanceId}`;
+    }
+    const reference = textColumn(row, 'reference');
+    if (state.reference !== reference) {
+      return `carries reference ${state.reference}, not its stored ${reference}`;
+    }
+    const status = textColumn(row, 'status');
+    if (state.status !== status) {
+      return `carries status ${state.status}, not its stored ${status}`;
+    }
+    const checkedAt = textColumn(row, 'checked_at');
+    if (state.checkedAt !== checkedAt) {
+      return `carries checkedAt ${state.checkedAt}, not its stored ${checkedAt}`;
+    }
+    return null;
+  }
+
+  /**
+   * Resolve the stored account one Luogu record belongs to and prove it is an official Luogu one.
+   *
+   * Automatic synchronization, durable progress and a stored session are only meaningful for an
+   * account that already exists on the official `luogu:www.luogu.com.cn` instance: creating an
+   * account here would let a caller sync into an identity the catalog never produced, and accepting
+   * a foreign or repointed instance would bind the same UID on another host to this store's Luogu
+   * state. The account and its source instance are read from storage; caller-supplied identity is
+   * never trusted, and a missing account is a typed refusal rather than an implicit create.
+   */
+  private requireStoredLuoguAccount(accountId: string): {
+    readonly accountId: string;
+    readonly sourceInstanceId: string;
+  } {
+    const account = this.find('SELECT source_instance_id FROM accounts WHERE id = ?', [accountId]);
+    invariant(
+      account !== null,
+      'missing_reference',
+      `account ${accountId} is not stored; Luogu state is never created for an unknown account`,
+      { accountId },
+    );
+    const sourceInstanceId = textColumn(account, 'source_instance_id');
+    const instance = this.find('SELECT platform, base_url, domain FROM source_instances WHERE id = ?', [
+      sourceInstanceId,
+    ]);
+    invariant(
+      instance !== null,
+      'missing_reference',
+      `source instance ${sourceInstanceId} of account ${accountId} is not stored`,
+      { accountId, sourceInstanceId },
+    );
+    const platform = textColumn(instance, 'platform');
+    const baseUrl = textColumn(instance, 'base_url');
+    const domain = nullableTextColumn(instance, 'domain');
+    invariant(
+      sourceInstanceId === LUOGU_OFFICIAL_INSTANCE_ID &&
+        platform === 'luogu' &&
+        domain === LUOGU_OFFICIAL_DOMAIN &&
+        originOf(baseUrl) === LUOGU_OFFICIAL_BASE_URL,
+      'invalid_input',
+      `Luogu synchronization requires an account on the official ${LUOGU_OFFICIAL_INSTANCE_ID} source instance`,
+      { reason: 'not_official_luogu_source', accountId, sourceInstanceId, platform, domain, baseUrl },
+    );
+    return { accountId, sourceInstanceId };
+  }
+
+  // -------------------------------------------------------------------------------------
   // Write helpers (always called inside a serialized write scope)
   // -------------------------------------------------------------------------------------
 
@@ -2485,18 +3055,28 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
    *
    * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
    *    switched into another journal mode or otherwise touched.
-   * 2. A supported older database (v0, v1, v2, v3, v4 or v5) is backed up **before** `configureConnection`,
+   * 2. A supported older database (v0 through v6) is backed up **before** `configureConnection`,
    *    so the backup is the database as it was found and switching the journal mode is not part
-   *    of the pre-migration state. The copy is verified before migration starts.
-   * 3. migrateToSchemaV6 applies only missing versions in one transaction; every existing row
-   *    is retained, and exactly one pre-migration backup was already taken.
+   *    of the pre-migration state. The copy is verified before migration starts, at the literal
+   *    version the file was found in.
+   * 3. `migrateToSchemaV7` applies only the missing versions in one transaction and ends at the
+   *    current version; every existing row is retained, and exactly one pre-migration backup was
+   *    already taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
    *    succeeded, so a failed migration leaves the original file — including its original
    *    journal mode — untouched.
    */
   private openSchema(inMemory: boolean): void {
     const state = detectSchemaState(this.connection);
-    if (state === 'legacy_v0' || state === 'v1' || state === 'v2' || state === 'v3' || state === 'v4' || state === 'v5') {
+    if (
+      state === 'legacy_v0' ||
+      state === 'v1' ||
+      state === 'v2' ||
+      state === 'v3' ||
+      state === 'v4' ||
+      state === 'v5' ||
+      state === 'v6'
+    ) {
       // Keep a consistent copy of the database as found before any migration writes to it.
       const from =
         state === 'legacy_v0'
@@ -2505,14 +3085,20 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
             ? SCHEMA_VERSION_V1
             : state === 'v2'
               ? SCHEMA_VERSION_V2
-              : state === 'v3' ? SCHEMA_VERSION_V3 : state === 'v4' ? SCHEMA_VERSION_V4 : SCHEMA_VERSION_V5;
+              : state === 'v3'
+                ? SCHEMA_VERSION_V3
+                : state === 'v4'
+                  ? SCHEMA_VERSION_V4
+                  : state === 'v5'
+                    ? SCHEMA_VERSION_V5
+                    : SCHEMA_VERSION_V6;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
       this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        migrateToSchemaV6(this.connection, readUserVersion(this.connection));
+        migrateToSchemaV7(this.connection, readUserVersion(this.connection));
       } catch (error) {
         if (error instanceof StorageError) {
           throw error;

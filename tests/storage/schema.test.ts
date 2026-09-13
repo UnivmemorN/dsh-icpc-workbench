@@ -248,6 +248,11 @@ void test('a fresh path is initialized with the marker, the current schema and i
     'analyses',
     'coaching_attempts',
     'jobs',
+    'luogu_connection_generations',
+    'luogu_connection_journal',
+    'luogu_connections',
+    'luogu_sync_settings',
+    'luogu_sync_states',
     'manual_decisions',
     'manual_revisions',
     'plan_attempts',
@@ -276,11 +281,11 @@ void test('a database from a newer schema is rejected before anything is written
   rawExec(paths.path, [
     'CREATE TABLE problems (x TEXT)',
     `INSERT INTO problems (x) VALUES ('foreign data')`,
-    // Explicitly verify v7 is refused by this build's v6 store before any write.
+    // Explicitly verify a v8 database is refused by this build's v7 store before any write.
     `PRAGMA user_version = ${STORE_SCHEMA_VERSION + 1}`,
   ]);
-  assert.equal(STORE_SCHEMA_VERSION, 6);
-  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 7);
+  assert.equal(STORE_SCHEMA_VERSION, 7);
+  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 8);
   const before = fingerprint(paths.path);
   const beforeBytes = readFileSync(paths.path);
   assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');

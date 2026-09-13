@@ -4,7 +4,7 @@ import { readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { SqliteTrainingStore } from '../../src/adapters/sqlite/store.js';
-import { initializeSchemaV4, readUserVersion, tableNames, STORE_TABLES_V4 } from '../../src/adapters/sqlite/schema.js';
+import { initializeSchemaV4, readUserVersion, tableNames, STORE_SCHEMA_VERSION, STORE_TABLES_V4 } from '../../src/adapters/sqlite/schema.js';
 import { validateAbilityCalibration, validateTrainingReference } from '../../src/domain/ability-calibration.js';
 import { validateAbilityCalibrate } from '../../src/plugin/api-validation.js';
 import * as fx from './fixtures.js';
@@ -46,7 +46,7 @@ test('schema v4 is backed up intact; calibration survives import and restart wit
     const rows = db.prepare('SELECT body FROM ability_calibrations ORDER BY revision').all();
     assert.equal(rows.length, 2);
     assert.deepEqual(JSON.parse(rows[0]!['body'] as string), value);
-    assert.equal(readUserVersion(db), 6);
+    assert.equal(readUserVersion(db), STORE_SCHEMA_VERSION);
     db.close();
   } finally { await store.close(); fx.removeDirectory(paths.dir); }
 });

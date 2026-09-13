@@ -29,6 +29,13 @@ import type {
   EditorialSourceKind,
 } from '../domain/index.js';
 import type {
+  LuoguConnectionStatus,
+  LuoguSyncFailure,
+  LuoguSyncFailureCode,
+  LuoguSyncPhase,
+  LuoguSyncSettings,
+} from './luogu-sync-types.js';
+import type {
   ProblemPageCounts,
   SubmissionPageCounts,
 } from './import-types.js';
@@ -171,6 +178,24 @@ export const PLANNING_API_OPERATIONS = {
   planAiStatus: 'plan.aiStatus',
   planAiCancel: 'plan.aiCancel',
   planAiHistory: 'plan.aiHistory',
+} as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
+
+/**
+ * Luogu connection/synchronization operations registered by the owned Luogu host (Sprint 17d1).
+ *
+ * They are registered separately from the free business routes because they drive the durable
+ * authenticated synchronization service and the OS credential vault. `luogu.connect` is the single
+ * operation of the whole API whose request carries secret material; every other operation names
+ * only a stored account, an explicit action, a settings patch or a compare-and-set revision.
+ */
+export const LUOGU_API_OPERATIONS = {
+  status: 'luogu.status',
+  connect: 'luogu.connect',
+  probe: 'luogu.probe',
+  disconnect: 'luogu.disconnect',
+  configure: 'luogu.configure',
+  start: 'luogu.start',
+  cancel: 'luogu.cancel',
 } as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
 
 // ---------------------------------------------------------------------------------------
@@ -522,6 +547,124 @@ export interface ApiMaterialSupplementResult {
 }
 
 // ---------------------------------------------------------------------------------------
+// Luogu connection / synchronization operations (Sprint 17d1)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Request naming one stored Luogu account.
+ *
+ * Every Luogu operation takes the account explicitly and never creates one: an account is created
+ * once by `account.create` on the official Luogu platform, and a request for an account of another
+ * platform (or a non-canonical Luogu uid) is refused before any credential or platform work.
+ */
+export interface ApiLuoguAccountRequest {
+  readonly accountId: string;
+}
+
+/**
+ * Request of `luogu.connect`: the account plus the ephemeral session cookie of this one user action.
+ *
+ * The cookie is the **only** request field of the whole API that carries secret material. It is
+ * bounded by the OS credential store's own 2560-byte capacity, is stored only inside that store
+ * under a fresh opaque reference, and is never echoed by a response, a status, an error or a log.
+ */
+export interface ApiLuoguConnectRequest {
+  readonly accountId: string;
+  readonly sessionCookie: string;
+}
+
+/**
+ * Request of `luogu.configure`: one account's automation plus the revision the caller read.
+ *
+ * The patch is closed and must carry at least one field; `expectedRevision` is `null` only before
+ * that account's first settings row exists, and a mismatch is refused instead of overwriting a
+ * decision made elsewhere.
+ */
+export interface ApiLuoguConfigureRequest {
+  readonly accountId: string;
+  readonly expectedRevision: number | null;
+  readonly automaticEnabled?: boolean;
+  readonly runOnStartup?: boolean;
+  readonly intervalMinutes?: number;
+}
+
+/** Request of `luogu.start`: `resume` continues the durable position, `full` reconciles history. */
+export interface ApiLuoguStartRequest {
+  readonly accountId: string;
+  readonly mode: 'resume' | 'full';
+}
+
+/** Safe projection of one stored connection; never a reference, a cookie or a vault detail. */
+export interface ApiLuoguConnectionView {
+  readonly status: LuoguConnectionStatus;
+  readonly connectedAt: string;
+  readonly checkedAt: string;
+  readonly failureCode: LuoguSyncFailureCode | null;
+  /** True when a previous credential could not be removed and a retry is still pending. */
+  readonly cleanupPending: boolean;
+}
+
+/**
+ * Field-by-field projection of one Luogu account's connection and synchronization status.
+ *
+ * The service's own status carries the stored connection record (an opaque vault reference) and the
+ * durable lease owner; neither is representable here. What remains is exactly what a caller needs:
+ * the canonical uid, whether this platform can store a session at all, the observed connection
+ * state and check time, per-account settings together with the revision the next configure must
+ * name, durable history coverage, committed progress, the metadata backlog and a sanitized failure
+ * with its retry/next-run instants. No field can carry a cookie, a vault reference, a raw platform
+ * body or an adapter exception message.
+ */
+export interface ApiLuoguStatusView {
+  readonly accountId: string;
+  /** Canonical decimal Luogu uid of the stored account. */
+  readonly uid: string;
+  readonly sourceInstanceId: string;
+  /** False when this platform has no supported OS-protected credential backend. */
+  readonly connectionAvailable: boolean;
+  /** Resolved platform of the credential backend (for example `win32`). */
+  readonly connectionPlatform: string;
+  readonly connection: ApiLuoguConnectionView | null;
+  readonly settings: LuoguSyncSettings;
+  /** Revision the next `luogu.configure` must name; `null` before the first settings row. */
+  readonly settingsRevision: number | null;
+  readonly phase: LuoguSyncPhase;
+  readonly historyComplete: boolean;
+  readonly historyCompletedAt: string | null;
+  /** True when a durable checkpoint continuation exists; the next pass resumes it first. */
+  readonly resumePending: boolean;
+  /** Time bound of the stored continuation; `null` for a full-window scan. */
+  readonly scanSince: string | null;
+  readonly running: boolean;
+  /** True while any plugin instance holds a live durable lease on this account. */
+  readonly leaseActive: boolean;
+  readonly paused: boolean;
+  readonly failure: LuoguSyncFailure | null;
+  readonly nextRunAt: string | null;
+  readonly scanStartedAt: string | null;
+  readonly lastScanStartedAt: string | null;
+  readonly lastSuccessAt: string | null;
+  readonly pagesInPass: number;
+  readonly totalPages: number;
+  readonly submissionsSeen: number;
+  readonly metadataBacklog: number;
+  readonly metadataBacklogFull: boolean;
+  readonly metadataResolved: number;
+  readonly metadataFailed: number;
+  /** Always `0`: this build refuses a write instead of forgetting a backlog key. */
+  readonly backlogDropped: number;
+  readonly closing: boolean;
+}
+
+/** Result of `luogu.start`; the durable plan itself is visible in `status`. */
+export interface ApiLuoguStartResult {
+  readonly accountId: string;
+  readonly mode: 'resume' | 'full';
+  readonly outcome: 'started' | 'coalesced' | 'queued';
+  readonly status: ApiLuoguStatusView;
+}
+
+// ---------------------------------------------------------------------------------------
 // Workbench read/review/plan operations (delegated to the accepted services)
 // ---------------------------------------------------------------------------------------
 
@@ -630,6 +773,13 @@ export interface WorkbenchApiMap {
   'plan.adopt': ApiEndpoint<ApiPlanAdoptRequest, ApiPlanAdoptResult>;
   'plan.edit': ApiEndpoint<ApiPlanEditRequest, ApiPlanEditResult>;
   'plan.checkoff': ApiEndpoint<ApiPlanCheckoffRequest, ApiPlanCheckoffResult>;
+  'luogu.status': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguStatusView>;
+  'luogu.connect': ApiEndpoint<ApiLuoguConnectRequest, ApiLuoguStatusView>;
+  'luogu.probe': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguStatusView>;
+  'luogu.disconnect': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguStatusView>;
+  'luogu.configure': ApiEndpoint<ApiLuoguConfigureRequest, ApiLuoguStatusView>;
+  'luogu.start': ApiEndpoint<ApiLuoguStartRequest, ApiLuoguStartResult>;
+  'luogu.cancel': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguStatusView>;
   'plan.aiPrepare': ApiEndpoint<Model.ModelPlanPrepareRequest, Model.ModelPlanPrepareResult>;
   'plan.aiRun': ApiEndpoint<Model.ModelPlanRunRequest, Model.ModelPlanRunResult>;
   'plan.aiStatus': ApiEndpoint<Model.ModelPlanStatusRequest, Model.ModelPlanStatusResult>;
