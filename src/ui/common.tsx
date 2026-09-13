@@ -12,7 +12,7 @@ export function ErrorNotice({error}:{error:unknown}){return error?<div className
 export function Notice({children}:{children:ReactNode}){return <div className="icpc-notice">{children}</div>;}
 export function Empty({children}:{children:ReactNode}){return <div className="icpc-empty">{children}</div>;}
 export function Panel({title,children,tools}:{title:string;children:ReactNode;tools?:ReactNode}){return <section className="icpc-card"><div className="icpc-card-head"><h2>{title}</h2>{tools}</div>{children}</section>;}
-export function ExternalLink({href,children}:{href:string;children:ReactNode}){let safe=false;try{safe=['http:','https:'].includes(new URL(href).protocol);}catch(error){safe=false;}return safe?<a href={href} target="_blank" rel="noreferrer">{children} ↗</a>:<span>{children}</span>;}
+export function ExternalLink({href,children}:{href:string;children:ReactNode}){let safe=false;try{safe=['http:','https:'].includes(new URL(href).protocol);}catch(error){safe=false;}return safe?<a href={href} target="_blank" rel="noopener noreferrer">{children} ↗</a>:<span>{children}</span>;}
 export function useRequest<K extends WorkbenchApiOperation>(operation:K,input:ApiRequest<K>|null){
   const [state,setState]=useState<{key:string;data:ApiResponse<K>|null;error:unknown;pending:boolean}>({key:'',data:null,error:null,pending:false});
   const [version,setVersion]=useState(0),serialized=input===null?null:JSON.stringify(input),key=operation+'|'+serialized;

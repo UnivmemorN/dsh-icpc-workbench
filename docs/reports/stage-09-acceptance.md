@@ -1,0 +1,22 @@
+# Stage 09 acceptance — knowledge learning evidence
+Date: 2026-09-13. Version: 0.1.4.
+## Delivered behavior
+Weakness defaults to a knowledge view covering the existing 105 stable taxonomy nodes: 89 techniques and 16 category summaries. All techniques remain browsable, including zero-observation entries. Search (Chinese/English/alias/id), explicit-parent category filters, evidence status filters, stable sorting, and 25-row numbered/jump paging operate locally on one weakness response.
+Platform-tag reference, effective adopted tags and latest AC-backed retrospectives remain separate. Independent, assisted and solution-used records are counted by distinct problem, with latest retrospective winning. Parent counters use unions, not sums; categories never imply mastery of every descendant. The five-independent-problem label is an explicit product heuristic, not a calibrated probability. Native difficulty ranges and missing samples describe only independent-method evidence.
+## Sources and current OI Wiki role
+The page credits [Nowcoder ACM skill exercises](https://ac.nowcoder.com/acm/skill/acm) for category/filter/practice presentation and [OI Wiki](https://oi-wiki.org/) / OI Wiki Team and community for learning references. All 105 nodes have mapped resources (118 references to 106 unique URLs), checked against the official navigation on 2026-09-13; this was not a full article-by-article verification.
+Composite concepts preserve multiple links; broader mappings are labeled overview. No article bodies, source code, images or site account data are redistributed. OI Wiki copyright terms are linked in the page and recorded in THIRD_PARTY_NOTICES.md.
+[Knowledge-learning design](../knowledge-learning.md) distinguishes the shipped navigation from future taxonomy maintenance, AI definition retrieval/completeness checks, and reading steps in training plans. These future items are not implemented by this release.
+## Checks actually completed
+- Coordinator focused core tests: 15 passed.
+- New domain, resource, service and UI helper suites: 36 tests altogether.
+- Full npm run check: 659 behavior tests plus 9 construction-script tests passed; TypeScript, architecture boundaries, independent ESM build, shared-React client factory and disposal checks passed.
+- Packaged local installation on pinned dsh 0.1.5-rc.2 activated successfully. All 445 installed dist files matched build hashes. Client SHA256: 31bc8bf84f868e8906c8d38a588a1516da502065f952a0a073fcc6b570f748f7.
+- Real local API returned all catalog nodes, account-correct totals and valid independent-evidence/rating invariants. Two observed weakness reads took 32 ms and 4 ms in this local run; these are observations, not a performance guarantee.
+- Before/after upgrade checks: SQLite integrity ok, schema remains 3, all 19 application tables identical, and old formal reports/coverage/raw-tag provenance identical. Backup retained in the independent local data directory.
+- Browser: default knowledge view, fourth page with 14 technique rows, alias search and reset to page 1, six-node nested number-theory filter, empty state and disabled paging, direct page jump, account-switch reset/isolation, old platform view, per-topic and per-category OI Wiki links, multi-link DFS/BFS concept, noopener/noreferrer, no console errors or visible alerts.
+## Boundaries
+No production model call, new submission, account, retrospective or manual tag decision was created during acceptance. No private training records, full editorials or model logs are in this report or Git.
+The taxonomy itself was not changed; classification completeness still depends on available raw/effective/retrospective evidence. Unknown records are not labeled inability. No automatic Wiki ingestion, AI plan generation, automatic tag-completeness queue, or cross-account skill aggregation is claimed.
+The profile package manager continues to report missing peers for host-provided shared packages (including dsh services and React), as with the previous dependency declarations. Those declarations are unchanged; the pinned host activation and shared-module/client checks pass. No duplicate host/React packages were installed to silence that diagnostic.
+Construction used one dsh Flash/max worker at a time. The UI invocation hit its 40-request cap; one bounded repair invocation completed the remaining checks. Source-only Git delivery, no public binary or GitHub Release.

@@ -27,3 +27,11 @@ The exact dependency tree is recorded in package-lock.json. Installed dependenci
 | @deepseek-ai/dsh-client-ui-sidebar | 0.1.5-rc.2 | MIT |
 | @deepseek-ai/dsh-client-ui-renderer | 0.1.5-rc.2 | MIT |
 | react | 18.3.1 | MIT |
+
+## Knowledge learning references
+
+- [Nowcoder ACM knowledge-point exercises](https://ac.nowcoder.com/acm/skill/acm), observed 2026-09-13: inspiration for category browsing, search/filter and per-topic practice counts. The learning-evidence rules and implementation here are independent; no Nowcoder page, code, question bank or account records are copied.
+- [OI Wiki](https://oi-wiki.org/), OI Wiki Team and community contributors, [repository](https://github.com/OI-wiki/OI-wiki), observed 2026-09-13: reference for topic navigation and external learning resources. The package contains independently selected title/URL mappings, not OI Wiki article bodies, code, images or a mirror. Broad mappings are explicitly marked as overview references. See [knowledge-learning.md](docs/knowledge-learning.md) for implemented roles and future plans.
+- OI Wiki's [copyright declaration](https://github.com/OI-wiki/OI-wiki#版权声明) states that non-code content, unless otherwise specified, is available under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) and additional [SATA](https://github.com/zTrix/sata-license) terms; individual material may have separate notices. Any future reproduced/adapted content must retain its applicable attribution, license, source/version and change notices and must not be represented as covered solely by this project's MIT license.
+
+Neither Nowcoder nor OI Wiki supplies or certifies this project's mastery assessment. The status labels describe recorded evidence and are not a validated mastery probability.

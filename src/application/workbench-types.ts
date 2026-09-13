@@ -18,6 +18,7 @@ import type {
   DecisionReason,
   EditorialAvailability,
   EditorialSourceKind,
+  KnowledgeEvidenceReport,
   ManualTagAction,
   ModelRole,
   ModelUsage,
@@ -483,6 +484,12 @@ export interface WorkbenchPlatformTagStatsView {
 export interface WorkbenchWeaknessResult {
   /** Pure domain report: distinct problems, minimum-sample gate, latest retrospective wins. */
   readonly report: AccountWeaknessReport;
+  /**
+   * Per-taxonomy-node learning evidence (Stage 09a) reduced from the same collected evidence:
+   * provisional raw tags, effective verified decisions and the latest retrospectives stay separate
+   * channels, and an accepted submission alone confirms no method.
+   */
+  readonly knowledge: KnowledgeEvidenceReport;
   /** Every distinct accepted problem over its own raw platform dimensions (provisional). */
   readonly solvedDistribution: WorkbenchSolvedDistributionView;
   /** Unverified platform-label reference; descriptive only, never formal weakness evidence. */

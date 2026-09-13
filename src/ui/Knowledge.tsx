@@ -1,0 +1,584 @@
+import { useEffect, useRef, useState, type FormEvent } from 'react';
+import type { ApiWeaknessResult } from '../application/workbench-api.js';
+import {
+  KNOWLEDGE_ATTRIBUTION_COPYRIGHT_URL,
+  KNOWLEDGE_ATTRIBUTION_NOTES,
+  KNOWLEDGE_ATTRIBUTION_SOURCES,
+  KNOWLEDGE_RESOURCES_CHECKED_DATE,
+  knowledgeResourcesFor,
+} from '../domain/knowledge-resources.js';
+import { Empty, ExternalLink, Notice, Panel, useWorkbench } from './common.js';
+import { barWidthPercent } from './histogram.js';
+import {
+  KNOWLEDGE_AC_NOTE,
+  KNOWLEDGE_CATALOG_DRIFT_NOTE,
+  KNOWLEDGE_CATEGORY_SUMMARY_NOTE,
+  KNOWLEDGE_NO_OBSERVATION_NOTE,
+  KNOWLEDGE_OVERLAP_NOTE,
+  KNOWLEDGE_SELF_REPORT_NOTE,
+  KNOWLEDGE_SORTS,
+  KNOWLEDGE_SORT_LABELS,
+  KNOWLEDGE_STATUS_LABELS,
+  KNOWLEDGE_TECHNIQUE_STATUSES,
+  changeKnowledgeFilter,
+  initialKnowledgeViewState,
+  knowledgeCategoryOptions,
+  knowledgeCategorySummary,
+  knowledgePage,
+  knowledgeRatingText,
+  knowledgeRelationLabel,
+  knowledgeStatusCounts,
+  knowledgeStatusHint,
+  knowledgeTechniqueCoverage,
+  knowledgeUnknownCatalogIds,
+  moveKnowledgePage,
+  reconcileKnowledgeCategory,
+  selectKnowledgeTechniques,
+  type KnowledgeTechniqueRow,
+  type KnowledgeViewState,
+} from './knowledge-view.js';
+import { jumpHint, pageNumbers, pagerDisplay, parseJumpPage } from './pager.js';
+
+/** The knowledge report as the business API returns it; the UI invents no second model. */
+export type KnowledgeViewData = ApiWeaknessResult['knowledge'];
+
+/** Coverage of the same weakness read, reused for the missing-metadata part of the gap list. */
+export type KnowledgeOuterCoverage = ApiWeaknessResult['coverage'];
+
+/**
+ * Knowledge view: what the imported evidence says per technique node.
+ *
+ * The view reuses the weakness read the page already made — filtering, sorting, paging and the
+ * status distribution are local state over that one confirmed response, so opening or filtering
+ * this view never starts an API or model call. It presents the domain's transparent status and
+ * distinct-problem counters instead of a mastery percentage: an empty node is "unknown", an AC alone
+ * confirms nothing, retrospectives are self-reports, evidence channels overlap and are never summed,
+ * and a selected category is a catalog summary of its subtree, never mastery of the category.
+ *
+ * Every filter change resets to page 1, an account change resets the whole view, a shrinking result
+ * clamps the page to the last one that exists, and a category a refreshed catalog dropped falls back
+ * to all categories. Technique rows carry their verified OI Wiki links, a selected category shows
+ * its own links beside its subtree summary, and the footer credits the presentation and learning
+ * references without implying that any external page certifies the user's knowledge.
+ */
+export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewData; coverage: KnowledgeOuterCoverage }) {
+  const { boot, navigate } = useWorkbench();
+  const [state, setState] = useState<KnowledgeViewState>(initialKnowledgeViewState);
+  const [jump, setJump] = useState('');
+  const results = useRef<HTMLDivElement | null>(null);
+
+  // A new account shows its own default view state instead of the previous account's filters.
+  useEffect(() => {
+    setState(initialKnowledgeViewState());
+    setJump('');
+  }, [knowledge.accountId]);
+
+  const catalog = boot.taxonomy.nodes;
+
+  // A refreshed catalog can drop the selected category (or turn it into a technique); fall back to
+  // “all categories” on page 1. The helper returns the identical state while the selection is still
+  // offered, so this effect settles instead of re-rendering in a loop.
+  useEffect(() => {
+    setState((previous) => reconcileKnowledgeCategory(previous, catalog));
+  }, [catalog]);
+
+  const rows = selectKnowledgeTechniques(knowledge.nodes, catalog, state);
+  const page = knowledgePage(rows, state.page);
+  const pagerState = pagerDisplay(
+    page.totalPages === 0
+      ? { page: 1, totalItems: 0, totalPages: 0 }
+      : { page: page.page, totalItems: page.totalItems, totalPages: page.totalPages },
+    state.page,
+  );
+
+  // A refresh (or a filter that removed the current page) may shrink the result set; mirror the
+  // clamped page back into state so the next request starts from the page actually served.
+  useEffect(() => {
+    if (page.totalPages > 0 && state.page > page.totalPages) {
+      setState((previous) => moveKnowledgePage(previous, page.totalPages, page.totalPages));
+    }
+  }, [page.totalPages, state.page]);
+
+  const counts = knowledgeStatusCounts(knowledge.nodes);
+  const peak = Math.max(1, ...counts.map((entry) => entry.count));
+  const techniqueCoverage = knowledgeTechniqueCoverage(knowledge.nodes, knowledge.minimumIndependentProblems);
+  const categories = knowledgeCategoryOptions(catalog);
+  const categorySummary =
+    state.categoryId === null ? null : knowledgeCategorySummary(knowledge.nodes, catalog, state.categoryId);
+  // Resource metadata covers every catalog node, categories included, so the selected category can
+  // show its own OI Wiki references beside its subtree summary.
+  const categoryResources = categorySummary === null ? [] : knowledgeResourcesFor(categorySummary.taxonomyId);
+  const unknownCatalogIds = knowledgeUnknownCatalogIds(knowledge.nodes, catalog);
+  const catalogDrift = knowledge.taxonomyVersion !== boot.taxonomy.version || unknownCatalogIds.length > 0;
+  const statusCountOf = (status: (typeof KNOWLEDGE_TECHNIQUE_STATUSES)[number]): number =>
+    counts.find((entry) => entry.status === status)?.count ?? 0;
+
+  function goTo(target: number, from: 'top' | 'bottom'): void {
+    setState((previous) => moveKnowledgePage(previous, target, page.totalPages));
+    if (from === 'bottom') {
+      // Keep long filtered lists usable: the bottom pager returns the reader to the table instead
+      // of forcing a scroll back to the top.
+      results.current?.scrollIntoView({ block: 'start' });
+      results.current?.focus();
+    }
+  }
+
+  function submitJump(event: FormEvent<HTMLFormElement>, from: 'top' | 'bottom'): void {
+    event.preventDefault();
+    const target = parseJumpPage(jump);
+    if (target === null) {
+      // Blank or malformed text is a no-op; the value stays beside its inline hint.
+      return;
+    }
+    goTo(target, from);
+    setJump('');
+  }
+
+  /** One pager; top and bottom share it but carry distinct accessible labels. */
+  function pager(where: 'top' | 'bottom') {
+    const label = where === 'top' ? '知识点分页（顶部）' : '知识点分页（底部）';
+    const locked = !pagerState.navigable;
+    const counter = pagerState.hasData
+      ? `筛选后 ${pagerState.totalItems} 个知识点 · 第 ${pagerState.currentPage} / ${pagerState.totalPages} 页`
+      : '暂无结果';
+    const jumpId = `icpc-knowledge-jump-${where}`;
+    const hintId = `icpc-knowledge-jump-hint-${where}`;
+    const warning = jumpHint(jump);
+    return (
+      <nav className="icpc-pager" aria-label={label}>
+        <button type="button" disabled={locked || pagerState.currentPage <= 1} onClick={() => goTo(1, where)}>
+          « 首页
+        </button>
+        <button
+          type="button"
+          disabled={locked || pagerState.currentPage <= 1}
+          onClick={() => goTo(pagerState.currentPage - 1, where)}
+        >
+          ‹ 上一页
+        </button>
+        {pageNumbers(pagerState.currentPage, pagerState.totalPages).map((entry, index) =>
+          entry === null ? (
+            <span key={`gap-${index}`} className="icpc-pager-gap" aria-hidden="true">
+              …
+            </span>
+          ) : (
+            <button
+              key={entry}
+              type="button"
+              className={entry === pagerState.currentPage ? 'icpc-page-current' : undefined}
+              aria-current={entry === pagerState.currentPage ? 'page' : undefined}
+              aria-label={`${label}：第 ${entry} 页`}
+              disabled={locked}
+              onClick={() => goTo(entry, where)}
+            >
+              {entry}
+            </button>
+          ),
+        )}
+        <button
+          type="button"
+          disabled={locked || pagerState.currentPage >= pagerState.totalPages}
+          onClick={() => goTo(pagerState.currentPage + 1, where)}
+        >
+          下一页 ›
+        </button>
+        <button
+          type="button"
+          disabled={locked || pagerState.currentPage >= pagerState.totalPages}
+          onClick={() => goTo(pagerState.totalPages, where)}
+        >
+          末页 »
+        </button>
+        <form className="icpc-page-jump" onSubmit={(event) => submitJump(event, where)}>
+          <label htmlFor={jumpId}>跳至</label>
+          <input
+            id={jumpId}
+            value={jump}
+            inputMode="numeric"
+            aria-label={`${label}：页码输入`}
+            aria-invalid={warning === null ? undefined : true}
+            aria-describedby={warning === null ? undefined : hintId}
+            onChange={(event) => setJump(event.target.value)}
+          />
+          <button type="submit" disabled={locked || parseJumpPage(jump) === null}>
+            跳转
+          </button>
+        </form>
+        {warning !== null && (
+          <small className="icpc-muted" id={hintId} role="status">
+            {warning}
+          </small>
+        )}
+        <span className="icpc-muted" aria-live="polite">
+          {counter}
+        </span>
+      </nav>
+    );
+  }
+
+  return (
+    <Panel title="按知识点汇总学习证据">
+      <div className="icpc-knowledge-summary">
+        <div>
+          <span>知识点总数</span>
+          <strong>{techniqueCoverage.techniques}</strong>
+          <small className="icpc-muted">当前词表中的算法与技巧，不含分类目录。</small>
+        </div>
+        <div>
+          <span>已有独立完成题目的知识点</span>
+          <strong>
+            {techniqueCoverage.withIndependentEvidence} / {techniqueCoverage.techniques}
+          </strong>
+          <small className="icpc-muted">至少 1 道独立完成题目，是计数覆盖，不是“掌握率”。</small>
+        </div>
+        <div>
+          <span>独立证据阈值</span>
+          <strong>≥ {techniqueCoverage.minimumIndependentProblems} 题</strong>
+          <small className="icpc-muted">达到阈值才标记“已有独立证据”。</small>
+        </div>
+      </div>
+
+      <div className="icpc-knowledge-dist" role="group" aria-label="知识点状态分布（点击筛选）">
+        {counts.map((entry) => (
+          <button
+            key={entry.status}
+            type="button"
+            aria-pressed={state.status === entry.status}
+            title={knowledgeStatusHint(entry.status, knowledge.minimumIndependentProblems)}
+            onClick={() =>
+              setState((previous) =>
+                changeKnowledgeFilter(previous, { status: previous.status === entry.status ? 'all' : entry.status }),
+              )
+            }
+          >
+            <span className="icpc-knowledge-dist-label">{entry.label}</span>
+            <strong>{entry.count}</strong>
+            <span className="icpc-knowledge-meter" aria-hidden="true">
+              <span style={{ width: barWidthPercent(entry.count, peak) + '%' }} />
+            </span>
+          </button>
+        ))}
+      </div>
+      <p className="icpc-muted">
+        {KNOWLEDGE_NO_OBSERVATION_NOTE} {KNOWLEDGE_AC_NOTE}
+      </p>
+
+      {catalogDrift && (
+        <Notice>
+          {KNOWLEDGE_CATALOG_DRIFT_NOTE} 报告目录版本 {knowledge.taxonomyVersion}，当前目录版本{' '}
+          {boot.taxonomy.version}
+          {unknownCatalogIds.length > 0
+            ? `；报告中有 ${unknownCatalogIds.length} 个知识点不在当前目录：${unknownCatalogIds.slice(0, 8).join('、')}${
+                unknownCatalogIds.length > 8 ? ' 等' : ''
+              }`
+            : ''}
+          。
+        </Notice>
+      )}
+
+      <div className="icpc-toolbar">
+        <label>
+          搜索知识点
+          <input
+            value={state.query}
+            placeholder="中文 / English / 别名 / id"
+            onChange={(event) =>
+              setState((previous) => changeKnowledgeFilter(previous, { query: event.target.value }))
+            }
+          />
+        </label>
+        <label>
+          分类
+          <select
+            value={state.categoryId ?? ''}
+            onChange={(event) =>
+              setState((previous) =>
+                changeKnowledgeFilter(previous, { categoryId: event.target.value === '' ? null : event.target.value }),
+              )
+            }
+          >
+            <option value="">全部分类</option>
+            {categories.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.label}（{option.techniqueCount} 个知识点）
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          状态
+          <select
+            value={state.status}
+            onChange={(event) =>
+              setState((previous) =>
+                changeKnowledgeFilter(previous, {
+                  status: event.target.value as KnowledgeViewState['status'],
+                }),
+              )
+            }
+          >
+            <option value="all">全部状态</option>
+            {KNOWLEDGE_TECHNIQUE_STATUSES.map((status) => (
+              <option key={status} value={status}>
+                {KNOWLEDGE_STATUS_LABELS[status]}（{statusCountOf(status)}）
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          排序
+          <select
+            value={state.sort}
+            onChange={(event) =>
+              setState((previous) =>
+                changeKnowledgeFilter(previous, { sort: event.target.value as KnowledgeViewState['sort'] }),
+              )
+            }
+          >
+            {KNOWLEDGE_SORTS.map((sort) => (
+              <option key={sort} value={sort}>
+                {KNOWLEDGE_SORT_LABELS[sort]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          onClick={() => {
+            setState(initialKnowledgeViewState());
+            setJump('');
+          }}
+        >
+          重置筛选
+        </button>
+      </div>
+
+      {categorySummary !== null && (
+        <Notice>
+          分类“{categorySummary.nameZh}”：该分类相关题目 <strong>{categorySummary.relatedProblems}</strong> 道；有独立证据的知识点{' '}
+          <strong>
+            {categorySummary.descendantsWithIndependentEvidence} / {categorySummary.descendantTechniques}
+          </strong>{' '}
+          个。{KNOWLEDGE_CATEGORY_SUMMARY_NOTE}（分类计数按去重题集合并，不累加子项。）
+          {categoryResources.length > 0 && (
+            <span>
+              {' '}
+              分类学习资料：
+              {categoryResources.map((resource) => (
+                <span key={resource.url}>
+                  <ExternalLink href={resource.url}>
+                    {resource.provider} · {resource.title}
+                  </ExternalLink>
+                  <span className="icpc-muted">（{knowledgeRelationLabel(resource.relation)}）</span>
+                </span>
+              ))}
+            </span>
+          )}
+        </Notice>
+      )}
+
+      {pager('top')}
+      {page.totalItems === 0 ? (
+        <Empty>
+          当前筛选下没有知识点。可以清空搜索、分类或状态条件；分类目录与零记录知识点都在目录内，仍然可以被搜索到。
+        </Empty>
+      ) : (
+        <>
+          <div
+            className="icpc-table-wrap icpc-knowledge-table"
+            ref={results}
+            tabIndex={-1}
+            aria-label="知识点结果"
+          >
+            <table>
+              <thead>
+                <tr>
+                  <th>知识点</th>
+                  <th>状态</th>
+                  <th>相关题目结果</th>
+                  <th>实际解法（复盘）</th>
+                  <th>详情 / 学习链接</th>
+                </tr>
+              </thead>
+              <tbody>
+                {page.items.map((row) => (
+                  <KnowledgeRow
+                    key={row.taxonomyId}
+                    row={row}
+                    minimumIndependentProblems={knowledge.minimumIndependentProblems}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="icpc-muted">
+            {KNOWLEDGE_OVERLAP_NOTE} {KNOWLEDGE_SELF_REPORT_NOTE} 每题只取最新一次复盘。
+          </p>
+        </>
+      )}
+      {pager('bottom')}
+
+      <details className="icpc-coverage">
+        <summary>
+          证据覆盖与未匹配标签：未匹配原始标签 {knowledge.unmatchedAlgorithmLabels.length} 个 · 缺少题目元数据{' '}
+          {coverage.metadataMissing} / {coverage.distinctProblems} 题
+        </summary>
+        <div className="icpc-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>口径</th>
+                <th>题目数（同一题只算一次）</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>已尝试</td>
+                <td>{knowledge.coverage.attemptedDistinctTotal}</td>
+              </tr>
+              <tr>
+                <td>已通过</td>
+                <td>{knowledge.coverage.solvedDistinctTotal}</td>
+              </tr>
+              <tr>
+                <td>有已知分类标签的相关题</td>
+                <td>{knowledge.coverage.relatedAttemptedDistinct}</td>
+              </tr>
+              <tr>
+                <td>有有效复核标签的题</td>
+                <td>{knowledge.coverage.verifiedAttemptedDistinct}</td>
+              </tr>
+              <tr>
+                <td>有复盘的已通过题</td>
+                <td>{knowledge.coverage.retrospectiveProblemDistinct}</td>
+              </tr>
+              <tr>
+                <td>带未匹配原始标签的题</td>
+                <td>{knowledge.coverage.unmatchedAlgorithmProblemDistinct}</td>
+              </tr>
+              <tr>
+                <td>缺少本地题目元数据</td>
+                <td>
+                  {coverage.metadataMissing} / {coverage.distinctProblems}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>未匹配的原始标签不会被强行归入某个知识点：</p>
+        {knowledge.unmatchedAlgorithmLabels.length === 0 ? (
+          <p className="icpc-muted">当前没有未匹配的原始算法标签。</p>
+        ) : (
+          <div className="icpc-tags">
+            {knowledge.unmatchedAlgorithmLabels.map((label) => (
+              <span key={label} className="icpc-tag">
+                {label}
+              </span>
+            ))}
+          </div>
+        )}
+        <p className="icpc-muted">
+          缺少的本地题目元数据仍计入分母，但带不上标签或难度，可以在 题库 &gt; 导入与同步 &gt; 题目目录 补齐。
+        </p>
+      </details>
+
+      <Notice>
+        想让某个知识点的证据更完整：去 <strong>题库</strong> 并选择 <strong>已通过</strong> 筛选，打开题目填写 <strong>复盘</strong>，记录实际用到的解法与
+        <strong>完成方式</strong>（独立完成 / 提示辅助 / 参考题解）。只有复盘中的“独立完成”会累计独立证据。
+      </Notice>
+      <div className="icpc-actions">
+        <button onClick={() => navigate('bank')}>去题库记录复盘</button>
+      </div>
+
+      <footer className="icpc-knowledge-sources">
+        <p>
+          知识点分类、筛选与练习呈现方式参考{' '}
+          <ExternalLink href={KNOWLEDGE_ATTRIBUTION_SOURCES.nowcoder.url}>
+            {KNOWLEDGE_ATTRIBUTION_SOURCES.nowcoder.provider}
+          </ExternalLink>
+          ；知识点学习资料参考{' '}
+          <ExternalLink href={KNOWLEDGE_ATTRIBUTION_SOURCES.oiWiki.url}>
+            {KNOWLEDGE_ATTRIBUTION_SOURCES.oiWiki.provider}
+          </ExternalLink>
+          （<ExternalLink href={KNOWLEDGE_ATTRIBUTION_COPYRIGHT_URL}>版权声明</ExternalLink>）。资料链接核对日期：
+          {KNOWLEDGE_RESOURCES_CHECKED_DATE}。
+        </p>
+        {KNOWLEDGE_ATTRIBUTION_NOTES.map((note) => (
+          <p key={note}>{note}</p>
+        ))}
+      </footer>
+    </Panel>
+  );
+}
+
+/** One technique row; the expanded detail carries the honest reading and the verified links. */
+function KnowledgeRow({
+  row,
+  minimumIndependentProblems,
+}: {
+  row: KnowledgeTechniqueRow;
+  minimumIndependentProblems: number;
+}) {
+  const evidence = row.evidence;
+  const resources = knowledgeResourcesFor(row.taxonomyId);
+  return (
+    <tr>
+      <td>
+        <span className="icpc-knowledge-name">{row.nameZh}</span>
+        <span className="icpc-muted">{row.nameEn}</span>
+        <span className="icpc-muted">
+          {row.categoryPath}
+        </span>
+      </td>
+      <td>
+        <span
+          className={
+            evidence.status === 'not_observed'
+              ? 'icpc-knowledge-status icpc-knowledge-status-none'
+              : 'icpc-knowledge-status'
+          }
+        >
+          {KNOWLEDGE_STATUS_LABELS[evidence.status]}
+        </span>
+      </td>
+      <td>
+        <span>
+          平台原始（未复核）：通过 {evidence.platformSolvedDistinct} / 尝试 {evidence.platformAttemptedDistinct}
+        </span>
+        <span>
+          已复核标签：通过 {evidence.verifiedSolvedDistinct} / 尝试 {evidence.verifiedAttemptedDistinct}
+        </span>
+        <span className="icpc-muted">相关去重题目 {evidence.observedRelatedDistinct}</span>
+      </td>
+      <td>
+        <span>
+          独立 {evidence.retrospectiveIndependentDistinct} · 提示辅助 {evidence.retrospectiveAssistedDistinct} · 参考题解{' '}
+          {evidence.retrospectiveSolutionUsedDistinct}
+        </span>
+
+      </td>
+      <td>
+        <details className="icpc-knowledge-detail">
+          <summary>详情与学习链接</summary>
+          <p>{knowledgeRatingText(evidence.independentRatingRanges, evidence.retrospectiveIndependentDistinct)}</p>
+          <p className="icpc-muted">{knowledgeStatusHint(evidence.status, minimumIndependentProblems)}</p>
+          {resources.length === 0 ? (
+            <p className="icpc-muted">当前目录还没有为该知识点登记学习资料。</p>
+          ) : (
+            <ul className="icpc-knowledge-links">
+              {resources.map((resource) => (
+                <li key={resource.url}>
+                  <ExternalLink href={resource.url}>
+                    {resource.provider} · {resource.title}
+                  </ExternalLink>{' '}
+                  <span className="icpc-muted">（{knowledgeRelationLabel(resource.relation)}）</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="icpc-muted">外部资料只是普通学习链接，不参与状态判定，也不证明掌握。</p>
+        </details>
+      </td>
+    </tr>
+  );
+}

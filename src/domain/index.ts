@@ -258,6 +258,30 @@ export {
 } from './weakness.js';
 
 export {
+  DEFAULT_MINIMUM_INDEPENDENT_PROBLEMS,
+  KNOWLEDGE_NOTES,
+  computeKnowledgeEvidence,
+  type ComputeKnowledgeEvidenceInput,
+  type KnowledgeCoverage,
+  type KnowledgeEvidenceReport,
+  type KnowledgeNodeEvidence,
+  type KnowledgeNodeStatus,
+  type KnowledgeRatingRange,
+} from './knowledge.js';
+
+export {
+  KNOWLEDGE_ATTRIBUTION_COPYRIGHT_URL,
+  KNOWLEDGE_ATTRIBUTION_NOTES,
+  KNOWLEDGE_ATTRIBUTION_SOURCES,
+  KNOWLEDGE_RESOURCES_BY_TAXONOMY_ID,
+  KNOWLEDGE_RESOURCES_CHECKED_DATE,
+  knowledgeResourcesFor,
+  type KnowledgeAttributionSource,
+  type KnowledgeResource,
+  type KnowledgeResourceRelation,
+} from './knowledge-resources.js';
+
+export {
   computeTrainingStatistics,
   expectedRatingDimension,
   type ComputeTrainingStatisticsInput,

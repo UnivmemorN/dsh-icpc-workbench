@@ -31,6 +31,7 @@ import {
   assertIsoTimestamp,
   assertKnownTag,
   checkOffTask as checkOffTrainingTask,
+  computeKnowledgeEvidence,
   computeTrainingStatistics,
   computeWeaknessReports,
   contentHashOf,
@@ -875,6 +876,10 @@ export class WorkbenchService {
    * solved-problem distribution over this source's own raw difficulty dimension, and the raw
    * platform-label reference. Neither is formal evidence and neither reaches the weakness ranking or
    * a plan, which keeps using only effective/adopted tags.
+   *
+   * `knowledge` (Stage 09a) is the third additive projection over that same read: per-taxonomy-node
+   * learning evidence whose raw, verified and retrospective channels stay distinguishable. It adds no
+   * store read and leaves the formal report untouched.
    */
   async weakness(request: WorkbenchWeaknessRequest, token: CancellationToken): Promise<WorkbenchWeaknessResult> {
     requireToken(token);
@@ -902,8 +907,20 @@ export class WorkbenchService {
         expectedDimension: expectedRatingDimension(source.platform),
         minimumSampleSize: WORKBENCH_MIN_WEAKNESS_SAMPLE,
       });
+      // The knowledge reduction reuses exactly the evidence above: no additional storage,
+      // platform or model read, and no change to the formal report beside it.
+      const knowledge = computeKnowledgeEvidence({
+        taxonomy: this.taxonomy,
+        accountId: account.id,
+        problems: evidence.problems,
+        submissions: evidence.submissions,
+        decisions: evidence.decisions,
+        retrospectives: evidence.retrospectives,
+        minimumIndependentProblems: WORKBENCH_MIN_WEAKNESS_SAMPLE,
+      });
       return {
         report: this.weaknessReportOf(account, evidence),
+        knowledge,
         solvedDistribution: solvedDistributionView(statistics.solvedDistribution),
         platformTagStats: platformTagStatsView(statistics.platformTagStats),
         coverage: evidence.coverage,

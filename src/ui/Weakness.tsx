@@ -1,17 +1,19 @@
 import { useEffect, useState } from 'react';
 import { Panel, Notice, Empty, ErrorNotice, useRequest, useWorkbench, Stats, tagName } from './common.js';
+import { Knowledge } from './Knowledge.js';
 import { SolvedDistribution, shareText } from './SolvedDistribution.js';
 
-/** Two explicit readings of the same evidence: raw platform labels vs. reviewed analysis. */
-type WeaknessView = 'platform' | 'verified';
+/** Three explicit readings of the same evidence: per technique node, raw platform labels vs. reviewed analysis. */
+type WeaknessView = 'knowledge' | 'platform' | 'verified';
 
 /**
  * Weakness page. The reading order is deliberate: heading → summary Stats → view switch (with the
- * collapsed coverage diagnosis beside it) → the selected reference/formal content → the full
- * solved-problem histogram. The ranking that answers "where am I weak" is therefore reachable
- * without scrolling past a long histogram and a long coverage panel, while both remain available;
- * Today keeps the histogram in its prominent position. Provisional numbers never replace formal
- * evidence, and the view switch is local and costs no request.
+ * collapsed coverage diagnosis beside it) → the selected content → the full solved-problem
+ * histogram. The default view reads the same evidence per technique node ("what do my own records
+ * actually show for this technique?"); the platform reference and the reviewed analysis keep their
+ * previous behavior, so the ranking that answers "where am I weak" stays one click away and the
+ * histogram remains below. Provisional numbers never replace formal evidence, and the view switch is
+ * local and costs no request.
  */
 export function Weakness() {
   const { accountId, boot, navigate } = useWorkbench();
@@ -24,9 +26,9 @@ export function Weakness() {
   const attempted = data?.report.attemptedDistinctTotal ?? 0;
   const platformTagged = data?.platformTagStats.attemptedTaggedDistinct ?? 0;
   const formalTagged = data?.report.taggedAttemptedDistinct ?? 0;
-  const defaultView: WeaknessView =
-    data !== null && data.report.ranking.length === 0 && platformTagged > 0 ? 'platform' : 'verified';
-  const view: WeaknessView = data === null ? 'verified' : picked ?? defaultView;
+  // The knowledge view is the landing view: it reuses this read and explains the evidence per
+  // technique node; the two previous views stay one click away with unchanged content.
+  const view: WeaknessView = picked ?? 'knowledge';
   const tagless = Math.max(0, (data?.coverage.metadataPresent ?? 0) - platformTagged);
   const diagnosis: string[] = [];
   if (data) {
@@ -63,7 +65,7 @@ export function Weakness() {
       <div className="icpc-page-heading">
         <div>
           <p className="icpc-eyebrow">LEARNING EVIDENCE</p>
-          <h1>用足够的样本看清薄弱项</h1>
+          <h1>知识点与薄弱项</h1>
           <p>
             同一道题的多次提交只算一道；每个标签至少 5 道尝试题才进入已复核排名。平台原始标签只作参考，不算已接受标签。
           </p>
@@ -87,6 +89,9 @@ export function Weakness() {
                 ]}
               />
               <div className="icpc-viewswitch" role="group" aria-label="统计视图">
+                <button type="button" aria-pressed={view === 'knowledge'} onClick={() => setPicked('knowledge')}>
+                  知识点掌握情况
+                </button>
                 <button type="button" aria-pressed={view === 'platform'} onClick={() => setPicked('platform')}>
                   平台标签参考（未复核）
                 </button>
@@ -151,7 +156,9 @@ export function Weakness() {
                   <button onClick={() => navigate('review')}>去标签审核</button>
                 </div>
               </details>
-              {view === 'platform' ? (
+              {view === 'knowledge' ? (
+                <Knowledge knowledge={data.knowledge} coverage={data.coverage} />
+              ) : view === 'platform' ? (
                 <Panel title="平台标签参考（未复核）">
                   <Notice>
                     这些标签是平台原始数据，未经复核，也不是已接受的标签。原始标签可能不完整、口径不同或与训练方向不一致，据此判断薄弱项可能失真；它们不会进入训练计划，也不改变“已复核分析”。
