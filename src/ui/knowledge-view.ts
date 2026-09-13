@@ -16,6 +16,9 @@ import type {
   KnowledgeNodeEvidence,
   KnowledgeNodeStatus,
   KnowledgeRatingRange,
+  SourceTagMappingDiagnostic,
+  TagMappingRelation,
+  TagVocabulary,
   TaxonomyNode,
 } from '../domain/index.js';
 import type { KnowledgeResourceRelation } from '../domain/knowledge-resources.js';
@@ -542,4 +545,247 @@ export function knowledgeRatingText(
 /** Chinese label of a resource relation; `overview` is explicitly only a broad reference. */
 export function knowledgeRelationLabel(relation: KnowledgeResourceRelation): string {
   return relation === 'overview' ? '参考概述' : '主题条目';
+}
+
+/** Mapping rows per page; the 来源标签对照 section stays a bounded table on large imports. */
+export const TAG_MAPPING_PAGE_SIZE = 20;
+
+/** Chinese labels of every relation the crosswalk can report. */
+export const TAG_MAPPING_RELATION_LABELS = {
+  exact: '精确对应',
+  broader: '上级类别',
+  narrower: '大类中的单项',
+  ambiguous: '含义待核对',
+  composite: '组合标签',
+  unmapped: '未匹配',
+  non_algorithm: '来源信息',
+  reference: '仅作资料',
+} as const satisfies Readonly<Record<TagMappingRelation, string>>;
+
+/** Chinese labels of every tag vocabulary; the instance id is always shown beside it. */
+export const TAG_VOCABULARY_LABELS = {
+  codeforces: 'Codeforces',
+  luogu: '洛谷',
+  nowcoder: '牛客',
+  'oi-wiki': 'OI Wiki',
+  manual: '手动录入',
+  unknown: '未识别来源',
+} as const satisfies Readonly<Record<TagVocabulary, string>>;
+
+/**
+ * Honest caveat that must travel with the 来源标签对照 table: the crosswalk is provisional platform
+ * evidence, never a record of the method actually used, and older combined nodes stay coarse.
+ */
+export const KNOWLEDGE_TAG_MAPPING_NOTE =
+  '来源标签对照是试行规则：它只说明平台原始标签大致对应哪个知识点，不代表你实际用过该方法，也不构成掌握证明；较早的合并知识点仍然只概括一个粗粒度大类，不能据此认为其中每一项都已掌握。';
+
+/** Relations a reader should review by hand: nothing here is counted as an exact match. */
+export const TAG_MAPPING_ISSUE_RELATIONS: readonly TagMappingRelation[] = [
+  'ambiguous',
+  'composite',
+  'narrower',
+  'unmapped',
+];
+
+/** True when a mapping stayed unresolved and therefore deserves manual review. */
+export function isTagMappingIssue(mapping: SourceTagMappingDiagnostic): boolean {
+  return TAG_MAPPING_ISSUE_RELATIONS.includes(mapping.relation);
+}
+
+/** Stable React key of one mapping row: source + exact raw + relation + rule, never the display name. */
+export function sourceTagMappingKey(mapping: SourceTagMappingDiagnostic): string {
+  return JSON.stringify([mapping.sourceInstanceId, mapping.raw, mapping.relation, mapping.ruleId]);
+}
+
+/** Local filter set of the 来源标签对照 section; it never triggers an API or model call. */
+export interface TagMappingFilter {
+  /** Selected source instance id, or `null` for every source. */
+  readonly sourceInstanceId: string | null;
+  readonly relation: TagMappingRelation | 'all';
+  /** Keep only unresolved (`ambiguous`/`composite`/`narrower`/`unmapped`) mappings. */
+  readonly issuesOnly: boolean;
+}
+
+/** Filter set plus the current page; one immutable value the component replaces on every action. */
+export interface TagMappingViewState extends TagMappingFilter {
+  readonly page: number;
+}
+
+/** Fresh mapping view state: every source, every relation, first page. */
+export function initialTagMappingViewState(): TagMappingViewState {
+  return { sourceInstanceId: null, relation: 'all', issuesOnly: false, page: 1 };
+}
+
+/** Apply a filter patch; **any** filter change returns to page 1, exactly like the technique table. */
+export function changeTagMappingFilter(
+  state: TagMappingViewState,
+  patch: Partial<TagMappingFilter>,
+): TagMappingViewState {
+  return { ...state, ...patch, page: 1 };
+}
+
+/** Move to another mapping page, clamped into `1..totalPages` (`0` pages keeps page 1). */
+export function moveTagMappingPage(
+  state: TagMappingViewState,
+  target: number,
+  totalPages: number,
+): TagMappingViewState {
+  if (totalPages <= 0) {
+    return { ...state, page: 1 };
+  }
+  const wanted = Number.isSafeInteger(target) && target >= 1 ? target : 1;
+  return { ...state, page: Math.min(wanted, totalPages) };
+}
+
+/**
+ * Repair a source-instance selection the refreshed report no longer offers.
+ *
+ * The mapping selector stores only a source instance id. A refresh can drop that instance entirely,
+ * and the filter would then keep matching nothing while the selector shows a source that no longer
+ * exists; the selection therefore falls back to all sources and to page 1 (the stored page belonged
+ * to the old, narrower result). A still-offered selection returns the same state object, so a caller
+ * may run this on every report change inside an effect without causing a render loop.
+ */
+export function reconcileTagMappingSource(
+  state: TagMappingViewState,
+  mappings: readonly SourceTagMappingDiagnostic[],
+): TagMappingViewState {
+  if (state.sourceInstanceId === null) {
+    return state;
+  }
+  return mappings.some((mapping) => mapping.sourceInstanceId === state.sourceInstanceId)
+    ? state
+    : { ...state, sourceInstanceId: null, page: 1 };
+}
+
+/** One selectable source of the mapping table, in report order. */
+export interface TagMappingSourceOption {
+  readonly sourceInstanceId: string;
+  readonly vocabulary: TagVocabulary;
+  /** Mappings reported for this instance. */
+  readonly count: number;
+  /** Vocabulary label plus the exact instance id, so two instances never merge by name. */
+  readonly label: string;
+}
+
+/** Every source instance that reported at least one mapping, in first-seen report order. */
+export function tagMappingSourceOptions(
+  mappings: readonly SourceTagMappingDiagnostic[],
+): readonly TagMappingSourceOption[] {
+  const bySource = new Map<string, { readonly vocabulary: TagVocabulary; count: number }>();
+  for (const mapping of mappings) {
+    const existing = bySource.get(mapping.sourceInstanceId);
+    if (existing === undefined) {
+      bySource.set(mapping.sourceInstanceId, { vocabulary: mapping.vocabulary, count: 1 });
+    } else {
+      existing.count += 1;
+    }
+  }
+  return [...bySource.entries()].map(([sourceInstanceId, entry]) => ({
+    sourceInstanceId,
+    vocabulary: entry.vocabulary,
+    count: entry.count,
+    label: `${TAG_VOCABULARY_LABELS[entry.vocabulary]} · ${sourceInstanceId}`,
+  }));
+}
+
+/** Code-point text order; `0` only for equal text (never `localeCompare`). */
+function compareMappingText(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+}
+
+/**
+ * Mapping rows selected by one filter set, in the deterministic order of the report itself.
+ *
+ * Rows are re-sorted defensively by source instance, exact raw label, relation and rule, so paging
+ * and React keys stay stable regardless of the order a caller passes in. The same raw text from two
+ * sources therefore remains two rows; nothing is merged by display name.
+ */
+export function selectSourceTagMappings(
+  mappings: readonly SourceTagMappingDiagnostic[],
+  filter: TagMappingFilter,
+): readonly SourceTagMappingDiagnostic[] {
+  return mappings
+    .filter(
+      (mapping) =>
+        (filter.sourceInstanceId === null || mapping.sourceInstanceId === filter.sourceInstanceId) &&
+        (filter.relation === 'all' || mapping.relation === filter.relation) &&
+        (!filter.issuesOnly || isTagMappingIssue(mapping)),
+    )
+    .sort(
+      (left, right) =>
+        compareMappingText(left.sourceInstanceId, right.sourceInstanceId) ||
+        compareMappingText(left.raw, right.raw) ||
+        compareMappingText(left.relation, right.relation) ||
+        compareMappingText(left.ruleId, right.ruleId),
+    );
+}
+
+/** One served page of filtered mapping rows. */
+export interface TagMappingPage {
+  readonly items: readonly SourceTagMappingDiagnostic[];
+  readonly totalItems: number;
+  readonly totalPages: number;
+  /** Served page; `0` for an empty filtered result, so no page is ever fabricated. */
+  readonly page: number;
+}
+
+/** Slice filtered mappings into one clamped page of {@link TAG_MAPPING_PAGE_SIZE} rows. */
+export function tagMappingPage(
+  rows: readonly SourceTagMappingDiagnostic[],
+  requestedPage: number,
+): TagMappingPage {
+  const totalItems = rows.length;
+  const totalPages = Math.ceil(totalItems / TAG_MAPPING_PAGE_SIZE);
+  if (totalPages === 0) {
+    return { items: [], totalItems: 0, totalPages: 0, page: 0 };
+  }
+  const wanted = Number.isSafeInteger(requestedPage) && requestedPage >= 1 ? requestedPage : 1;
+  const page = Math.min(wanted, totalPages);
+  const start = (page - 1) * TAG_MAPPING_PAGE_SIZE;
+  return { items: rows.slice(start, start + TAG_MAPPING_PAGE_SIZE), totalItems, totalPages, page };
+}
+
+/** Chinese names of the counted targets, or the honest fallback for a mapping that counted nothing. */
+export function sourceTagMappingTargetText(
+  mapping: SourceTagMappingDiagnostic,
+  catalog: readonly TaxonomyNode[],
+): string {
+  if (mapping.targetIds.length > 0) {
+    return mapping.targetIds.map((id) => catalog.find((node) => node.id === id)?.names.zh ?? id).join('、');
+  }
+  if (mapping.relation === 'reference') {
+    return '仅作资料';
+  }
+  if (mapping.relation === 'non_algorithm') {
+    return '来源信息，不计入知识点';
+  }
+  return '待核对';
+}
+
+/** Candidate names kept for review; empty text when the mapping has no candidate. */
+export function sourceTagMappingCandidateText(
+  mapping: SourceTagMappingDiagnostic,
+  catalog: readonly TaxonomyNode[],
+): string {
+  if (mapping.candidateIds.length === 0) {
+    return '';
+  }
+  const names = mapping.candidateIds.map((id) => catalog.find((node) => node.id === id)?.names.zh ?? id);
+  return `候选：${names.join('、')}`;
+}
+
+/**
+ * Visible title of one external reference of a mapping row.
+ *
+ * The table shows what a link *is* — `平台标签说明` for a platform's own terminology page,
+ * `知识点参考` for an OI Wiki definition — while the URL stays in the anchor's `href`; no
+ * implementation prose is rendered in the cell. Anything outside `oi-wiki.org` counts as a platform
+ * page, and a non-URL string still gets a title instead of throwing.
+ */
+export function sourceTagMappingReferenceTitle(url: string): string {
+  return /^https?:\/\/(?:[a-z0-9-]+\.)*oi-wiki\.org(?:\/|$)/iu.test(url) ? '知识点参考' : '平台标签说明';
 }

@@ -35,3 +35,7 @@ The exact dependency tree is recorded in package-lock.json. Installed dependenci
 - OI Wiki's [copyright declaration](https://github.com/OI-wiki/OI-wiki#版权声明) states that non-code content, unless otherwise specified, is available under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) and additional [SATA](https://github.com/zTrix/sata-license) terms; individual material may have separate notices. Any future reproduced/adapted content must retain its applicable attribution, license, source/version and change notices and must not be represented as covered solely by this project's MIT license.
 
 Neither Nowcoder nor OI Wiki supplies or certifies this project's mastery assessment. The status labels describe recorded evidence and are not a validated mastery probability.
+
+## Source-tag alignment
+
+The [tag-alignment rules](docs/tag-alignment.md) reference public terminology from [Codeforces](https://codeforces.com/apiHelp/objects#Problem), [Luogu](https://www.luogu.com.cn/problem/list), [Nowcoder](https://ac.nowcoder.com/acm/skill/acm), and [OI Wiki](https://oi-wiki.org/), checked 2026-09-13. Cross-source equivalences and conservative exclusions are independently maintained project decisions, not an official joint taxonomy or endorsement. No problem/editorial bodies or third-party article code/images are incorporated. Existing project and content-license notices above continue to apply.

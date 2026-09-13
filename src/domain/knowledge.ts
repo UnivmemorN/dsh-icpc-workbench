@@ -9,7 +9,7 @@
  * - the unit is the **distinct problem** of the selected account; a submission row of another
  *   account is never counted and repeated ACs never inflate anything;
  * - four evidence channels stay permanently distinguishable and are never promoted into one
- *   another: `platform*` (raw tags resolved through the taxonomy alias index — provisional),
+ *   another: `platform*` (raw tags resolved by the source-aware crosswalk — provisional),
  *   `verified*` (current effective tag decisions), `retrospective*` (the latest self-reported
  *   completion per account+problem) and `observedRelated*` (their set union, each problem once);
  * - an accepted submission alone confirms **no** method: only a retrospective can produce
@@ -18,8 +18,10 @@
  *   statement correctly downgrades earlier stronger evidence;
  * - direct evidence propagates **up** to ancestors by distinct-problem sets (a parent therefore
  *   counts a shared child problem once) and never **down** to children;
- * - unknown taxonomy ids are ignored, never fabricated; unknown raw algorithm labels are exposed
- *   as an honest coverage gap instead of being forced into a node;
+ * - unknown taxonomy ids are ignored, never fabricated; a raw algorithm label that the crosswalk
+ *   leaves `ambiguous`/`composite`/`narrower`/`unmapped` is exposed as an honest coverage gap, and
+ *   every distinct source-label mapping is reported with its vocabulary, rule, relation and
+ *   distinct attempted/solved problem counts;
  * - category rows always carry status `category_summary` plus the number of descendant technique
  *   nodes that hold independent evidence, out of all descendant technique nodes. A technique
  *   status ({@link KnowledgeNodeStatus}) is a transparent product heuristic, **not** a validated
@@ -33,7 +35,12 @@ import { deepFreeze } from './immutable.js';
 import { numericRating, type NormalizedProblem } from './problem.js';
 import { latestRetrospectiveByProblem, type CompletionMode, type Retrospective } from './retrospective.js';
 import { reduceSubmissionsByAccount, type Submission } from './submission.js';
-import { classifyRawTag } from './taxonomy/classify.js';
+import {
+  TAG_MAPPING_VERSION,
+  isUnresolvedAlgorithmRelation,
+  mapSourceTag,
+  type SourceTagMapping,
+} from './taxonomy/crosswalk.js';
 import type { TaxonomyIndex, TaxonomyNodeKind } from './taxonomy/types.js';
 import { effectiveTagIdsByProblem, type TagDecision } from './tags.js';
 
@@ -122,24 +129,53 @@ export interface KnowledgeCoverage {
   readonly verifiedAttemptedDistinct: number;
   /** Solved problems with a latest retrospective for the selected account. */
   readonly retrospectiveProblemDistinct: number;
-  /** Attempted problems carrying at least one raw label that maps to no taxonomy node. */
+  /** Attempted problems carrying at least one unresolved algorithm label (see the report field). */
   readonly unmatchedAlgorithmProblemDistinct: number;
+}
+
+/**
+ * One deduplicated source-label mapping of the selected account's attempted problems (Sprint 10).
+ *
+ * It extends the resolver's own result — raw label, source instance, vocabulary, relation, counted
+ * targets, candidates, rule, explanation and references — with the **distinct problem counts** of
+ * that exact label. The dedupe key is `sourceInstanceId + exact raw + relation + ruleId`, so the
+ * same text from two source instances stays two entries, and a label repeated on one problem (or
+ * repeated across its submissions) never inflates either count.
+ */
+export interface SourceTagMappingDiagnostic extends SourceTagMapping {
+  /** Distinct attempted problems of the selected account carrying this exact raw label. */
+  readonly attemptedDistinct: number;
+  /** Of those, the distinct problems this account got accepted. */
+  readonly solvedDistinct: number;
 }
 
 /** One account's per-taxonomy-node learning evidence. */
 export interface KnowledgeEvidenceReport {
   readonly accountId: string;
   readonly taxonomyVersion: string;
+  /** Version of the source-aware raw-label crosswalk (Sprint 10) used for `sourceTagMappings`. */
+  readonly tagMappingVersion: string;
   /** Independent problems required for `independent_evidence` (echoed, never implicit). */
   readonly minimumIndependentProblems: number;
   readonly coverage: KnowledgeCoverage;
   /** Every taxonomy node, in the taxonomy's own catalog order, zero-evidence nodes included. */
   readonly nodes: readonly KnowledgeNodeEvidence[];
   /**
-   * Distinct raw labels that are neither a known taxonomy alias nor recognised non-algorithm
-   * provenance. They stay unmapped: the product never fabricates a taxonomy id for them.
+   * Distinct raw labels that stayed unresolved algorithm coverage under the crosswalk: relation
+   * `ambiguous`, `composite`, `narrower` or `unmapped`. Provenance metadata, Luogu numeric tag ids
+   * and OI Wiki reference titles are deliberately not listed, and no taxonomy id is ever fabricated
+   * for a label. Each affected distinct problem is counted once in
+   * {@link KnowledgeCoverage.unmatchedAlgorithmProblemDistinct}.
    */
   readonly unmatchedAlgorithmLabels: readonly string[];
+  /**
+   * Every distinct source-label mapping observed on the attempted problems, sorted by source
+   * instance, exact raw label, relation and rule. Counted (`exact`/`broader`) and unresolved
+   * mappings are both listed; a mapping is display/diagnostic evidence only and never creates
+   * verified or retrospective evidence. Empty when the account has no attempted problem with a raw
+   * label — an empty report still carries the field.
+   */
+  readonly sourceTagMappings: readonly SourceTagMappingDiagnostic[];
   /** Machine-readable disclaimers; the status is a heuristic, not a mastery probability. */
   readonly notes: readonly string[];
 }
@@ -149,6 +185,7 @@ export const KNOWLEDGE_NOTES: readonly string[] = [
   'status_is_a_transparent_heuristic_not_a_mastery_probability',
   'accepted_submission_alone_confirms_no_method',
   'unknown_labels_are_not_forced_into_a_taxonomy_node',
+  'source_label_mapping_is_provisional_platform_evidence_not_a_recorded_method',
 ];
 
 export interface ComputeKnowledgeEvidenceInput {
@@ -342,8 +379,15 @@ export function computeKnowledgeEvidence(input: ComputeKnowledgeEvidenceInput): 
   let verifiedProblems = 0;
   let retrospectiveProblems = 0;
 
-  // Channel 1 — raw platform tags, resolved through the same alias index the rest of the product
-  // uses. They stay provisional: a platform label is not an accepted tag.
+  // Channel 1 — raw platform tags, resolved by the source-aware crosswalk (Sprint 10). A platform
+  // label stays original provenance, never an accepted tag: only `exact`/`broader` targets feed the
+  // provisional counts, ambiguous/composite/narrower/unmapped algorithm labels become an honest
+  // coverage gap, and metadata/reference labels are excluded. Every distinct mapping is collected
+  // for diagnostics together with its own distinct attempted/solved problem sets.
+  const mappingCounts = new Map<
+    string,
+    { readonly mapping: SourceTagMapping; readonly attempted: Set<string>; readonly solved: Set<string> }
+  >();
   for (const key of sortedKeys(attempted)) {
     const problem = problemByKey.get(key);
     if (problem === undefined) {
@@ -351,14 +395,27 @@ export function computeKnowledgeEvidence(input: ComputeKnowledgeEvidenceInput): 
     }
     const direct = new Set<string>();
     let unmatched = false;
+    const isSolved = solved.has(key);
     for (const tag of problem.rawTags) {
-      const classification = classifyRawTag(index, tag.raw);
-      if (classification.kind === 'taxonomy') {
-        direct.add(classification.taxonomyId);
-      } else if (classification.kind === 'unknown') {
-        // Unknown labels are reported as a coverage gap; only recognised non-algorithm provenance
-        // (source, event, year, difficulty, language, noise) is deliberately not listed.
-        unmatchedLabels.add(classification.raw);
+      const mapping = mapSourceTag(index, { raw: tag.raw, sourceInstanceId: tag.sourceInstanceId });
+      const diagnosticKey = JSON.stringify([mapping.sourceInstanceId, mapping.raw, mapping.relation, mapping.ruleId]);
+      let diagnostic = mappingCounts.get(diagnosticKey);
+      if (diagnostic === undefined) {
+        diagnostic = { mapping, attempted: new Set<string>(), solved: new Set<string>() };
+        mappingCounts.set(diagnosticKey, diagnostic);
+      }
+      diagnostic.attempted.add(key);
+      if (isSolved) {
+        diagnostic.solved.add(key);
+      }
+      if (mapping.targetIds.length > 0) {
+        for (const taxonomyId of mapping.targetIds) {
+          direct.add(taxonomyId);
+        }
+      } else if (isUnresolvedAlgorithmRelation(mapping.relation)) {
+        // Only unresolved algorithm-looking labels are a coverage gap; provenance metadata, Luogu
+        // numeric tag ids and OI Wiki reference titles are deliberately not listed.
+        unmatchedLabels.add(mapping.raw);
         unmatched = true;
       }
     }
@@ -369,7 +426,6 @@ export function computeKnowledgeEvidence(input: ComputeKnowledgeEvidenceInput): 
       continue;
     }
     relatedKeys.add(key);
-    const isSolved = solved.has(key);
     for (const taxonomyId of direct) {
       addEvidence(index, platformAttempted, taxonomyId, key);
       if (isSolved) {
@@ -483,9 +539,26 @@ export function computeKnowledgeEvidence(input: ComputeKnowledgeEvidenceInput): 
     };
   });
 
+  // Diagnostics order is code-point order over the full dedupe key, so the same evidence reports
+  // exactly the same rows (and page boundaries) on every machine.
+  const sourceTagMappings: SourceTagMappingDiagnostic[] = [...mappingCounts.values()]
+    .map((entry): SourceTagMappingDiagnostic => ({
+      ...entry.mapping,
+      attemptedDistinct: entry.attempted.size,
+      solvedDistinct: entry.solved.size,
+    }))
+    .sort(
+      (left, right) =>
+        compareText(left.sourceInstanceId, right.sourceInstanceId) ||
+        compareText(left.raw, right.raw) ||
+        compareText(left.relation, right.relation) ||
+        compareText(left.ruleId, right.ruleId),
+    );
+
   return deepFreeze({
     accountId,
     taxonomyVersion: index.taxonomy.version,
+    tagMappingVersion: TAG_MAPPING_VERSION,
     minimumIndependentProblems,
     coverage: {
       attemptedDistinctTotal: attempted.size,
@@ -497,6 +570,7 @@ export function computeKnowledgeEvidence(input: ComputeKnowledgeEvidenceInput): 
     },
     nodes,
     unmatchedAlgorithmLabels: sortedKeys(unmatchedLabels),
+    sourceTagMappings,
     notes: [...KNOWLEDGE_NOTES],
   });
 }

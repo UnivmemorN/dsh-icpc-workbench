@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  TAG_MAPPING_VERSION,
   computeKnowledgeEvidence,
   createNormalizedProblem,
   createRetrospective,
@@ -426,4 +427,158 @@ void test('ratings stay in native dimensions and every independent problem is ac
   }
   assert.equal(stack.platformAttemptedDistinct, 0, 'no raw tag was reported');
   assert.equal(stack.status, 'practicing');
+});
+
+void test('raw-tag resolution is source-aware and reports every distinct mapping', () => {
+  const p1 = problem('K1', { rawTags: ['栈', 'hash', 'codeforces', '2021', '**'] });
+  const report = run({ problems: [p1], submissions: [submission(p1.ref, 'k1', 'accepted')] });
+
+  assert.equal(report.tagMappingVersion, TAG_MAPPING_VERSION);
+  const byRaw = new Map(report.sourceTagMappings.map((entry) => [entry.raw, entry]));
+  assert.equal(byRaw.size, 5);
+
+  const stack = byRaw.get('栈');
+  assert.ok(stack);
+  assert.equal(stack.sourceInstanceId, INSTANCE);
+  assert.equal(stack.vocabulary, 'codeforces');
+  assert.equal(stack.relation, 'exact');
+  assert.deepEqual(stack.targetIds, ['ds.stack']);
+  assert.equal(stack.attemptedDistinct, 1);
+  assert.equal(stack.solvedDistinct, 1);
+  assert.equal(stack.mappingVersion, TAG_MAPPING_VERSION);
+  assert.equal(stack.taxonomyVersion, 'test.09a.1');
+
+  const hash = byRaw.get('hash');
+  assert.ok(hash);
+  assert.equal(hash.relation, 'ambiguous', 'hash is not counted as string hashing');
+  assert.deepEqual(hash.targetIds, []);
+  assert.deepEqual(report.unmatchedAlgorithmLabels, ['hash'], 'only an unresolved algorithm label is a gap');
+  assert.equal(report.coverage.unmatchedAlgorithmProblemDistinct, 1);
+
+  assert.equal(byRaw.get('codeforces')?.relation, 'non_algorithm');
+  assert.equal(byRaw.get('2021')?.relation, 'non_algorithm');
+  assert.equal(byRaw.get('**')?.relation, 'non_algorithm');
+
+  const stackNode = nodeOf(report, 'ds.stack');
+  assert.equal(stackNode.platformAttemptedDistinct, 1);
+  assert.equal(stackNode.platformSolvedDistinct, 1);
+  assert.equal(isDeeplyFrozen(report.sourceTagMappings), true);
+  assert.equal(
+    report.notes.includes('source_label_mapping_is_provisional_platform_evidence_not_a_recorded_method'),
+    true,
+  );
+});
+
+void test('diagnostic counts dedupe per source label and per distinct problem', () => {
+  const p1 = problem('P1', { rawTags: ['栈', 'stack'] });
+  const p2 = problem('P2', { rawTags: ['栈'] });
+  const report = run({
+    problems: [p1, p2],
+    submissions: [
+      submission(p1.ref, 'a1', 'accepted'),
+      submission(p1.ref, 'a2', 'accepted'),
+      submission(p2.ref, 'b1', 'wrong_answer'),
+    ],
+  });
+
+  const stackMappings = report.sourceTagMappings.filter((entry) => entry.targetIds.includes('ds.stack'));
+  assert.deepEqual(
+    stackMappings.map((entry) => entry.raw),
+    ['stack', '栈'],
+    'two different labels stay two rows even when they share a target',
+  );
+  assert.deepEqual(
+    stackMappings.map((entry) => [entry.raw, entry.attemptedDistinct, entry.solvedDistinct]),
+    [
+      ['stack', 1, 1],
+      ['栈', 2, 1],
+    ],
+  );
+
+  const stack = nodeOf(report, 'ds.stack');
+  assert.equal(stack.platformAttemptedDistinct, 2, 'repeated submissions of one problem never inflate a count');
+  assert.equal(stack.platformSolvedDistinct, 1);
+  assert.equal(stack.observedRelatedDistinct, 2);
+});
+
+void test('the same raw text from two source instances stays two mappings', () => {
+  const cfProblem = problem('C1', { rawTags: ['栈'] });
+  const luoguRef: ProblemRef = { sourceInstanceId: 'luogu:www.luogu.com.cn', domain: null, externalKey: 'L1' };
+  const luoguProblem = createNormalizedProblem({
+    ref: luoguRef,
+    title: 'Luogu L1',
+    url: 'https://www.luogu.com.cn/problem/L1',
+    statement: null,
+    fetchedAt: AT,
+    rawTags: ['栈', 'luogu-tag:42'],
+  });
+  const report = run({
+    problems: [cfProblem, luoguProblem],
+    submissions: [submission(cfProblem.ref, 'c1', 'accepted'), submission(luoguRef, 'l1', 'accepted')],
+  });
+
+  const sameRaw = report.sourceTagMappings.filter((entry) => entry.raw === '栈');
+  assert.equal(sameRaw.length, 2, 'one raw text from two instances stays two mappings');
+  assert.deepEqual(
+    sameRaw.map((entry) => entry.sourceInstanceId),
+    ['codeforces:codeforces.com', 'luogu:www.luogu.com.cn'],
+  );
+  assert.deepEqual(
+    sameRaw.map((entry) => entry.vocabulary),
+    ['codeforces', 'luogu'],
+  );
+  assert.deepEqual(
+    sameRaw.map((entry) => [entry.attemptedDistinct, entry.solvedDistinct]),
+    [
+      [1, 1],
+      [1, 1],
+    ],
+  );
+
+  const numeric = report.sourceTagMappings.find((entry) => entry.raw === 'luogu-tag:42');
+  assert.ok(numeric);
+  assert.equal(numeric.relation, 'reference');
+  assert.equal(numeric.vocabulary, 'luogu');
+  assert.equal(report.unmatchedAlgorithmLabels.includes('luogu-tag:42'), false, 'a platform id is no algorithm gap');
+
+  const stack = nodeOf(report, 'ds.stack');
+  assert.equal(stack.platformAttemptedDistinct, 2);
+  assert.equal(stack.platformSolvedDistinct, 2);
+  assert.equal(stack.verifiedAttemptedDistinct, 0, 'a raw mapping never becomes a verified decision');
+  assert.equal(stack.retrospectiveIndependentDistinct, 0, 'a raw mapping never becomes self-reported method evidence');
+  assert.equal(stack.status, 'unconfirmed');
+  assert.equal(isDeeplyFrozen(report), true);
+});
+
+void test('composite constituents and platform references are honest coverage gaps', () => {
+  const luoguRef: ProblemRef = { sourceInstanceId: 'luogu:www.luogu.com.cn', domain: null, externalKey: 'L2' };
+  const entry = createNormalizedProblem({
+    ref: luoguRef,
+    title: 'Luogu L2',
+    url: 'https://www.luogu.com.cn/problem/L2',
+    statement: null,
+    fetchedAt: AT,
+    rawTags: ['并查集', '单调队列', 'luogu-tag:7'],
+  });
+  const report = run({ problems: [entry], submissions: [submission(luoguRef, 'l2', 'accepted')] });
+
+  assert.equal(nodeOf(report, 'ds.dsu').platformAttemptedDistinct, 1, 'a plain synonym still counts');
+  assert.deepEqual(
+    report.unmatchedAlgorithmLabels,
+    ['单调队列'],
+    'a constituent of the frozen monotonic stack/queue node is not silently counted',
+  );
+  assert.equal(report.coverage.unmatchedAlgorithmProblemDistinct, 1);
+  assert.equal(report.sourceTagMappings.find((mapping) => mapping.raw === 'luogu-tag:7')?.relation, 'reference');
+  assert.equal(
+    report.nodes.some((node) => node.taxonomyId.includes('monotonic')),
+    false,
+    'no taxonomy node was invented for the constituent',
+  );
+});
+
+void test('an empty report still carries the crosswalk version with zero mappings', () => {
+  const report = run({ problems: [], submissions: [] });
+  assert.equal(report.tagMappingVersion, TAG_MAPPING_VERSION);
+  assert.deepEqual(report.sourceTagMappings, []);
 });

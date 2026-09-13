@@ -88,6 +88,17 @@ function matchNonAlgorithmRule(raw: string): NonAlgorithmReason | null {
 }
 
 /**
+ * Reason a raw tag is recognised as non-algorithm provenance, or `null`.
+ *
+ * Exposed so the source-aware crosswalk (Sprint 10) applies exactly the same provenance rules as
+ * {@link classifyRawTag} instead of re-implementing them. The classifier's own behaviour is
+ * unchanged by this helper.
+ */
+export function nonAlgorithmTagReason(raw: string): NonAlgorithmReason | null {
+  return matchNonAlgorithmRule(raw.trim());
+}
+
+/**
  * Classify one raw platform tag.
  * Taxonomy aliases win over noise rules (a platform may tag `hash` or `flow` directly).
  */

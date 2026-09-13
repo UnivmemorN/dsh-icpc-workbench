@@ -13,6 +13,7 @@ import { test } from 'node:test';
 import type {
   KnowledgeNodeEvidence,
   KnowledgeRatingRange,
+  SourceTagMappingDiagnostic,
   TaxonomyNode,
   TaxonomyNodeKind,
 } from '../../src/domain/index.js';
@@ -24,9 +25,16 @@ import {
   KNOWLEDGE_SORTS,
   KNOWLEDGE_SORT_LABELS,
   KNOWLEDGE_STATUS_LABELS,
+  KNOWLEDGE_TAG_MAPPING_NOTE,
   KNOWLEDGE_TECHNIQUE_STATUSES,
+  TAG_MAPPING_PAGE_SIZE,
+  TAG_MAPPING_RELATION_LABELS,
+  TAG_VOCABULARY_LABELS,
   changeKnowledgeFilter,
+  changeTagMappingFilter,
   initialKnowledgeViewState,
+  initialTagMappingViewState,
+  isTagMappingIssue,
   knowledgeCategoryOptions,
   knowledgeCategorySummary,
   knowledgeIdInCategory,
@@ -41,9 +49,19 @@ import {
   knowledgeUnknownCatalogIds,
   matchesKnowledgeQuery,
   moveKnowledgePage,
+  moveTagMappingPage,
   reconcileKnowledgeCategory,
+  reconcileTagMappingSource,
   selectKnowledgeTechniques,
+  selectSourceTagMappings,
+  sourceTagMappingCandidateText,
+  sourceTagMappingKey,
+  sourceTagMappingReferenceTitle,
+  sourceTagMappingTargetText,
+  tagMappingPage,
+  tagMappingSourceOptions,
   type KnowledgeViewState,
+  type TagMappingViewState,
 } from '../../src/ui/knowledge-view.js';
 
 /** Independence threshold used by these cases; the report echoes its own value. */
@@ -481,4 +499,205 @@ void test('sort choices and resource relations stay distinguishable', () => {
   }
   assert.equal(knowledgeRelationLabel('topic'), '主题条目');
   assert.equal(knowledgeRelationLabel('overview'), '参考概述');
+});
+
+/** One source-label diagnostic row; every field is overridable so each case stays explicit. */
+function mapping(raw: string, overrides: Partial<SourceTagMappingDiagnostic> = {}): SourceTagMappingDiagnostic {
+  return {
+    mappingVersion: '2026.09.13.1',
+    taxonomyVersion: 'test.10.1',
+    raw,
+    sourceInstanceId: 'codeforces:codeforces.com',
+    vocabulary: 'codeforces',
+    relation: 'exact',
+    targetIds: [],
+    candidateIds: [],
+    ruleId: 'test.rule',
+    explanation: '测试说明',
+    referenceUrls: [],
+    attemptedDistinct: 1,
+    solvedDistinct: 0,
+    ...overrides,
+  };
+}
+
+void test('source-label diagnostics filter locally by source, relation and issues only', () => {
+  const rows: readonly SourceTagMappingDiagnostic[] = [
+    mapping('栈', { targetIds: ['math.number-theory.gcd'], attemptedDistinct: 2, solvedDistinct: 1 }),
+    mapping('hash', { relation: 'ambiguous', candidateIds: ['math.number-theory.gcd'], attemptedDistinct: 1 }),
+    mapping('luogu-tag:42', {
+      sourceInstanceId: 'luogu:www.luogu.com.cn',
+      vocabulary: 'luogu',
+      relation: 'reference',
+    }),
+    mapping('tarjan', { sourceInstanceId: 'luogu:www.luogu.com.cn', vocabulary: 'luogu', relation: 'ambiguous' }),
+  ];
+  const base = initialTagMappingViewState();
+  assert.equal(selectSourceTagMappings(rows, base).length, 4);
+  assert.deepEqual(
+    selectSourceTagMappings(rows, { ...base, sourceInstanceId: 'luogu:www.luogu.com.cn' }).map((row) => row.raw),
+    ['luogu-tag:42', 'tarjan'],
+    'a source filter keeps only that instance',
+  );
+  assert.deepEqual(
+    selectSourceTagMappings(rows, { ...base, relation: 'ambiguous' }).map((row) => row.raw),
+    ['hash', 'tarjan'],
+  );
+  assert.deepEqual(
+    selectSourceTagMappings(rows, { ...base, issuesOnly: true }).map((row) => row.raw),
+    ['hash', 'tarjan'],
+    'issues-only keeps every unresolved relation',
+  );
+  assert.deepEqual(
+    selectSourceTagMappings(rows, { ...base, issuesOnly: true, sourceInstanceId: 'codeforces:codeforces.com' }).map(
+      (row) => row.raw,
+    ),
+    ['hash'],
+    'source and issue filters combine',
+  );
+  assert.equal(isTagMappingIssue(rows[0]!), false);
+  assert.equal(isTagMappingIssue(rows[1]!), true);
+
+  const before = structuredClone(rows);
+  selectSourceTagMappings(rows, { ...base, issuesOnly: true });
+  assert.deepEqual(rows, before, 'filtering never reorders or mutates the report rows');
+});
+
+void test('source-label diagnostics page with a bounded table and clamped pages', () => {
+  const rows = Array.from({ length: TAG_MAPPING_PAGE_SIZE + 3 }, (_, index) =>
+    mapping(`raw-${String(index).padStart(2, '0')}`, { relation: 'unmapped', attemptedDistinct: index + 1 }),
+  );
+  const pageOne = tagMappingPage(selectSourceTagMappings(rows, initialTagMappingViewState()), 1);
+  assert.equal(pageOne.items.length, TAG_MAPPING_PAGE_SIZE, 'a large import never renders one unbounded table');
+  assert.equal(pageOne.totalItems, TAG_MAPPING_PAGE_SIZE + 3);
+  assert.equal(pageOne.totalPages, 2);
+  assert.equal(tagMappingPage(rows, 99).page, 2, 'a page past the end is clamped');
+  assert.equal(tagMappingPage(rows, Number.NaN).page, 1);
+  assert.deepEqual(
+    tagMappingPage([], 5),
+    { items: [], totalItems: 0, totalPages: 0, page: 0 },
+    'an empty filter result has no fabricated page',
+  );
+
+  const paged: TagMappingViewState = {
+    ...initialTagMappingViewState(),
+    sourceInstanceId: 'luogu:www.luogu.com.cn',
+    relation: 'ambiguous',
+    issuesOnly: true,
+    page: 3,
+  };
+  const cleared = changeTagMappingFilter(paged, { relation: 'all' });
+  assert.equal(cleared.page, 1, 'a filter change clears the page');
+  assert.equal(cleared.sourceInstanceId, 'luogu:www.luogu.com.cn', 'untouched fields survive the patch');
+  assert.equal(cleared.issuesOnly, true);
+  assert.equal(moveTagMappingPage(paged, 5, 0).page, 1);
+  assert.equal(moveTagMappingPage(paged, 5, 2).page, 2);
+  assert.equal(moveTagMappingPage(paged, 1, 2).page, 1);
+  assert.equal(moveTagMappingPage(paged, Number.NaN, 2).page, 1);
+  assert.equal(
+    initialTagMappingViewState().page,
+    1,
+    'the state an account change resets to has no filters and page 1',
+  );
+});
+
+void test('mapping identity stays per source and target text never fabricates a name', () => {
+  const cf = mapping('栈', { targetIds: ['math.number-theory.gcd'] });
+  const luogu = mapping('栈', {
+    sourceInstanceId: 'luogu:www.luogu.com.cn',
+    vocabulary: 'luogu',
+    targetIds: ['math.number-theory.gcd'],
+  });
+  assert.notEqual(sourceTagMappingKey(cf), sourceTagMappingKey(luogu), 'same raw text from two sources stays distinct');
+  assert.equal(sourceTagMappingKey(cf), sourceTagMappingKey(mapping('栈', { targetIds: ['math.number-theory.gcd'] })));
+
+  assert.equal(sourceTagMappingTargetText(cf, CATALOG), '最大公约数', 'counted targets show their Chinese name');
+  assert.equal(
+    sourceTagMappingTargetText(mapping('hash', { relation: 'ambiguous', candidateIds: ['math.number-theory.gcd'] }), CATALOG),
+    '待核对',
+  );
+  assert.equal(
+    sourceTagMappingCandidateText(
+      mapping('hash', { relation: 'ambiguous', candidateIds: ['math.number-theory.gcd'] }),
+      CATALOG,
+    ),
+    '候选：最大公约数',
+  );
+  assert.equal(sourceTagMappingTargetText(mapping('luogu-tag:42', { relation: 'reference' }), CATALOG), '仅作资料');
+  assert.equal(
+    sourceTagMappingTargetText(mapping('2021', { relation: 'non_algorithm' }), CATALOG),
+    '来源信息，不计入知识点',
+  );
+  assert.equal(sourceTagMappingCandidateText(cf, CATALOG), '', 'a counted mapping has no candidate line');
+
+  const options = tagMappingSourceOptions([cf, luogu, mapping('hash')]);
+  assert.deepEqual(
+    options.map((option) => option.sourceInstanceId),
+    ['codeforces:codeforces.com', 'luogu:www.luogu.com.cn'],
+  );
+  assert.deepEqual(
+    options.map((option) => option.count),
+    [2, 1],
+  );
+  assert.equal(
+    options[0]!.label.includes('Codeforces') && options[0]!.label.includes('codeforces:codeforces.com'),
+    true,
+    'a source option shows its vocabulary and exact instance id',
+  );
+  assert.equal(TAG_MAPPING_RELATION_LABELS.exact, '精确对应');
+  for (const label of Object.values(TAG_MAPPING_RELATION_LABELS)) {
+    assert.ok(label.trim().length > 0, 'every relation needs a label');
+  }
+  assert.equal(TAG_VOCABULARY_LABELS['oi-wiki'], 'OI Wiki');
+  assert.ok(KNOWLEDGE_TAG_MAPPING_NOTE.includes('不代表你实际用过该方法'));
+});
+
+void test('a vanished source instance falls back to all sources on page 1', () => {
+  const rows: readonly SourceTagMappingDiagnostic[] = [
+    mapping('栈', { targetIds: ['math.number-theory.gcd'] }),
+    mapping('luogu-tag:42', {
+      sourceInstanceId: 'luogu:www.luogu.com.cn',
+      vocabulary: 'luogu',
+      relation: 'reference',
+    }),
+  ];
+  const paged: TagMappingViewState = {
+    ...initialTagMappingViewState(),
+    sourceInstanceId: 'luogu:www.luogu.com.cn',
+    relation: 'reference',
+    page: 2,
+  };
+  assert.equal(reconcileTagMappingSource(paged, rows), paged, 'a still-offered source keeps the identical state');
+  assert.equal(reconcileTagMappingSource(initialTagMappingViewState(), rows).sourceInstanceId, null);
+
+  const repaired = reconcileTagMappingSource(
+    paged,
+    rows.filter((row) => row.sourceInstanceId !== 'luogu:www.luogu.com.cn'),
+  );
+  assert.equal(repaired.sourceInstanceId, null);
+  assert.equal(repaired.page, 1, 'the old page belonged to the old, narrower result set');
+  assert.equal(repaired.relation, 'reference', 'only the source and page are repaired');
+  assert.equal(
+    reconcileTagMappingSource(paged, []).sourceInstanceId,
+    null,
+    'an empty refreshed report cannot keep a source selection',
+  );
+});
+
+void test('reference links carry short visible titles, never raw URLs', () => {
+  assert.equal(sourceTagMappingReferenceTitle('https://codeforces.com/apiHelp/objects#Problem'), '平台标签说明');
+  assert.equal(sourceTagMappingReferenceTitle('https://www.luogu.com.cn/problem/list'), '平台标签说明');
+  assert.equal(sourceTagMappingReferenceTitle('https://ac.nowcoder.com/acm/skill/acm'), '平台标签说明');
+  assert.equal(sourceTagMappingReferenceTitle('https://oi-wiki.org/ds/stack/'), '知识点参考');
+  assert.equal(
+    sourceTagMappingReferenceTitle('https://m.oi-wiki.org/'),
+    '知识点参考',
+    'the host check is not a bare substring match',
+  );
+  assert.equal(
+    sourceTagMappingReferenceTitle('https://evil.example/?next=https://oi-wiki.org/'),
+    '平台标签说明',
+    'a URL that merely mentions oi-wiki.org stays a platform page',
+  );
+  assert.equal(sourceTagMappingReferenceTitle('not a url'), '平台标签说明', 'a malformed URL still gets a title');
 });

@@ -24,9 +24,27 @@ export {
   classifyRawTag,
   classifyRawTags,
   isAlgorithmRelevant,
+  nonAlgorithmTagReason,
   tagLookupKey,
   unknownRawTags,
   type NonAlgorithmReason,
   type NonAlgorithmTagRule,
   type TagClassification,
 } from './classify.js';
+
+export {
+  TAG_CROSSWALK_SAFE_SPELLINGS,
+  TAG_MAPPING_RELATIONS,
+  TAG_MAPPING_VERSION,
+  TAG_VOCABULARIES,
+  inferTagVocabulary,
+  isCountedTagRelation,
+  isTagVocabulary,
+  isUnresolvedAlgorithmRelation,
+  mapSourceTag,
+  sourceTagKey,
+  type MapSourceTagInput,
+  type SourceTagMapping,
+  type TagMappingRelation,
+  type TagVocabulary,
+} from './crosswalk.js';

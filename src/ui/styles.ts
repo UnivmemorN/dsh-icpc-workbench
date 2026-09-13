@@ -85,4 +85,7 @@ export const styles=`
 .icpc-knowledge-sources p+p{margin-top:8px}
 @media(max-width:640px){.icpc-knowledge-dist button{flex-basis:calc(50% - 8px);min-width:0}.icpc-knowledge-table td:first-child{min-width:0}}
 @media(prefers-color-scheme:dark){.icpc-root .icpc-knowledge-dist button[aria-pressed=true]{color:#17221f}.icpc-root .icpc-knowledge-dist button[aria-pressed=true] .icpc-knowledge-meter>span{background:#17221f}}
+.icpc-tag-mapping td > span{display:block;overflow-wrap:anywhere}
+.icpc-tag-mapping td .icpc-tag-mapping-refs{display:flex;flex-direction:column;gap:3px;margin-top:4px}
+.icpc-tag-mapping td .icpc-tag-mapping-refs a{display:inline-block;font-size:12px;overflow-wrap:anywhere}
 `;

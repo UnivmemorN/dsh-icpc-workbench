@@ -8,6 +8,7 @@ import {
   knowledgeResourcesFor,
 } from '../domain/knowledge-resources.js';
 import { Empty, ExternalLink, Notice, Panel, useWorkbench } from './common.js';
+import { TAG_MAPPING_RELATIONS } from '../domain/index.js';
 import { barWidthPercent } from './histogram.js';
 import {
   KNOWLEDGE_AC_NOTE,
@@ -19,9 +20,14 @@ import {
   KNOWLEDGE_SORTS,
   KNOWLEDGE_SORT_LABELS,
   KNOWLEDGE_STATUS_LABELS,
+  KNOWLEDGE_TAG_MAPPING_NOTE,
   KNOWLEDGE_TECHNIQUE_STATUSES,
+  TAG_MAPPING_RELATION_LABELS,
+  TAG_VOCABULARY_LABELS,
   changeKnowledgeFilter,
+  changeTagMappingFilter,
   initialKnowledgeViewState,
+  initialTagMappingViewState,
   knowledgeCategoryOptions,
   knowledgeCategorySummary,
   knowledgePage,
@@ -32,10 +38,20 @@ import {
   knowledgeTechniqueCoverage,
   knowledgeUnknownCatalogIds,
   moveKnowledgePage,
+  moveTagMappingPage,
   reconcileKnowledgeCategory,
+  reconcileTagMappingSource,
   selectKnowledgeTechniques,
+  selectSourceTagMappings,
+  sourceTagMappingCandidateText,
+  sourceTagMappingKey,
+  sourceTagMappingReferenceTitle,
+  sourceTagMappingTargetText,
+  tagMappingPage,
+  tagMappingSourceOptions,
   type KnowledgeTechniqueRow,
   type KnowledgeViewState,
+  type TagMappingViewState,
 } from './knowledge-view.js';
 import { jumpHint, pageNumbers, pagerDisplay, parseJumpPage } from './pager.js';
 
@@ -64,12 +80,15 @@ export type KnowledgeOuterCoverage = ApiWeaknessResult['coverage'];
 export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewData; coverage: KnowledgeOuterCoverage }) {
   const { boot, navigate } = useWorkbench();
   const [state, setState] = useState<KnowledgeViewState>(initialKnowledgeViewState);
+  const [mappingState, setMappingState] = useState<TagMappingViewState>(initialTagMappingViewState);
   const [jump, setJump] = useState('');
   const results = useRef<HTMLDivElement | null>(null);
 
-  // A new account shows its own default view state instead of the previous account's filters.
+  // A new account shows its own default view state instead of the previous account's filters; the
+  // source-label filters and their page belong to the account as well.
   useEffect(() => {
     setState(initialKnowledgeViewState());
+    setMappingState(initialTagMappingViewState());
     setJump('');
   }, [knowledge.accountId]);
 
@@ -98,6 +117,26 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
       setState((previous) => moveKnowledgePage(previous, page.totalPages, page.totalPages));
     }
   }, [page.totalPages, state.page]);
+
+  // Source-label diagnostics use the same local-filter rules as the technique table: filtering and
+  // paging are pure helpers over the one confirmed report, and a shrinking result clamps the page.
+  const mappingRows = selectSourceTagMappings(knowledge.sourceTagMappings, mappingState);
+  const mappingPage = tagMappingPage(mappingRows, mappingState.page);
+  const mappingSources = tagMappingSourceOptions(knowledge.sourceTagMappings);
+  const relationCountOf = (relation: (typeof TAG_MAPPING_RELATIONS)[number]): number =>
+    knowledge.sourceTagMappings.filter((mapping) => mapping.relation === relation).length;
+  useEffect(() => {
+    if (mappingPage.totalPages > 0 && mappingState.page > mappingPage.totalPages) {
+      setMappingState((previous) => moveTagMappingPage(previous, mappingPage.totalPages, mappingPage.totalPages));
+    }
+  }, [mappingPage.totalPages, mappingState.page]);
+
+  // A refreshed report can also drop the selected source instance; fall back to all sources on
+  // page 1, exactly like the category selector. The helper returns the identical state while the
+  // selection is still offered, so this effect settles instead of re-rendering in a loop.
+  useEffect(() => {
+    setMappingState((previous) => reconcileTagMappingSource(previous, knowledge.sourceTagMappings));
+  }, [knowledge.sourceTagMappings]);
 
   const counts = knowledgeStatusCounts(knowledge.nodes);
   const peak = Math.max(1, ...counts.map((entry) => entry.count));
@@ -480,6 +519,177 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
         <p className="icpc-muted">
           缺少的本地题目元数据仍计入分母，但带不上标签或难度，可以在 题库 &gt; 导入与同步 &gt; 题目目录 补齐。
         </p>
+      </details>
+
+      <details className="icpc-tag-mapping">
+        <summary>
+          来源标签对照（试行）：{knowledge.sourceTagMappings.length} 条映射 · 对照版本{' '}
+          {knowledge.tagMappingVersion}
+        </summary>
+        <p className="icpc-muted">{KNOWLEDGE_TAG_MAPPING_NOTE}</p>
+        <div className="icpc-toolbar">
+          <label>
+            来源实例
+            <select
+              value={mappingState.sourceInstanceId ?? ''}
+              onChange={(event) =>
+                setMappingState((previous) =>
+                  changeTagMappingFilter(previous, {
+                    sourceInstanceId: event.target.value === '' ? null : event.target.value,
+                  }),
+                )
+              }
+            >
+              <option value="">全部来源</option>
+              {mappingSources.map((option) => (
+                <option key={option.sourceInstanceId} value={option.sourceInstanceId}>
+                  {option.label}（{option.count} 条）
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            对照结果
+            <select
+              value={mappingState.relation}
+              onChange={(event) =>
+                setMappingState((previous) =>
+                  changeTagMappingFilter(previous, {
+                    relation: event.target.value as TagMappingViewState['relation'],
+                  }),
+                )
+              }
+            >
+              <option value="all">全部结果</option>
+              {TAG_MAPPING_RELATIONS.map((relation) => (
+                <option key={relation} value={relation}>
+                  {TAG_MAPPING_RELATION_LABELS[relation]}（{relationCountOf(relation)}）
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="icpc-check">
+            <input
+              type="checkbox"
+              checked={mappingState.issuesOnly}
+              onChange={(event) =>
+                setMappingState((previous) =>
+                  changeTagMappingFilter(previous, { issuesOnly: event.target.checked }),
+                )
+              }
+            />
+            只看待核对
+          </label>
+          <button type="button" onClick={() => setMappingState(initialTagMappingViewState())}>
+            重置对照筛选
+          </button>
+        </div>
+        {mappingPage.totalItems === 0 ? (
+          <Empty>
+            当前筛选下没有来源标签映射。可以清空来源或对照结果条件；未匹配的原始标签仍然保留在题目记录里。
+          </Empty>
+        ) : (
+          <>
+            <div className="icpc-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>来源</th>
+                    <th>原始标签</th>
+                    <th>对照结果</th>
+                    <th>对应知识点</th>
+                    <th>题目数</th>
+                    <th>说明 / 参考</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mappingPage.items.map((mapping) => (
+                    <tr key={sourceTagMappingKey(mapping)}>
+                      <td>
+                        <span className="icpc-knowledge-name">{TAG_VOCABULARY_LABELS[mapping.vocabulary]}</span>
+                        <span className="icpc-muted">{mapping.sourceInstanceId}</span>
+                      </td>
+                      <td>{mapping.raw}</td>
+                      <td>{TAG_MAPPING_RELATION_LABELS[mapping.relation]}</td>
+                      <td>
+                        <span>{sourceTagMappingTargetText(mapping, catalog)}</span>
+                        {sourceTagMappingCandidateText(mapping, catalog) !== '' && (
+                          <span className="icpc-muted">{sourceTagMappingCandidateText(mapping, catalog)}</span>
+                        )}
+                      </td>
+                      <td>
+                        <span>
+                          通过 {mapping.solvedDistinct} / 尝试 {mapping.attemptedDistinct}
+                        </span>
+                      </td>
+                      <td>
+                        <span>{mapping.explanation}</span>
+                        {mapping.referenceUrls.length > 0 && (
+                          <span className="icpc-tag-mapping-refs">
+                            {mapping.referenceUrls.map((url) => (
+                              <ExternalLink key={url} href={url}>
+                                {sourceTagMappingReferenceTitle(url)}
+                              </ExternalLink>
+                            ))}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {mappingPage.totalPages > 1 && (
+              <nav className="icpc-pager" aria-label="来源标签对照分页">
+                <button
+                  type="button"
+                  disabled={mappingPage.page <= 1}
+                  onClick={() =>
+                    setMappingState((previous) =>
+                      moveTagMappingPage(previous, mappingPage.page - 1, mappingPage.totalPages),
+                    )
+                  }
+                >
+                  ‹ 上一页
+                </button>
+                {pageNumbers(mappingPage.page, mappingPage.totalPages).map((entry, index) =>
+                  entry === null ? (
+                    <span key={`mapping-gap-${index}`} className="icpc-pager-gap" aria-hidden="true">
+                      …
+                    </span>
+                  ) : (
+                    <button
+                      key={entry}
+                      type="button"
+                      className={entry === mappingPage.page ? 'icpc-page-current' : undefined}
+                      aria-current={entry === mappingPage.page ? 'page' : undefined}
+                      onClick={() =>
+                        setMappingState((previous) => moveTagMappingPage(previous, entry, mappingPage.totalPages))
+                      }
+                    >
+                      {entry}
+                    </button>
+                  ),
+                )}
+                <button
+                  type="button"
+                  disabled={mappingPage.page >= mappingPage.totalPages}
+                  onClick={() =>
+                    setMappingState((previous) =>
+                      moveTagMappingPage(previous, mappingPage.page + 1, mappingPage.totalPages),
+                    )
+                  }
+                >
+                  下一页 ›
+                </button>
+              </nav>
+            )}
+            <p className="icpc-muted" aria-live="polite">
+              筛选后 {mappingPage.totalItems} 条映射 · 第 {mappingPage.page} / {mappingPage.totalPages}{' '}
+              页；同一标签来自不同来源时分别列出，不按显示名合并。
+            </p>
+          </>
+        )}
       </details>
 
       <Notice>

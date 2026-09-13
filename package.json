@@ -1,6 +1,6 @@
 {
   "name": "dsh-icpc-workbench",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Personal ICPC training workbench plugin: normalized problems, evidence-checked tag analysis, weakness statistics and training plans.",
   "license": "MIT",
   "type": "module",
@@ -52,7 +52,10 @@
     "docs/knowledge-learning.md",
     "docs/reports/stage-09a-knowledge.md",
     "docs/reports/stage-09b-knowledge-ui.md",
-    "docs/reports/stage-09-acceptance.md"
+    "docs/reports/stage-09-acceptance.md",
+    "docs/tag-alignment.md",
+    "docs/reports/stage-10-tag-alignment.md",
+    "docs/reports/stage-10-acceptance.md"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
