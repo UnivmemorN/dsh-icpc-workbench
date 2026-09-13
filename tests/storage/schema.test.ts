@@ -276,11 +276,11 @@ void test('a database from a newer schema is rejected before anything is written
   rawExec(paths.path, [
     'CREATE TABLE problems (x TEXT)',
     `INSERT INTO problems (x) VALUES ('foreign data')`,
-    // Literal v6: one version newer than this build's v5 store, never a moving target.
+    // Explicitly verify v7 is refused by this build's v6 store before any write.
     `PRAGMA user_version = ${STORE_SCHEMA_VERSION + 1}`,
   ]);
-  assert.equal(STORE_SCHEMA_VERSION, 5);
-  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 6);
+  assert.equal(STORE_SCHEMA_VERSION, 6);
+  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 7);
   const before = fingerprint(paths.path);
   const beforeBytes = readFileSync(paths.path);
   assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');

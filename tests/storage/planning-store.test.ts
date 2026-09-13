@@ -464,6 +464,7 @@ void test('new history survives persisted plan validation while legacy preparati
   const legacy = structuredClone(current);
   delete (legacy.preparation.ability as { history?: unknown }).history;
   delete (legacy.preparation.ability as { trainingReference?: unknown }).trainingReference;
+  delete (legacy.preparation.ability as { competition?: unknown }).competition;
   (legacy.preparation.ability as { version: string }).version = 'ability.1';
   Object.assign(legacy.preparation, { evidenceHash: planPreparationEvidenceHash(legacy.preparation) });
   const restored = validatePlanAttempt(legacy);
@@ -475,4 +476,17 @@ void test('new history survives persisted plan validation while legacy preparati
   const corrupt = structuredClone(current);
   Object.assign(corrupt.preparation.ability.history!.periods[0]!, { eligibleDistinct: 100 });
   assert.throws(() => validatePlanAttempt(corrupt), hasCode('invalid_input'), 'inconsistent history counters are refused');
+});
+
+test('official plan references require matching closed competition evidence', () => {
+  const valid = structuredClone(makeAttempt());
+  Object.assign(valid.preparation.ability, { trainingReference: { source: 'official_rating', scale: 'codeforces', range: { min: 1642, max: 1642 }, revision: 0 }, competition: { status: 'rated', rating: 1642, maxRating: 1830, ratedContests: 2, activity: 'recent', revision: 1 } });
+  Object.assign(valid.preparation, { evidenceHash: planPreparationEvidenceHash(valid.preparation) });
+  assert.deepEqual(validatePlanAttempt(valid), valid);
+  for (const change of [{ competition: undefined }, { competition: { ...valid.preparation.ability.competition, rating: 1600 } }, { competition: { ...valid.preparation.ability.competition, handle: 'private' } }, { platform: 'luogu' }]) {
+    const bad = structuredClone(valid); Object.assign(bad.preparation.ability, change);
+    if (change.competition === undefined && Object.hasOwn(change, 'competition')) delete (bad.preparation.ability as { competition?: unknown }).competition;
+    Object.assign(bad.preparation, { evidenceHash: planPreparationEvidenceHash(bad.preparation) });
+    assert.throws(() => validatePlanAttempt(bad), hasCode('invalid_input'));
+  }
 });

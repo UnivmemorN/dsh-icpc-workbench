@@ -1,14 +1,13 @@
 /**
  * Account ability assessment.
  *
- * Since ability.3, trainingReference is the sole player-level reference: self-report or
+ * Since ability.3, trainingReference is the sole player-level reference: self-report, official contest rating or
  * uncalibrated. The legacy estimate below is retained for API readers as descriptive practice
  * data only; its median-derived pools are withheld from new planning inputs.
  *
  * This module answers exactly one bounded question: "which Codeforces **training** difficulty band
  * does the imported solving history support?" It is deliberately not an official-rating estimate:
- * the official account rating is never fetched (`officialRating.status` is the literal
- * `not_loaded`), no provider is called, no clock is read (the caller passes `now`), and the result
+ * official rating is supplied separately by the application, no provider is called, no clock is read (the caller passes `now`), and the result
  * is a transparent local heuristic that carries its version, its sample and its caveats.
  *
  * The counting rules are the conservative ones the rest of the product already uses:
@@ -46,6 +45,7 @@
  * never rewritten — and no upper bound is invented, because the official CF problem rating has no
  * documented maximum. An insufficient sample yields `unknown` — never `0` and never "newbie".
  */
+import { validateOfficialRating, competitionSummary, type CompetitionSummary, type OfficialRatingSnapshot, type OfficialRatingChange } from './official-rating.js';
 import { validateAbilityCalibration, type AbilityCalibration, type AbilityTrainingReference } from './ability-calibration.js';
 import { invariant, requireFiniteInt } from './errors.js';
 import { assertIsoTimestamp, type SourcePlatform } from './ids.js';
@@ -59,7 +59,7 @@ import { expectedRatingDimension } from './training-stats.js';
 const DAY_MS = 86_400_000;
 
 /** Version of the assessment shape and its counting rules; bump when an exported meaning changes. */
-export const ABILITY_ASSESSMENT_VERSION = 'ability.3';
+export const ABILITY_ASSESSMENT_VERSION = 'ability.4';
 
 /** Version of the Codeforces training-band heuristic alone; the numbers below belong to it. */
 export const CF_TRAINING_BAND_HEURISTIC_VERSION = 'cf-rating-band.1';
@@ -84,9 +84,9 @@ export const CF_TRAINING_POOL_FLOOR = 800;
 /** Official help page that explains user rating vs. problem rating. */
 export const CF_OFFICIAL_RATING_API_HELP_URL = 'https://codeforces.com/apiHelp/objects#User';
 
-/** Fixed statement that the official account rating was not loaded by this bounded task. */
+/** Default explanation until an official rating snapshot has been synchronized. */
 export const ABILITY_OFFICIAL_RATING_NOTE =
-  '未加载官方账号 rating：本任务不抓取 Codeforces API。官方用户 rating 与题目 rating 是两个不同的量，本页的难度带只是本地启发式训练参考，不代表官方分数。';
+  '尚未同步官方评分；可在能力评估中同步 CF 评分与比赛历史。';
 
 /** Stable, ordered vocabulary of the evidence caveats one assessment can carry. */
 export const ABILITY_EVIDENCE_REASONS = [
@@ -113,7 +113,7 @@ export type AbilityEvidenceReasonCode = (typeof ABILITY_EVIDENCE_REASONS)[number
  */
 export const ABILITY_REASON_TEXT: Readonly<Record<AbilityEvidenceReasonCode, string>> = {
   heuristic_unvalidated:
-    '练习难度中位数与 P25–P75 只描述选过的题，不能作为选手实力或能力区间。个人水平使用有来源的校准；未校准时保持未知，不把基础题的数量当成低水平证据。',
+    '练习难度中位数与 P25–P75 只描述选过的题，不能作为选手实力或能力区间。个人水平使用有来源的自评或官方比赛分；两者都没有时保持未知，不把基础题的数量当成低水平证据。',
   selection_bias_practice_vs_contest:
     '样本来自平时练习而不是正式比赛：练习环境、题面提示与时间压力都和比赛不同，练习表现可能高估或低估比赛表现。',
   incomplete_imports: '导入不完整：有尝试题缺少本地元数据或难度数值，可用样本可能不完整。',
@@ -127,7 +127,7 @@ export const ABILITY_REASON_TEXT: Readonly<Record<AbilityEvidenceReasonCode, str
   non_cf_native_scale_only:
     '该平台不是 Codeforces：只展示它自己的原生难度分位数与分布，不换算成 CF rating，也不给出 CF 训练难度带。',
   official_rating_not_loaded:
-    '未加载官方账号 rating（本任务不抓取官方 API）：用户 rating 与题目 rating 是两件事，本页只用本地导入的题目难度与复盘记录。',
+    '尚未同步官方账号 rating；用户 rating 与题目 rating 是两件事，练习统计不能替代比赛评分。',
 };
 
 /** Explicit settings; both bounds are validated integers. */
@@ -265,9 +265,10 @@ export interface AbilityTrainingEstimate {
   readonly reasons: readonly string[];
 }
 
-/** Official-rating status: this bounded task never loads it, and says so explicitly. */
-export interface AbilityOfficialRatingStatus {
-  readonly status: 'not_loaded';
+/** Official contest evidence loaded by the explicit sync operation; practice statistics stay separate. */
+export interface AbilityOfficialRatingStatus extends CompetitionSummary {
+  readonly fetchedAt: string | null;
+  readonly history: readonly OfficialRatingChange[];
   readonly apiHelpUrl: string;
   readonly note: string;
 }
@@ -374,6 +375,7 @@ export interface AbilityAssessment {
 }
 
 export interface ComputeAbilityAssessmentInput {
+  readonly officialRating?: OfficialRatingSnapshot | null;
   readonly calibration?: AbilityCalibration | null;
   readonly accountId: string;
   readonly sourceInstanceId: string;
@@ -396,6 +398,8 @@ export interface ComputeAbilityAssessmentInput {
  * is closed, a later caller cannot accidentally forward raw rows to a model.
  */
 export interface AbilityPlanningAggregate {
+  /** Absent only in legacy immutable preparations. */
+  readonly competition?: CompetitionSummary;
   /** Absent only in legacy immutable preparations; never synthesize it when reading those. */
   readonly trainingReference?: AbilityTrainingReference;
   /** Absent in legacy immutable preparations; present in newly prepared plans. */
@@ -978,14 +982,19 @@ export function computeAbilityAssessment(input: ComputeAbilityAssessmentInput): 
   const repeatedAcDistinct = [...acceptedInWindow].filter(
     (key) => (firstAcceptedAt.get(key) as string | undefined) !== undefined && Date.parse(firstAcceptedAt.get(key) as string) < windowStartMs,
   ).length;
+  const official = input.officialRating == null ? null : validateOfficialRating(input.officialRating);
+  invariant(official === null || official.accountId === accountId && input.platform === 'codeforces', 'invalid_input', 'official rating belongs to another account or platform');
+  invariant(official === null || Date.parse(official.fetchedAt) <= Date.parse(now), 'invalid_input', 'official rating snapshot is from the future');
+  const competition = competitionSummary(official, now);
+  if (official !== null) reportReasons.delete('official_rating_not_loaded');
   const codes = orderedReasons(reportReasons);
 
   const calibration = input.calibration == null ? null : validateAbilityCalibration(input.calibration);
   invariant(calibration === null || calibration.accountId === accountId, 'invalid_input', 'calibration belongs to another account');
   invariant(calibration === null || input.platform === 'codeforces', 'invalid_input', 'CF self-assessment belongs to a Codeforces account');
   const trainingReference: AbilityTrainingReference = {
-    source: calibration?.range ? 'self_report' : 'uncalibrated',
-    scale: 'codeforces', range: calibration?.range ?? null, revision: calibration?.revision ?? 0,
+    source: calibration?.range ? 'self_report' : official?.rating != null ? 'official_rating' : 'uncalibrated',
+    scale: 'codeforces', range: calibration?.range ?? (official?.rating == null ? null : { min: official.rating, max: official.rating }), revision: calibration?.revision ?? 0,
   };
   return deepFreeze({
     calibration, trainingReference,
@@ -1016,9 +1025,9 @@ export function computeAbilityAssessment(input: ComputeAbilityAssessmentInput): 
     nativeDifficulty,
     estimate,
     officialRating: {
-      status: 'not_loaded',
+      ...competition, fetchedAt: official?.fetchedAt ?? null, history: official?.history ?? [],
       apiHelpUrl: CF_OFFICIAL_RATING_API_HELP_URL,
-      note: ABILITY_OFFICIAL_RATING_NOTE,
+      note: official === null ? ABILITY_OFFICIAL_RATING_NOTE : competition.status === 'unrated' ? '官方账号没有 rated 比赛记录，不以零分代替未评级。' : competition.activity === 'historical' ? '官方当前 rating 来自 90 天以前的比赛，可能不能反映近期状态；历史最高分也不等于当前实力。' : '自动分直接采用官方当前 rating；它描述比赛表现，历史最高分与练习难度分布分别展示。',
     },
     excludedFromEstimate,
     coverage,
@@ -1041,6 +1050,7 @@ export function aggregateAbilityForPlanning(report: AbilityAssessment): AbilityP
     history: report.history,
     platform: report.platform,
     trainingReference: report.trainingReference,
+    competition: competitionSummary(report.officialRating.status === 'not_loaded' ? null : { accountId: report.accountId, source: 'codeforces_api', revision: report.officialRating.revision, fetchedAt: report.officialRating.fetchedAt!, rating: report.officialRating.rating, maxRating: report.officialRating.maxRating, history: report.officialRating.history }, report.computedAt),
     estimateStatus: 'unknown',
     estimateBasis: null,
     heuristicVersion: estimate.heuristicVersion,

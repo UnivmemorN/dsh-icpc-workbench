@@ -10,6 +10,7 @@
  * refusal of unknown fields and sanitized 500s with an observer. The platform is a fake adapter and
  * the registry is an in-process double; nothing reaches a socket, a model or a paid API.
  */
+import { officialFixture } from '../official-rating-fixtures.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ConnectionFetchRoute, HostConnectionFetch } from '@deepseek-ai/dsh-client-connection';
@@ -1410,5 +1411,22 @@ void test('ability.calibrate saves honest per-account provenance and refuses sta
     const abort = new AbortController(); abort.abort();
     await bench.post('ability.calibrate', { ...request, expectedRevision: 1, range: null }, abort.signal);
     assert.equal((await bench.store.getAbilityCalibration(account.id))!.revision, 1);
+  });
+});
+
+
+void test('ability.syncRating derives identity from the stored account and refuses browser-supplied scores', async () => {
+  let calls = 0;
+  await withBench({ adapter: instance => ({ ...fakeAdapter(instance), fetchOfficialRating: async request => { calls++; const { revision: _revision, ...data } = officialFixture(request.account.id, AT); return data; } }) }, async bench => {
+    const account = (await ok(bench, 'account.create', { platform: 'codeforces', handle: 'alice' })).account;
+    assert.equal((await bench.post('ability.syncRating', { accountId: account.id, rating: 3000 })).status, 400);
+    assert.equal(calls, 0);
+    assert.equal((await ok(bench, 'ability.syncRating', { accountId: account.id })).rating, 1642);
+    assert.equal((await ok(bench, 'weakness', { accountId: account.id })).ability.trainingReference.source, 'official_rating');
+    const luogu = (await ok(bench, 'account.create', { platform: 'luogu', handle: '123' })).account;
+    assert.equal((await bench.post('ability.syncRating', { accountId: luogu.id })).status, 400);
+    assert.equal(calls, 1);
+    const abort = new AbortController(); abort.abort(); await bench.post('ability.syncRating', { accountId: account.id }, abort.signal);
+    assert.equal((await bench.store.getOfficialRating(account.id))?.revision, 1);
   });
 });

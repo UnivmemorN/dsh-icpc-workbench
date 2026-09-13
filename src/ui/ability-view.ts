@@ -53,6 +53,7 @@ export function abilityNativeScaleOnly(ability: AbilityViewData): boolean {
 
 /** Compact summary value for the page-level Stats row. */
 export function abilityStatValue(ability: AbilityViewData): string {
+  if (ability.trainingReference.source === 'official_rating') return String(ability.trainingReference.range?.min) + '（CF 官方 rating）';
   if (ability.trainingReference.range) return abilityPoolText(ability.trainingReference.range) + '（用户自评）';
   if (abilityNativeScaleOnly(ability)) return '原生刻度评估（CF 估计不适用）';
   return '个人水平待校准';

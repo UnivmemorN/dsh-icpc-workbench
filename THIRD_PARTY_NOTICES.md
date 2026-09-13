@@ -39,3 +39,9 @@ Neither Nowcoder nor OI Wiki supplies or certifies this project's mastery assess
 ## Source-tag alignment
 
 The [tag-alignment rules](docs/tag-alignment.md) reference public terminology from [Codeforces](https://codeforces.com/apiHelp/objects#Problem), [Luogu](https://www.luogu.com.cn/problem/list), [Nowcoder](https://ac.nowcoder.com/acm/skill/acm), and [OI Wiki](https://oi-wiki.org/), checked 2026-09-13. Cross-source equivalences and conservative exclusions are independently maintained project decisions, not an official joint taxonomy or endorsement. No problem/editorial bodies or third-party article code/images are incorporated. Existing project and content-license notices above continue to apply.
+
+## Ability scoring references
+
+Reviewed 2026-09-13: [ZF3373/icpc-workbench](https://github.com/ZF3373/icpc-workbench) commit ac4a2e0920e07a9d5abde8cee54ac8aa8a3a5fa7, server/src/today/ability.ts and select.ts (MIT, Copyright (c) 2026 ZF3373). The separation of explicit overrides and practice evidence is a design reference; its median formula is not used as player ability. No implementation files are copied; the original MIT notice above remains included.
+
+[Codeforces official problem-difficulty explanation](https://codeforces.com/blog/entry/62865) and [official rating API](https://codeforces.com/apiHelp/methods#user.rating) define the distinction between problem ratings and official competition ratings. [AtCoder AHC v2](https://atcoder.jp/posts/1381) and its [formula](https://img.atcoder.jp/file/AHC_rating_v2_en.pdf) were reviewed, not implemented: practice solves are not contest performances. No article bodies, images or rating implementation code are incorporated. The product uses CF's returned current rating and independently implements the fetch, persistence and display; the sites do not certify or endorse this plugin. See [method and limitations](docs/ability-scoring.md).

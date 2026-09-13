@@ -501,7 +501,7 @@ export function planningAbilitySummary(ability: PlanningAbilityView): PlanningAb
   const nativeCount = ability.nativeDifficulty.reduce((total, row) => total + row.count, 0);
   const reference = ability.trainingReference;
   const headline = reference?.range
-    ? 'CF 水平 ' + rangeText(reference.range) + '（用户自评）'
+    ? reference.source === 'official_rating' ? 'CF 官方 rating ' + reference.range.min : 'CF 水平 ' + rangeText(reference.range) + '（用户自评）'
     : ability.platform !== 'codeforces' && nativeCount > 0
       ? '原生刻度评估（CF 估计不适用）'
       : '个人水平待校准';
@@ -510,7 +510,7 @@ export function planningAbilitySummary(ability: PlanningAbilityView): PlanningAb
     headline,
     sample: `${ability.sampleSize} / ${ability.minimumSampleSize} 题（${basis}）`,
     band: rangeText(ability.quartileBand),
-    confidence: reference?.range ? '用户自评（非官方 rating）' : '未校准',
+    confidence: reference?.source === 'official_rating' ? 'CF 官方比赛评分' : reference?.range ? '用户自评（非官方 rating）' : '未校准',
     native: ability.nativeDifficulty.map((row) =>
       row.count === 0
         ? `${row.dimension}：暂无可用的原生数值样本（${row.missing} 题缺失）`

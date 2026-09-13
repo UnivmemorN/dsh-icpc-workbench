@@ -7,8 +7,9 @@ import { abilityPoolText } from './ability-view.js';
 /** Per-account editor. Parent keys it by account and revision, so stale responses cannot leak between accounts. */
 export function AbilityCalibrationEditor({ ability, onSaved }: { ability: AbilityAssessment; onSaved: () => void }) {
   const reference = ability.trainingReference;
-  const [min, setMin] = useState(reference.range ? String(reference.range.min) : '');
-  const [max, setMax] = useState(reference.range ? String(reference.range.max) : '');
+  const ownRange = ability.calibration?.range ?? null;
+  const [min, setMin] = useState(ownRange ? String(ownRange.min) : '');
+  const [max, setMax] = useState(ownRange ? String(ownRange.max) : '');
   const action = useAction();
   const valid = /^\d+$/u.test(min) && /^\d+$/u.test(max) && Number.isSafeInteger(Number(min)) && Number.isSafeInteger(Number(max)) && Number(min) > 0 && Number(min) <= Number(max);
   async function save(clear: boolean) {
@@ -18,8 +19,8 @@ export function AbilityCalibrationEditor({ ability, onSaved }: { ability: Abilit
   if (ability.platform !== 'codeforces') return null;
   return <section aria-label="个人水平校准">
     <h3>个人水平校准</h3>
-    <p><strong>{reference.range ? 'CF 水平参考 ' + abilityPoolText(reference.range) + '（用户自评）' : '个人水平待校准'}</strong></p>
-    <p className="icpc-muted">填写你根据比赛或训练表现判断的 CF 水平范围。保存后作为新 AI 训练计划的主要选题参考；练习中位数不再决定水平。自评按当前账号保存，可修改或清除。</p>
+    <p><strong>{ownRange ? 'CF 水平参考 ' + abilityPoolText(ownRange) + '（用户自评）' : reference.source === 'official_rating' ? '计划使用官方 rating ' + reference.range?.min : '个人水平待校准'}</strong></p>
+    <p className="icpc-muted">填写你根据比赛或训练表现判断的 CF 水平范围。保存后作为新 AI 训练计划的主要选题参考；练习中位数不再决定水平。自评按当前账号保存，可修改或清除；清除后，有官方评分则自动使用官方评分。</p>
     <form onSubmit={event => { event.preventDefault(); if (valid) void save(false); }}>
       <div className="icpc-form-grid">
         <label>水平下限<input aria-label="水平下限" inputMode="numeric" value={min} onChange={event => setMin(event.target.value)} disabled={action.busy} placeholder="填写正整数" /></label>
@@ -27,7 +28,7 @@ export function AbilityCalibrationEditor({ ability, onSaved }: { ability: Abilit
       </div>
       <div className="icpc-actions">
         <button type="submit" disabled={action.busy || !valid}>保存水平校准</button>
-        <button type="button" disabled={action.busy || !reference.range} onClick={() => void save(true)}>清除自评</button>
+        <button type="button" disabled={action.busy || !ownRange} onClick={() => void save(true)}>清除自评</button>
       </div>
     </form>
     <ErrorNotice error={action.error} />

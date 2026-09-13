@@ -15,9 +15,11 @@ export interface AbilityCalibration {
 }
 /** Closed, identifier-free planning reference. Absence of a range means ability is uncalibrated. */
 export interface AbilityTrainingReference {
-  readonly source: 'self_report' | 'uncalibrated';
+  readonly source: 'self_report' | 'official_rating' | 'uncalibrated';
   readonly scale: 'codeforces';
+  /** Official reference preserves one exact signed rating; self-report uses positive bounds. */
   readonly range: AbilityCalibrationRange | null;
+  /** Self-report revision, including withdrawal; competition.revision tracks official refreshes. */
   readonly revision: number;
 }
 export function validateCalibrationRange(value: unknown): AbilityCalibrationRange | null {
@@ -46,6 +48,14 @@ export function validateTrainingReference(value: unknown): AbilityTrainingRefere
   const keys = ['source', 'scale', 'range', 'revision'];
   invariant(Object.keys(row).length === keys.length && keys.every(k => Object.hasOwn(row, k)), 'invalid_input', 'invalid training reference fields');
   invariant(row['scale'] === 'codeforces' && Number.isSafeInteger(row['revision']) && (row['revision'] as number) >= 0, 'invalid_input', 'invalid training reference scale/revision');
+  // Official CF user ratings can be zero or negative; they are never silently clamped.
+  if (row['source'] === 'official_rating') {
+    const r = row['range'];
+    invariant(typeof r === 'object' && r !== null && !Array.isArray(r), 'invalid_input', 'official reference range required');
+    const bounds = r as Record<string, unknown>;
+    invariant(Object.keys(bounds).length === 2 && Number.isSafeInteger(bounds['min']) && bounds['min'] === bounds['max'], 'invalid_input', 'official reference must preserve the exact rating');
+    return deepFreeze({ source: 'official_rating', scale: 'codeforces', range: { min: bounds['min'] as number, max: bounds['max'] as number }, revision: row['revision'] as number });
+  }
   const range = validateCalibrationRange(row['range']);
   invariant(range === null ? row['source'] === 'uncalibrated' : row['source'] === 'self_report' && (row['revision'] as number) > 0, 'invalid_input', 'training reference source/range mismatch');
   return deepFreeze({ source: row['source'] as AbilityTrainingReference['source'], scale: 'codeforces', range, revision: row['revision'] as number });

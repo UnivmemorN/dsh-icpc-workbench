@@ -414,3 +414,4 @@ export {
 export { type KnowledgeDifficultyBand } from './knowledge-difficulty.js';
 
 export * from './ability-calibration.js';
+export * from './official-rating.js';

@@ -46,7 +46,7 @@ test('schema v4 is backed up intact; calibration survives import and restart wit
     const rows = db.prepare('SELECT body FROM ability_calibrations ORDER BY revision').all();
     assert.equal(rows.length, 2);
     assert.deepEqual(JSON.parse(rows[0]!['body'] as string), value);
-    assert.equal(readUserVersion(db), 5);
+    assert.equal(readUserVersion(db), 6);
     db.close();
   } finally { await store.close(); fx.removeDirectory(paths.dir); }
 });

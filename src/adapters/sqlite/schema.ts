@@ -19,7 +19,7 @@
  * {@link SCHEMA_DDL_V2}/{@link applySchemaV2} and {@link SCHEMA_DDL_V3}/{@link applySchemaV3} keep
  * creating exactly their own version's tables **and write exactly their own literal
  * `user_version`**, so a fixture built with them is a real older database and the migration under
- * test is the real one. The current version adds {@link SCHEMA_DDL_V5} on top.
+ * test is the real one. The current version adds {@link SCHEMA_DDL_V6} on top.
  *
  * All metadata the adapter writes are immutable JSON bodies plus indexed identity columns.
  */
@@ -30,7 +30,8 @@ import { StorageError } from './errors.js';
 export const STORE_MARKER = 'dsh-icpc-workbench/training-store';
 
 /** Schema version this build reads and writes. */
-export const STORE_SCHEMA_VERSION = 5;
+export const STORE_SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION_V5 = 5;
 export const SCHEMA_VERSION_V4 = 4;
 
 /** Version of an uninitialized or pre-store database. */
@@ -354,7 +355,12 @@ export const STORE_TABLES_V5: readonly string[] = [...STORE_TABLES_V4, 'ability_
 export const SCHEMA_DDL_V5: readonly string[] = [
   'CREATE TABLE ability_calibrations (account_id TEXT NOT NULL REFERENCES accounts(id), revision INTEGER NOT NULL CHECK(revision > 0), body TEXT NOT NULL, PRIMARY KEY(account_id, revision))',
 ];
-export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'v3' | 'v4' | 'current';
+export const STORE_TABLES_V6: readonly string[] = [...STORE_TABLES_V5, 'official_rating_snapshots'];
+export const SCHEMA_DDL_V6 = [`CREATE TABLE official_rating_snapshots (
+  account_id TEXT NOT NULL REFERENCES accounts(id), revision INTEGER NOT NULL CHECK(revision > 0),
+  body TEXT NOT NULL, PRIMARY KEY(account_id, revision)
+)`];
+export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'v3' | 'v4' | 'v5' | 'current';
 
 function pragmaRow(db: DatabaseSync, sql: string): Record<string, unknown> | undefined {
   return db.prepare(sql).get() as Record<string, unknown> | undefined;
@@ -412,8 +418,13 @@ export function detectSchemaState(db: DatabaseSync): SchemaState {
   const tables = tableNames(db);
   if (version === STORE_SCHEMA_VERSION) {
     requireStoreMarker(db, version);
-    requireTables(tables, STORE_TABLES_V5, version);
+    requireTables(tables, STORE_TABLES_V6, version);
     return 'current';
+  }
+  if (version === SCHEMA_VERSION_V5) {
+    requireStoreMarker(db, version);
+    requireTables(tables, STORE_TABLES_V5, version);
+    return 'v5';
   }
   if (version === SCHEMA_VERSION_V4) {
     requireStoreMarker(db, version);
@@ -655,6 +666,19 @@ export function migrateToSchemaV5(db: DatabaseSync, from: number): void {
     for (const statement of SCHEMA_DDL_V5) db.exec(statement);
     db.exec('PRAGMA user_version = 5');
   }, 'schema v5 migration');
+}
+
+/** Add only missing versions; caller performs backup before any migration. */
+export function migrateToSchemaV6(db: DatabaseSync, from: number): void {
+  inTransaction(db, () => {
+    if (from < 1) applySchemaV1(db);
+    if (from < 2) applySchemaV2(db);
+    if (from < 3) applySchemaV3(db);
+    if (from < 4) applySchemaV4(db);
+    if (from < 5) for (const statement of SCHEMA_DDL_V5) db.exec(statement);
+    for (const statement of SCHEMA_DDL_V6) db.exec(statement);
+    db.exec('PRAGMA user_version = 6');
+  }, 'schema v6 migration');
 }
 
 function inTransaction(db: DatabaseSync, work: () => void, label: string): void {

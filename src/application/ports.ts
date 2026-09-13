@@ -177,6 +177,8 @@ export type EditorialFetchResult =
 export interface PlatformAdapter {
   readonly sourceInstance: SourceInstance;
   capabilities(): PlatformCapabilities;
+  /** Optional official contest-rating capability; absent on unsupported platforms. */
+  fetchOfficialRating?(request: { readonly account: Account; readonly token: CancellationToken; readonly limits: PlatformLimits }): Promise<import('../domain/official-rating.js').OfficialRatingData>;
   listProblems(request: ListProblemsRequest): Promise<Page<NormalizedProblem>>;
   listSubmissions(request: ListSubmissionsRequest): Promise<Page<Submission>>;
   /** Fetch one problem's full detail, including its statement when the platform has one. */
@@ -614,6 +616,8 @@ export interface MergedProblemBrowsePage {
  */
 export interface TrainingStore {
   /** Latest account calibration, including explicit withdrawals. Imports never change it. */
+  getOfficialRating(accountId: string): Promise<import('../domain/official-rating.js').OfficialRatingSnapshot | null>;
+  saveOfficialRating(record: import('../domain/official-rating.js').OfficialRatingSnapshot, expectedRevision: number): Promise<void>;
   getAbilityCalibration(accountId: string): Promise<import('../domain/ability-calibration.js').AbilityCalibration | null>;
   /** Append exactly the next revision; expectedRevision 0 means no prior calibration. */
   saveAbilityCalibration(record: import('../domain/ability-calibration.js').AbilityCalibration, expectedRevision: number): Promise<void>;

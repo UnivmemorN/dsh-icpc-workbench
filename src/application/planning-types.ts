@@ -29,6 +29,7 @@
  *   not counted as a used call; a cancel that arrives after the reservation was written settles
  *   through the dispatch path instead, so a paid call can never be released for free.
  */
+import { validateCompetitionSummary } from '../domain/official-rating.js';
 import { validateTrainingReference } from '../domain/ability-calibration.js';
 import {
   DomainError,
@@ -1132,7 +1133,7 @@ function dedupeIds(values: readonly string[]): readonly string[] {
 function requireAbilityAggregate(value: unknown): AbilityPlanningAggregate {
   const record = requireObject('planning preparation ability', value);
   requireExactKeys('planning preparation ability', record,
-    [...ABILITY_KEYS, ...(Object.hasOwn(record, 'history') ? ['history'] : []), ...(Object.hasOwn(record, 'trainingReference') ? ['trainingReference'] : [])]);
+    [...ABILITY_KEYS, ...(Object.hasOwn(record, 'history') ? ['history'] : []), ...(Object.hasOwn(record, 'trainingReference') ? ['trainingReference'] : []), ...(Object.hasOwn(record, 'competition') ? ['competition'] : [])]);
   const platform = record['platform'];
   invariant(
     SOURCE_PLATFORMS.includes(platform as (typeof SOURCE_PLATFORMS)[number]),
@@ -1173,9 +1174,14 @@ function requireAbilityAggregate(value: unknown): AbilityPlanningAggregate {
     };
   });
 
+  const competition = Object.hasOwn(record, 'competition') ? validateCompetitionSummary(record['competition']) : undefined;
+  const reference = Object.hasOwn(record, 'trainingReference') ? validateTrainingReference(record['trainingReference']) : undefined;
+  invariant(competition?.status !== 'rated' || platform === 'codeforces', 'invalid_input', 'CF competition score belongs to CF');
+  invariant(reference?.source !== 'official_rating' || platform === 'codeforces' && competition?.status === 'rated' && reference.range?.min === competition.rating, 'invalid_input', 'official training reference needs matching competition evidence');
   return {
+    ...(competition === undefined ? {} : { competition }),
     ...(Object.hasOwn(record, 'history') ? { history: requireAbilityHistory(record['history']) } : {}),
-    ...(Object.hasOwn(record, 'trainingReference') ? { trainingReference: validateTrainingReference(record['trainingReference']) } : {}),
+    ...(reference === undefined ? {} : { trainingReference: reference }),
     version: requireText('planning ability version', record['version']),
     platform: platform as AbilityPlanningAggregate['platform'],
     estimateStatus: estimateStatus as AbilityPlanningAggregate['estimateStatus'],

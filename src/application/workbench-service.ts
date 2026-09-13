@@ -22,6 +22,8 @@
  * after every awaited write, so a cancelled review or preview rolls its transaction back instead of
  * leaving a half-recorded one.
  */
+import { validateOfficialRating, type OfficialRatingSnapshot } from '../domain/official-rating.js';
+import type { PlatformAdapter, PlatformLimits } from './ports.js';
 import { validateAbilityCalibration, validateCalibrationRange, type AbilityCalibration, type AbilityCalibrationRange } from '../domain/ability-calibration.js';
 import {
   COMPLETION_MODES,
@@ -887,6 +889,26 @@ export class WorkbenchService {
   // weakness
   // -------------------------------------------------------------------------------------
 
+  /** Network fetch outside the store transaction; only a complete, current revision is committed. */
+  async syncOfficialRating(accountId: string, adapter: PlatformAdapter, limits: PlatformLimits, token: CancellationToken): Promise<OfficialRatingSnapshot> {
+    requireToken(token); token.throwIfCancelled();
+    const account = await this.requireAccount(requireRequiredId('accountId', accountId), token);
+    invariant(adapter.sourceInstance.id === account.sourceInstanceId && adapter.sourceInstance.platform === 'codeforces' && typeof adapter.fetchOfficialRating === 'function', 'invalid_input', 'official rating requires this account’s Codeforces adapter');
+    const before = await this.store.getOfficialRating(account.id);
+    token.throwIfCancelled();
+    const fetched = await adapter.fetchOfficialRating({ account, limits, token });
+    token.throwIfCancelled();
+    invariant(fetched.accountId === account.id, 'invalid_input', 'official rating belongs to another account');
+    const record = validateOfficialRating({ ...fetched, revision: (before?.revision ?? 0) + 1 });
+    return this.store.transaction(async () => {
+      token.throwIfCancelled();
+      const current = await this.requireAccount(account.id, token);
+      invariant(current.sourceInstanceId === account.sourceInstanceId && current.handle === account.handle, 'invalid_transition', 'account changed during rating refresh');
+      await this.store.saveOfficialRating(record, before?.revision ?? 0);
+      token.throwIfCancelled(); return record;
+    });
+  }
+
   /** Save an explicit user range without touching platform records, retrospectives or earlier revisions. */
   async calibrateAbility(request: { readonly accountId: string; readonly expectedRevision: number; readonly range: AbilityCalibrationRange | null }, token: CancellationToken): Promise<AbilityCalibration> {
     requireToken(token); token.throwIfCancelled();
@@ -971,6 +993,7 @@ export class WorkbenchService {
       // evidence or turns an imported AC into an independently completed solve.
       const ability = computeAbilityAssessment({
         calibration: await this.store.getAbilityCalibration(account.id),
+        officialRating: await this.store.getOfficialRating(account.id),
         accountId: account.id,
         sourceInstanceId: account.sourceInstanceId,
         platform: source.platform,
@@ -1317,6 +1340,7 @@ export class WorkbenchService {
       const ability = aggregateAbilityForPlanning(
         computeAbilityAssessment({
           calibration: await this.store.getAbilityCalibration(account.id),
+        officialRating: await this.store.getOfficialRating(account.id),
           accountId: account.id,
           sourceInstanceId: account.sourceInstanceId,
           platform: source.platform,
@@ -1428,6 +1452,7 @@ export class WorkbenchService {
     const ability = aggregateAbilityForPlanning(
       computeAbilityAssessment({
         calibration: await this.store.getAbilityCalibration(account.id),
+        officialRating: await this.store.getOfficialRating(account.id),
         accountId: account.id,
         sourceInstanceId: account.sourceInstanceId,
         platform: source.platform,

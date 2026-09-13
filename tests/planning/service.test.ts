@@ -9,6 +9,7 @@
  * after dispatch, settings/lease guards, cancellation, the borrowed rolling quota, restart
  * recovery without a duplicate call and the account-scoped status/cancel reads.
  */
+import { officialFixture } from '../official-rating-fixtures.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SqliteTrainingStore } from '../../src/adapters/sqlite/index.js';
@@ -1298,5 +1299,28 @@ test('account calibration reaches free preparation and changes invalidate it bef
     assert.equal(run.outcome, 'refused');
     assert.equal(scripted.calls.length, 0);
     assert.deepEqual((await store.getPlanAttempt(REQUEST))!.preparation.ability.trainingReference?.range, { min: 1700, max: 2200 }, 'old preparation is immutable');
+  }, scripted);
+});
+
+
+test('official competition evidence reaches plans and a refresh invalidates even a self-report override preparation', async () => {
+  const scripted = scriptedGenerator(async () => { throw Error('No model dispatch expected'); });
+  await withBench(async ({ store, workbench, planning, scope }) => {
+    const record = officialFixture(scope.account.id, AT);
+    await store.saveOfficialRating(record, 0);
+    await workbench.calibrateAbility({ accountId: scope.account.id, expectedRevision: 0, range: { min: 1800, max: 2100 } }, TOKEN);
+    const prepared = await planning.prepare({ requestId: REQUEST, accountId: scope.account.id }, TOKEN);
+    assert.equal(prepared.outcome, 'prepared');
+    const stored = (await store.getPlanAttempt(REQUEST))!;
+    assert.equal(stored.preparation.ability.competition?.rating, 1642);
+    assert.equal(stored.preparation.ability.trainingReference?.source, 'self_report');
+    assert.equal((await workbench.revalidatePlanInput(stored.preparation, TOKEN)).ok, true);
+    await store.saveOfficialRating({ ...record, revision: 2 }, 1);
+    const stale = await workbench.revalidatePlanInput(stored.preparation, TOKEN);
+    assert.equal(stale.ok, false);
+    if (!stale.ok) assert.equal(stale.staleness.reason, 'ability_changed');
+    assert.equal((await planning.run({ requestId: REQUEST, accountId: scope.account.id }, TOKEN)).outcome, 'refused');
+    assert.equal(scripted.calls.length, 0);
+    assert.equal((await store.getPlanAttempt(REQUEST))!.preparation.ability.competition?.revision, 1);
   }, scripted);
 });

@@ -201,7 +201,7 @@ void test('native quantiles stay native and the no-conversion statement stays ex
   assert.match(ABILITY_NO_CONVERSION_NOTE, /非 Codeforces/);
   assert.equal(ability.officialRating.status, 'not_loaded');
   assert.equal(ability.officialRating.apiHelpUrl, CF_OFFICIAL_RATING_API_HELP_URL);
-  assert.match(ability.officialRating.note, /未加载官方账号 rating/);
+  assert.match(ability.officialRating.note, /尚未同步官方评分/);
   assert.ok(ability.reasons.some((reason) => reason.includes('不能作为选手实力')));
 });
 

@@ -1,11 +1,11 @@
+import { OfficialRating } from './OfficialRating.js';
 import { AbilityCalibrationEditor } from './AbilityCalibration.js';
 import { AbilityHistory } from './AbilityHistory.js';
 import type { ApiWeaknessResult } from '../application/workbench-api.js';
-import { Empty, ExternalLink, Notice, Panel, Stats } from './common.js';
+import { Empty, Notice, Panel, Stats } from './common.js';
 import {
   ABILITY_MODE_LABELS,
   ABILITY_NO_CONVERSION_NOTE,
-  ABILITY_OFFICIAL_RATING_LINK_TEXT,
   abilityCoverageLines,
   abilityEstimateHeadline,
   abilityExcludedText,
@@ -26,9 +26,9 @@ export function Ability({ ability, onSaved }: { ability: AbilityViewData; onSave
     <Panel title="能力评估与练习记录">
       <Notice>
         个人水平与练习选题是两个不同的量：基础题练得多、近期题目变简单，都不能据此降低能力评价。
-        当前使用有来源的个人校准作为水平参考；没有校准时保持“待校准”。{ABILITY_NO_CONVERSION_NOTE}
-        官方账号 rating 未加载（<ExternalLink href={ability.officialRating.apiHelpUrl}>{ABILITY_OFFICIAL_RATING_LINK_TEXT}</ExternalLink>）。
+        自动分使用官方比赛 rating，已保存的自评可作为计划的主要水平参考。{ABILITY_NO_CONVERSION_NOTE}
       </Notice>
+      <OfficialRating key={ability.accountId} ability={ability} onSaved={onSaved} />
       <AbilityCalibrationEditor key={ability.accountId + ':' + ability.trainingReference.revision} ability={ability} onSaved={onSaved} />
       <AbilityHistory history={ability.history} platform={ability.platform} />
       <details>

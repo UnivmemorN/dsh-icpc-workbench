@@ -54,3 +54,5 @@ The full backend contract, its defaults, the settlement truth table and the exac
 Integrated runtime and browser verification: [Stage 11 acceptance](reports/stage-11-acceptance.md).
 
 Since 0.1.10, practice medians never establish the player's level or restrict their training pools. See [personal calibration](ability-calibration.md).
+
+Since 0.1.11, an explicitly synchronized official CF rating is the automatic reference when no self-report is active. The closed competition aggregate supplies current/max rating, contest count, recency class and snapshot revision; it never includes a handle or per-contest records. A rating refresh also invalidates older preparations. See [score sources and rules](ability-scoring.md).

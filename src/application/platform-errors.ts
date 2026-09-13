@@ -34,7 +34,7 @@ export const PLATFORM_ERROR_CODES: readonly PlatformErrorCode[] = [
 ];
 
 /** Which adapter operation failed. Diagnostic context only, never control flow. */
-export type PlatformOperation = 'catalog' | 'problem' | 'statement' | 'submissions' | 'editorial';
+export type PlatformOperation = 'catalog' | 'problem' | 'statement' | 'submissions' | 'editorial' | 'rating';
 
 export interface PlatformErrorInput {
   readonly code: PlatformErrorCode;

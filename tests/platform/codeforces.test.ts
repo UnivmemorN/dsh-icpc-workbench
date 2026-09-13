@@ -1193,3 +1193,36 @@ test('reject zero resume offsets, non-main submission identities and non-root so
     await assert.rejects(adapter.listSubmissions({account:adapter.account('alice'),cursor:null,limit:10,limits,token:token()}),error=>isPlatformError(error)&&error.code==='changed_response');
   }
 });
+
+test('official rating validates account and profile/history consistency with shared 2-second pacing', async () => {
+  const rows = [{ contestId: 1, contestName: 'Synthetic round', handle: 'Alice', rank: 12, ratingUpdateTimeSeconds: 1767225600, oldRating: 0, newRating: 1642 }];
+  let rating: unknown = 1642, handle = 'Alice';
+  const h = createHttpHarness({ routes: {
+    '/api/user.info': url => { assert.equal(url.searchParams.get('checkHistoricHandles'), 'false'); return jsonResponse({ status: 'OK', result: [{ handle, rating, maxRating: rating }] }); },
+    '/api/user.rating': () => jsonResponse({ status: 'OK', result: rows }),
+  } });
+  const adapter = new CodeforcesAdapter({ transport: h.transport, clock: () => Date.parse('2026-09-12T08:00:00.000Z') });
+  const request = { account: adapter.account('alice'), limits, token: token() };
+  assert.equal((await adapter.fetchOfficialRating(request)).rating, 1642);
+  assert.equal(h.requests[1]!.at - h.requests[0]!.at, 2000);
+  rating = 1700; await assert.rejects(adapter.fetchOfficialRating(request), e => isPlatformError(e) && e.code === 'changed_response');
+  rating = '1642'; await assert.rejects(adapter.fetchOfficialRating(request), e => isPlatformError(e) && e.code === 'changed_response');
+  handle = 'Bob'; const count = h.requests.length;
+  await assert.rejects(adapter.fetchOfficialRating(request), e => isPlatformError(e) && e.code === 'changed_response');
+  assert.equal(h.requests.length, count + 1, 'foreign profile stops before history fetch');
+  const cancelled = createCancellationSource(); cancelled.cancel();
+  await assert.rejects(adapter.fetchOfficialRating({ ...request, token: cancelled.token }), expectCancelled);
+});
+
+test('official rating distinguishes unrated, rate-limit and unavailable responses', async () => {
+  let status = 200;
+  const h = createHttpHarness({ routes: {
+    '/api/user.info': () => status === 200 ? jsonResponse({ status: 'OK', result: [{ handle: 'alice' }] }) : jsonResponse({ status: 'FAILED', comment: status === 400 ? 'Call limit exceeded' : 'unavailable' }, status),
+    '/api/user.rating': () => jsonResponse({ status: 'OK', result: [] }),
+  } });
+  const adapter = new CodeforcesAdapter({ transport: h.transport });
+  const request = { account: adapter.account('alice'), limits, token: token() };
+  const unrated = await adapter.fetchOfficialRating(request); assert.equal(unrated.rating, null); assert.deepEqual(unrated.history, []);
+  status = 400; await assert.rejects(adapter.fetchOfficialRating(request), e => isPlatformError(e) && e.code === 'rate_limited');
+  status = 503; await assert.rejects(adapter.fetchOfficialRating(request), e => isPlatformError(e) && e.code === 'unavailable');
+});

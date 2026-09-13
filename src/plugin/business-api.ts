@@ -468,6 +468,16 @@ function businessRoutes(context: ApiContext): readonly BusinessRouteEntry[] {
       validate: validateRetroRecord,
       handle: async (input, token) => context.workbench.recordRetrospective(input, token),
     }),
+    businessRoute(WORKBENCH_API_OPERATIONS.abilitySyncRating, {
+      method: 'POST', validate: validateWeakness,
+      handle: async (input, token) => {
+        token.throwIfCancelled();
+        const account = await context.store.getAccount(input.accountId);
+        invariant(account !== null, 'missing_reference', 'rating account is not stored');
+        const adapter = await adapterOf(context, configuredSource(context, account.sourceInstanceId));
+        return context.workbench.syncOfficialRating(account.id, adapter, await platformLimits(context), token);
+      },
+    }),
     businessRoute(WORKBENCH_API_OPERATIONS.abilityCalibrate, {
       method: 'POST', validate: validateAbilityCalibrate,
       handle: async (input, token) => context.workbench.calibrateAbility(input, token),

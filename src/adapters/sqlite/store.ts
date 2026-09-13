@@ -1,3 +1,4 @@
+import { validateOfficialRating, type OfficialRatingSnapshot } from '../../domain/official-rating.js';
 /**
  * SQLite implementation of the {@link TrainingStore} port, built on the built-in
  * `node:sqlite` `DatabaseSync` (no dependency, no separate driver process).
@@ -175,7 +176,8 @@ import {
 import {
   SCHEMA_VERSION_EMPTY,
   SCHEMA_VERSION_V4,
-  migrateToSchemaV5,
+  migrateToSchemaV6,
+  SCHEMA_VERSION_V5,
   SCHEMA_VERSION_V1,
   SCHEMA_VERSION_V2,
   SCHEMA_VERSION_V3,
@@ -527,6 +529,31 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
           ],
         );
       }
+    });
+  }
+
+  async getOfficialRating(accountId: string): Promise<OfficialRatingSnapshot | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT account_id, revision, body FROM official_rating_snapshots WHERE account_id = ? ORDER BY revision DESC LIMIT 1', [requireId('account id', accountId)]);
+      if (row === null) return null;
+      try {
+        const value = validateOfficialRating(JSON.parse(textColumn(row, 'body')));
+        invariant(value.accountId === accountId && value.revision === intColumn(row, 'revision'), 'invalid_input', 'official rating identity mismatch');
+        return value;
+      } catch (error) { throw new StorageError('corrupt_row', 'invalid ability official rating body', { cause: String(error) }); }
+    });
+  }
+
+  async saveOfficialRating(record: OfficialRatingSnapshot, expectedRevision: number): Promise<void> {
+    this.assertOpen();
+    const value = validateOfficialRating(record);
+    invariant(Number.isSafeInteger(expectedRevision) && expectedRevision >= 0 && value.revision === expectedRevision + 1, 'invalid_input', 'official rating must append the next revision');
+    return this.withWrite(() => {
+      invariant(this.find('SELECT id FROM accounts WHERE id = ?', [value.accountId]) !== null, 'missing_reference', 'official rating account is not stored');
+      const current = this.find('SELECT revision FROM official_rating_snapshots WHERE account_id = ? ORDER BY revision DESC LIMIT 1', [value.accountId]);
+      invariant((current === null ? 0 : intColumn(current, 'revision')) === expectedRevision, 'invalid_transition', 'official rating revision changed');
+      this.write('INSERT INTO official_rating_snapshots (account_id, revision, body) VALUES (?, ?, ?)', [value.accountId, value.revision, canonicalJson(value)]);
     });
   }
 
@@ -2458,10 +2485,10 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
    *
    * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
    *    switched into another journal mode or otherwise touched.
-   * 2. A supported older database (v0, v1, v2, v3 or v4) is backed up **before** `configureConnection`,
+   * 2. A supported older database (v0, v1, v2, v3, v4 or v5) is backed up **before** `configureConnection`,
    *    so the backup is the database as it was found and switching the journal mode is not part
    *    of the pre-migration state. The copy is verified before migration starts.
-   * 3. migrateToSchemaV5 applies only missing versions in one transaction; every existing row
+   * 3. migrateToSchemaV6 applies only missing versions in one transaction; every existing row
    *    is retained, and exactly one pre-migration backup was already taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
    *    succeeded, so a failed migration leaves the original file — including its original
@@ -2469,7 +2496,7 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
    */
   private openSchema(inMemory: boolean): void {
     const state = detectSchemaState(this.connection);
-    if (state === 'legacy_v0' || state === 'v1' || state === 'v2' || state === 'v3' || state === 'v4') {
+    if (state === 'legacy_v0' || state === 'v1' || state === 'v2' || state === 'v3' || state === 'v4' || state === 'v5') {
       // Keep a consistent copy of the database as found before any migration writes to it.
       const from =
         state === 'legacy_v0'
@@ -2478,14 +2505,14 @@ export class SqliteTrainingStore implements TrainingStore, SettingsStore, Coachi
             ? SCHEMA_VERSION_V1
             : state === 'v2'
               ? SCHEMA_VERSION_V2
-              : state === 'v3' ? SCHEMA_VERSION_V3 : SCHEMA_VERSION_V4;
+              : state === 'v3' ? SCHEMA_VERSION_V3 : state === 'v4' ? SCHEMA_VERSION_V4 : SCHEMA_VERSION_V5;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
       this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        migrateToSchemaV5(this.connection, readUserVersion(this.connection));
+        migrateToSchemaV6(this.connection, readUserVersion(this.connection));
       } catch (error) {
         if (error instanceof StorageError) {
           throw error;

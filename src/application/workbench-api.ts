@@ -136,6 +136,7 @@ export const USER_ANSWER_ASSOCIATED_LINK_NOTE = '用户未提供答案出处链�
 export const WORKBENCH_API_OPERATIONS = {
   accountCreate: 'account.create',
   abilityCalibrate: 'ability.calibrate',
+  abilitySyncRating: 'ability.syncRating',
   syncPage: 'sync.page',
   importPreview: 'import.preview',
   importApply: 'import.apply',
@@ -608,6 +609,7 @@ export interface WorkbenchApiMap {
   'coaching.history': ApiEndpoint<Model.ModelCoachingHistoryRequest, Model.ModelCoachingHistoryResult>;
   'coaching.cancel': ApiEndpoint<Model.ModelCoachingCancelRequest, Model.ModelCoachingCancelResult>;
   'settings.save': ApiEndpoint<Model.ModelSettingsSaveRequest, Model.ModelSettingsSaveResult>;
+  'ability.syncRating': ApiEndpoint<{ readonly accountId: string }, import('../domain/official-rating.js').OfficialRatingSnapshot>;
   'ability.calibrate': ApiEndpoint<{ readonly accountId: string; readonly expectedRevision: number; readonly range: AbilityCalibrationRange | null }, AbilityCalibration>;
   'account.create': ApiEndpoint<ApiAccountCreateRequest, ApiAccountCreateResult>;
   'sync.page': ApiEndpoint<ApiSyncPageRequest, ApiSyncPageResult>;

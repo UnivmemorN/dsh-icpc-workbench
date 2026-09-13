@@ -25,6 +25,8 @@
  *   never reports a proven editorial absence, because one page cannot prove it.
  */
 import {
+  validateOfficialRating,
+  type OfficialRatingData,
   assertIsoTimestamp,
   contentHashOf,
   createEditorialSolution,
@@ -686,6 +688,39 @@ export class CodeforcesAdapter implements PlatformAdapter {
       rawTags: parsed.page.rawTags,
       fetchedAt: new Date().toISOString(),
     });
+  }
+
+  /** Fetch a coherent official profile and complete contest history using the shared limiter. */
+  async fetchOfficialRating(request: { readonly account: Account; readonly token: CancellationToken; readonly limits: PlatformLimits }): Promise<OfficialRatingData> {
+    const limits = this.requireLimits(request.limits);
+    const handle = requireAccountHandle(this.sourceInstance, request.account, 'rating');
+    const fetchRows = async (path: string) => {
+      const response = await this.transport.request(path, { token: request.token, operation: 'rating', acceptStatuses: [400], limits: this.httpLimits(limits) });
+      if (response.status === 400) throw apiFailure('rating', 'official rating', response.status, parseJsonRecordOrNull(response.body));
+      const root = requireRecord(parseJson(response.body, 'rating', 'official rating'), 'official rating', 'rating');
+      if (root.status !== 'OK') throw apiFailure('rating', 'official rating', response.status, root);
+      return requireArray(root.result, 'rating result', 'rating');
+    };
+    const profiles = await fetchRows('/api/user.info?' + new URLSearchParams({ handles: handle, checkHistoricHandles: 'false' }).toString());
+    if (profiles.length !== 1) throw payloadError('rating', 'expected one account profile');
+    const profile = requireRecord(profiles[0], 'profile', 'rating');
+    const checkHandle = (value: unknown) => {
+      if (typeof value !== 'string' || value.toLowerCase() !== handle.toLowerCase()) throw payloadError('rating', 'official response belongs to another handle');
+    };
+    checkHandle(profile.handle);
+    const rows = await fetchRows('/api/user.rating?' + new URLSearchParams({ handle }).toString());
+    if (rows.length > 10000) throw payloadError('rating', 'rating history exceeds the supported bound');
+    const history = rows.map(raw => {
+      const row = requireRecord(raw, 'rating change', 'rating'); checkHandle(row.handle);
+      const seconds = requireSafeCount(row.ratingUpdateTimeSeconds, 'rating timestamp', 'rating');
+      if (!Number.isFinite(new Date(seconds * 1000).getTime())) throw payloadError('rating', 'invalid rating timestamp');
+      return { contestId: row.contestId, contestName: row.contestName, rank: row.rank, ratedAt: new Date(seconds * 1000).toISOString(), oldRating: row.oldRating, newRating: row.newRating };
+    });
+    request.token.throwIfCancelled();
+    try {
+      const { revision: _revision, ...data } = validateOfficialRating({ accountId: request.account.id, revision: 1, source: 'codeforces_api', fetchedAt: new Date(this.clock()).toISOString(), rating: profile.rating ?? null, maxRating: profile.maxRating ?? null, history });
+      return data;
+    } catch { throw payloadError('rating', 'invalid or inconsistent profile/rating history; refresh again'); }
   }
 
   async listSubmissions(request: ListSubmissionsRequest): Promise<Page<Submission>> {
