@@ -113,3 +113,26 @@ test('host activation recovers an expired AI plan reservation before any route s
   assert.equal(f.calls(),0);
  }finally{await runtime.dispose();f.remove();}
 });
+test('activation migrates legacy models once, preserves limits, and rejects non-Flash settings',async()=>{
+ const f=fixture();mkdirSync(f.dataDir,{recursive:true});
+ const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>fx.AT});
+ const original=defaultWorkbenchSettings();
+ const legacy={...original,provider:'legacy-provider',roles:{...original.roles,reasoningModel:'deepseek-v4-pro',analysisModel:'legacy-analysis'},modelLimits:{...original.modelLimits,maxAnalysisCalls:7},coaching:{...original.coaching,model:'legacy-coaching',maxCallsPer24Hours:4}};
+ await seed.saveWorkbenchSettings(legacy,null);await seed.close();
+ let runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+ try {
+  const boot=await f.call('bootstrap');const settings=boot.body.value.settings;
+  assert.equal(settings.revision,2);assert.equal(settings.value.provider,'deepseek-official');
+  for(const field of ['analysisModel','verificationModel','reasoningModel'])assert.equal(settings.value.roles[field],'deepseek-flash');
+  assert.equal(settings.value.coaching.model,'deepseek-flash');assert.equal(settings.value.modelLimits.maxAnalysisCalls,7);assert.equal(settings.value.coaching.maxCallsPer24Hours,4);
+  for(const field of ['analysisModel','verificationModel','reasoningModel']){
+   const bad=structuredClone(settings.value);bad.roles[field]='deepseek-v4-pro';
+   assert.equal((await f.call('settings.save',{expectedRevision:2,value:bad})).status,400);
+  }
+  const badCoach=structuredClone(settings.value);badCoach.coaching.model='custom-model';assert.equal((await f.call('settings.save',{expectedRevision:2,value:badCoach})).status,400);
+  const badProvider=structuredClone(settings.value);badProvider.provider='legacy-provider';assert.equal((await f.call('settings.save',{expectedRevision:2,value:badProvider})).status,400);
+  assert.equal((await f.call('bootstrap')).body.value.settings.revision,2);assert.equal(f.calls(),0);
+  await runtime.dispose();runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+  assert.equal((await f.call('bootstrap')).body.value.settings.revision,2);assert.equal(f.calls(),0);
+ }finally{await runtime.dispose();f.remove();}
+});

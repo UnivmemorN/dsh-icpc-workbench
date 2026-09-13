@@ -21,7 +21,7 @@ import { CoachingService } from '../application/coaching-service.js';
 import { ImportService } from '../application/import-service.js';
 import { PlanningService } from '../application/planning-service.js';
 import { WorkbenchService } from '../application/workbench-service.js';
-import { defaultWorkbenchSettings } from '../application/workbench-settings.js';
+import { defaultWorkbenchSettings, isFlashOnlySettings, withFlashOnlyModels } from '../application/workbench-settings.js';
 import type { PlatformAdapter } from '../application/ports.js';
 import { CURRENT_TAXONOMY, createCancellationSource, createTaxonomyIndex } from '../domain/index.js';
 import { checkHostCompatibility, type HostCompatibilityProbe } from './compatibility.js';
@@ -74,12 +74,14 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
     await store.transaction(async()=>{
       const existing=new Set((await store.listSourceInstances()).map(s=>s.id));
       await store.upsertSourceInstances(sources.filter(s=>!existing.has(s.id)));
-      if(await store.getWorkbenchSettings()===null)await store.saveWorkbenchSettings(defaultWorkbenchSettings(),null);
+      const settings=await store.getWorkbenchSettings();
+      if(settings===null)await store.saveWorkbenchSettings(defaultWorkbenchSettings(),null);
+      else if(!isFlashOnlySettings(settings.value))await store.saveWorkbenchSettings(withFlashOnlyModels(settings.value),settings.revision);
     });
     const adapters:PlatformAdapter[]=[new CodeforcesAdapter({sourceInstance:sources[0]!}),new LuoguAdapter({sourceInstance:sources[1]!})];
     const byId=new Map(adapters.map(a=>[a.sourceInstance.id,a]));
     const imports=new ImportService({store,now}),workbench=new WorkbenchService({store,taxonomy:createTaxonomyIndex(CURRENT_TAXONOMY),now,uniqueId:randomUUID});
-    const client=new DshAuditedModelClient({llm:host.llm,sessions:auditSessions},{now}),catalog=new ModelCatalog(host.llm);
+    const client=new DshAuditedModelClient({llm:host.llm,sessions:auditSessions},{now,flashOnly:true}),catalog=new ModelCatalog(host.llm);
     const coaching=new CoachingService({store,now,generator:new DshCoachingGenerator({client,now}),onInternalError:reportFailure});
     // AI planning (Sprint 11d): the accepted durable service over the same audited client, with the
     // workbench's own preparation/revalidation/save methods bound as its data port. The port names

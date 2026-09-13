@@ -274,9 +274,11 @@ export class DshAuditedModelClient {
   private readonly host: DshAuditedHost;
   private readonly now: () => string;
   private session: Promise<Session> | null = null;
+  private readonly flashOnly: boolean;
 
-  constructor(host: DshAuditedHost, options: { readonly now?: () => string } = {}) {
+  constructor(host: DshAuditedHost, options: { readonly now?: () => string; readonly flashOnly?: boolean } = {}) {
     this.host = host;
+    this.flashOnly = options.flashOnly ?? false;
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -297,6 +299,12 @@ export class DshAuditedModelClient {
         callId,
         null,
       );
+    }
+    // The installed ICPC product enforces its policy before session creation, metadata lookup or
+    // provider dispatch. Legacy jobs cannot reopen a Pro/other-model path after an upgrade.
+    if (this.flashOnly && (request.provider !== 'deepseek-official' || request.model !== 'deepseek-flash'
+      || (request.effort !== undefined && String(request.effort) !== 'max'))) {
+      return failureResult(localFailure('unsupported', 'ICPC requires DeepSeek V4.1 Flash at max for every role'), zeroUsage(), callId, null);
     }
     const refusal = validateRequest(request);
     if (refusal !== null) {

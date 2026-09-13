@@ -290,6 +290,33 @@ void test('the payload carries the ability summary and the prepared candidates o
   }
 });
 
+void test('the planner receives no solution or editorial body, only the aggregate candidate pool', async () => {
+  // A provided-answer body is material for the analysis, verification and coaching passes; planning
+  // stays aggregate-only, so the prepared pool may carry a title but never a solution body field.
+  const solutionBody = 'Pasted provided answer: keep a monotonic stack and pop while the new value is smaller.';
+  const { state, generator } = harness([{ payload: ANSWER }]);
+
+  assert.equal(valueOf<PlanGenerationOutcome>(await generator.generate(request())).draft.tasks.length, 2);
+
+  const text = userText(state.dispatch[0]);
+  for (const forbidden of [solutionBody, 'sourceId', 'solutionId', '"solutions"', 'solutionText', 'editorial']) {
+    assert.equal(text.includes(forbidden), false, `the planning prompt must not carry ${forbidden}`);
+  }
+  const payload = promptPayload(state.dispatch[0]);
+  assert.deepEqual(Object.keys(payload), ['task', 'settings', 'ability', 'weakness', 'candidates']);
+  const sent = payload.candidates as readonly Record<string, unknown>[];
+  assert.deepEqual(Object.keys(sent[0] ?? {}).sort(), [
+    'candidateId',
+    'estimatedMinutes',
+    'provisionalNote',
+    'provisionalRawTags',
+    'ratings',
+    'taxonomyIds',
+    'title',
+    'url',
+  ]);
+});
+
 // ---------------------------------------------------------------------------------------
 // Strict output, usage accounting and refusals
 // ---------------------------------------------------------------------------------------

@@ -98,6 +98,34 @@ export type ApiResponse<K extends keyof WorkbenchApiMap> = NonNullable<Workbench
 export const WORKBENCH_API_ORIGINS: readonly ('codeforces' | 'luogu')[] = ['codeforces', 'luogu'];
 
 /**
+ * Longest accepted `answer.sourceLabel` (a short attribution such as `GPT6` or `教师解析`).
+ *
+ * Declared next to the request type so the HTTP boundary and the UI form enforce exactly the same
+ * bound instead of each keeping a private copy.
+ */
+export const MAX_USER_ANSWER_LABEL_CHARS = 200;
+
+/**
+ * Longest accepted `answer.text` (the pasted answer body).
+ *
+ * Far above any real write-up, but bounded so one paste can never become an unbounded write.
+ */
+export const MAX_USER_ANSWER_TEXT_CHARS = 200_000;
+
+/**
+ * Stable id prefix of the "user-provided answer" editorial source namespace.
+ *
+ * A pasted answer is stored as a genuine `found` source with `kind: 'other'`, never as an official
+ * editorial, and this prefix keeps its deterministic namespace disjoint from the platform importers'
+ * ids and from the material-check namespace. The UI recognises such a source by this prefix to
+ * render its provenance instead of presenting it as a platform article.
+ */
+export const USER_ANSWER_SOURCE_ID_PREFIX = 'user-answer-';
+
+/** Fixed final provenance clause; caller labels cannot change the meaning of the link. */
+export const USER_ANSWER_ASSOCIATED_LINK_NOTE = '用户未提供答案出处链接；此处关联的是题目链接（仅为关联题目，并非答案出处），本插件不会抓取任何外部链接。';
+
+/**
  * Every operation this stage registers, in the order they are registered.
  *
  * `as const satisfies` proves statically that each name is a real {@link WorkbenchApiMap} key, so no
@@ -435,6 +463,21 @@ export interface ApiMaterialRefreshResult {
   readonly material: ApiMaterialDeclarationView | null;
 }
 
+/**
+ * One answer the user obtained elsewhere (GPT6, a teacher, their own write-up) and pasted in.
+ *
+ * This is a genuine user-provided source, not an official editorial and not model output: the
+ * caller supplies the attribution (`sourceLabel`), the exact body (`text`) and optionally the link
+ * it came from (`url`). The URL is attribution only and is never fetched by this plugin; when it is
+ * absent the stored problem URL is used as an *associated* problem link, and the persisted note
+ * says so. Nothing here certifies that the answer is correct.
+ */
+export interface ApiUserAnswerInput {
+  readonly sourceLabel: string;
+  readonly text: string;
+  readonly url?: string;
+}
+
 /** One supplied editorial: a found paste or an explicit, explained absence. */
 export type ApiSupplementEditorial =
   | {
@@ -451,12 +494,20 @@ export type ApiSupplementEditorial =
       readonly note: string;
     };
 
-/** Request of `material.supplement`; a client never re-imports the whole problem. */
+/**
+ * Request of `material.supplement`; a client never re-imports the whole problem.
+ *
+ * A request names a statement, an official-editorial declaration or a user-provided answer. The
+ * editorial declaration and the answer are mutually exclusive: they describe different provenance,
+ * and merging them into one source would make the stored material claim an origin it does not have.
+ */
 export interface ApiMaterialSupplementRequest {
   readonly problemKey: string;
   readonly expectedSnapshotId: string | null;
   readonly statement?: string;
   readonly editorial?: ApiSupplementEditorial;
+  /** A pasted answer; always stored as a user-provided source, never as an official editorial. */
+  readonly answer?: ApiUserAnswerInput;
 }
 
 export interface ApiMaterialSupplementResult {

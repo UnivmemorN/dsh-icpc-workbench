@@ -212,7 +212,10 @@ function problemPayload(snapshot: ProblemSnapshot): Record<string, unknown> {
  *
  * A source itself carries metadata and a body hash, never the body text, so the actual editorial
  * text sent is the text of the solutions that belong to a found source; a source that is not
- * `found` is omitted entirely.
+ * `found` is omitted entirely. A found source's stored `note` is sent with it as task data: for a
+ * pasted user answer that is where the attribution and the "user-provided, correctness not verified,
+ * linked page is only the associated problem" provenance lives, so the tutor can tell a user paste
+ * from platform material instead of presenting it as an official editorial.
  */
 function materialPayload(snapshot: ProblemSnapshot): Record<string, unknown> {
   const found = snapshot.sources.filter((source) => source.availability === 'found');
@@ -224,6 +227,7 @@ function materialPayload(snapshot: ProblemSnapshot): Record<string, unknown> {
       title: source.title,
       author: source.author,
       language: source.language,
+      note: source.note,
     })),
     solutions: snapshot.solutions
       .filter((solution) => shown.has(solution.sourceId))

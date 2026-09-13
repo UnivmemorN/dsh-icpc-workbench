@@ -38,7 +38,7 @@ export const DEFAULT_WORKBENCH_MODELS = {
   provider: 'deepseek-official',
   analysis: 'deepseek-flash',
   verification: 'deepseek-flash',
-  reasoning: 'deepseek-v4-pro',
+  reasoning: 'deepseek-flash',
   coaching: 'deepseek-flash',
 } as const;
 
@@ -364,6 +364,30 @@ export function validateWorkbenchSettings(value: unknown): WorkbenchSettings {
     platformLimits: platformValue,
     coaching: coachingValue,
   };
+}
+
+/** Fixed product policy; legacy settings remain structurally readable for immutable history. */
+export function isFlashOnlySettings(value: WorkbenchSettings): boolean {
+  return value.provider === DEFAULT_WORKBENCH_MODELS.provider
+    && value.roles.analysisModel === DEFAULT_WORKBENCH_MODELS.analysis
+    && value.roles.verificationModel === DEFAULT_WORKBENCH_MODELS.verification
+    && value.roles.reasoningModel === DEFAULT_WORKBENCH_MODELS.reasoning
+    && value.coaching.model === DEFAULT_WORKBENCH_MODELS.coaching;
+}
+
+/** Upgrade only model selection; preserve every stored quota, timeout and platform setting. */
+export function withFlashOnlyModels(value: WorkbenchSettings): WorkbenchSettings {
+  const validated = validateWorkbenchSettings(value);
+  return {...validated, provider: DEFAULT_WORKBENCH_MODELS.provider,
+    roles: {...validated.roles, analysisModel: DEFAULT_WORKBENCH_MODELS.analysis,
+      verificationModel: DEFAULT_WORKBENCH_MODELS.verification, reasoningModel: DEFAULT_WORKBENCH_MODELS.reasoning},
+    coaching: {...validated.coaching, model: DEFAULT_WORKBENCH_MODELS.coaching}};
+}
+
+/** Reject new non-Flash settings rather than silently dispatching a different model. */
+export function requireFlashOnlySettings(value: WorkbenchSettings): void {
+  invariant(isFlashOnlySettings(value), 'invalid_input',
+    'All ICPC model roles require deepseek-official/deepseek-flash (DSV4.1 Flash); other models are disabled.');
 }
 
 /** One stored settings row: the CAS revision plus the validated value. */

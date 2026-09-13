@@ -387,7 +387,7 @@ void test('prepare resolves current snapshots into spoiler-free metadata and ref
     assert.deepEqual(prepared.models, {
       analysis: 'deepseek-flash',
       verification: 'deepseek-flash',
-      reasoning: 'deepseek-v4-pro',
+      reasoning: 'deepseek-flash',
     });
     assert.deepEqual(prepared.availability, { ready: 1, absent: 1, error: 0 });
     assert.equal(prepared.jobs.length, 2);

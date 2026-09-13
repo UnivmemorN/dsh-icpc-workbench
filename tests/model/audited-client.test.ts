@@ -1059,3 +1059,30 @@ void test('synchronous output validation cannot adopt after the whole-call deadl
   assert.equal(result.error.code, 'timeout');
   assert.deepEqual(result.usage, KNOWN_USAGE);
 });
+void test('installed Flash policy rejects every other model before audit or provider IO', async () => {
+  const f = makeHost(() => scripted([]));
+  const client = new DshAuditedModelClient(f.host, {flashOnly:true});
+  for (const role of ['analysis','verification','reasoning','coaching','planning'] as const) {
+    for (const selection of [
+      {provider:'deepseek-official',model:'deepseek-v4-pro'},
+      {provider:'other-provider',model:'deepseek-flash'},
+      {provider:'deepseek-official',model:'custom-model'},
+      {provider:'deepseek-official',model:'deepseek-flash',effort:'low' as ReasoningEffortId},
+    ]) {
+      const result=await client.callJson(request({...selection,role}),value=>value);
+      assert.equal(result.ok,false);assert.deepEqual(result.usage,ZERO_USAGE);
+    }
+  }
+  assert.equal(f.dispatch.length,0);assert.equal(f.created.length,0);assert.equal(f.flushed.length,0);
+});
+
+void test('installed policy still dispatches Flash at max for every auxiliary role',async()=>{
+ const f=makeHost(()=>scripted(textChunks('{"ok":true}')));
+ const client=new DshAuditedModelClient(f.host,{flashOnly:true});
+ for(const role of ['analysis','verification','reasoning','coaching','planning'] as const){
+  const result=await client.callJson(request({provider:'deepseek-official',model:'deepseek-flash',role}),value=>value);
+  assert.equal(result.ok,true);
+ }
+ assert.equal(f.dispatch.length,5);
+ for(const d of f.dispatch){assert.equal(d.provider,'deepseek-official');assert.equal(d.model,'deepseek-flash');assert.equal(String(d.reasoningEffort),'max');}
+});

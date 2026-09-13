@@ -19,7 +19,7 @@ import { editorialSourceIdOf } from '../../src/application/import-types.js';
 import { PlatformError } from '../../src/application/platform-errors.js';
 import type { PlatformAdapter, PlatformCapabilities, TrainingStore } from '../../src/application/ports.js';
 import { defaultWorkbenchSettings } from '../../src/application/workbench-settings.js';
-import { WORKBENCH_API_OPERATIONS } from '../../src/application/workbench-api.js';
+import { WORKBENCH_API_OPERATIONS, USER_ANSWER_SOURCE_ID_PREFIX } from '../../src/application/workbench-api.js';
 import { WorkbenchService } from '../../src/application/workbench-service.js';
 import {
   CURRENT_TAXONOMY,
@@ -35,6 +35,9 @@ import {
 import { API_PREFIX, type ApiEnvelope, type ApiErrorBody } from '../../src/plugin/api-transport.js';
 import {
   registerBusinessApi,
+  userAnswerProvenanceNote,
+  userAnswerSourceIdOf,
+  USER_ANSWER_SOURCE_TITLE,
   type BusinessSourceConfig,
   type RegisterBusinessApiOptions,
 } from '../../src/plugin/business-api.js';
@@ -611,6 +614,289 @@ void test('material.supplement records an explicit absence only with its note', 
     assert.equal(absent.material.outcome, 'applied');
     assert.equal(absent.material.availability, 'absent');
     assert.equal(absent.material.freshFound, false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// material.supplement — user-provided answers (Sprint 12)
+// ---------------------------------------------------------------------------------------
+
+/** The single source of one problem's current snapshot, addressed by the deterministic id rule. */
+async function snapshotSourceOf(bench: Bench, scope: fx.Scope, sourceId: string) {
+  const head = await bench.store.getCurrentSnapshotHead(scope.problem.ref);
+  assert.ok(head, 'a stored snapshot head is required by this assertion');
+  const snapshot = await bench.store.getSnapshot(head.snapshotId);
+  assert.ok(snapshot);
+  return { head, snapshot, source: snapshot.sources.find((entry) => entry.id === sourceId) ?? null };
+}
+
+void test('a pasted answer without a URL is stored as a user-provided source with an honest note', async () => {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1234A');
+  const label = '教师解析';
+  const text = `先二分答案，再用前缀和验证。\n\n\`\`\`cpp\nint main(){ return 0; }\n\`\`\`\n${SECRET}`;
+  const sourceId = userAnswerSourceIdOf(scope.problem.ref, label, text, null);
+  await withBench({ sources: [{ instance: scope.instance }] }, async (bench) => {
+    await seedScope(bench.store, scope);
+
+    const value = await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: null,
+      answer: { sourceLabel: ` ${label} `, text },
+    });
+
+    assert.equal(value.material.freshFound, true);
+    assert.equal(value.snapshot.changed, true);
+    assert.equal(value.snapshot.version, 1);
+    assert.equal(
+      JSON.stringify(value).includes(SECRET),
+      false,
+      'a write answer must not echo the pasted body',
+    );
+    assert.equal(JSON.stringify(value).includes(text), false);
+    assert.match(sourceId, new RegExp(`^${USER_ANSWER_SOURCE_ID_PREFIX}[0-9a-f]{32}$`));
+
+    const stored = await snapshotSourceOf(bench, scope, sourceId);
+    const source = stored.source;
+    assert.ok(source, 'the paste is stored under its deterministic user-answer id');
+    assert.equal(source.kind, 'other', 'a paste is never an official editorial');
+    assert.equal(source.availability, 'found');
+    assert.equal(source.title, `${USER_ANSWER_SOURCE_TITLE}（${label}）`);
+    assert.equal(
+      source.url,
+      scope.problem.url,
+      'with no supplied URL the stored problem URL is used, and only as the associated problem link',
+    );
+    assert.equal(source.note, userAnswerProvenanceNote(label, true));
+    assert.match(source.note ?? '', /用户提供解析/);
+    assert.match(source.note ?? '', /非官方题解/);
+    assert.match(source.note ?? '', /正确性未经核验/);
+    assert.match(source.note ?? '', /用户未提供答案出处链接/);
+    assert.match(source.note ?? '', /并非答案出处/);
+    assert.equal(stored.snapshot.solutions.length, 1);
+    assert.equal(stored.snapshot.solutions[0]?.text, text, 'the exact pasted text is the solution body');
+    assert.equal(stored.snapshot.solutions[0]?.sourceId, sourceId);
+    assert.equal(stored.snapshot.solutions[0]?.ordinal, 0);
+
+    // The stored problem keeps its own hidden metadata; a paste is not a re-import.
+    const problem = await bench.store.getProblem(scope.problem.key);
+    assert.deepEqual(problem?.rawTags.map((tag) => tag.raw), ['data structures', 'segment tree']);
+    assert.equal(problem?.title, scope.problem.title);
+    assert.equal(problem?.statement, scope.problem.statement);
+  });
+});
+
+void test('a pasted answer with a supplied URL stores that citation and never fetches it', async () => {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1234A');
+  const label = 'GPT6';
+  const citation = 'https://example.org/answers/1234A';
+  const text = 'GPT6 的解析正文：用单调栈维护下降序列。';
+  await withBench({ sources: [{ instance: scope.instance }] }, async (bench) => {
+    await seedScope(bench.store, scope);
+
+    const value = await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: null,
+      answer: { sourceLabel: label, url: `${citation} `, text },
+    });
+
+    const sourceId = userAnswerSourceIdOf(scope.problem.ref, label, text, citation);
+    assert.equal(userAnswerSourceIdOf(scope.problem.ref, label, text, citation), sourceId);
+    const stored = await snapshotSourceOf(bench, scope, sourceId);
+    assert.ok(stored.source);
+    assert.equal(stored.source.url, citation, 'the supplied citation is the stored link');
+    assert.equal(stored.source.kind, 'other');
+    assert.equal(stored.source.note, userAnswerProvenanceNote(label, false));
+    assert.match(stored.source.note ?? '', /来源链接由用户提供，仅作标注/);
+    assert.equal(
+      (stored.source.note ?? '').includes('用户未提供答案出处链接'),
+      false,
+      'a supplied citation keeps the associated-problem wording out of the note',
+    );
+    assert.equal(value.snapshot.version, 1);
+  });
+});
+
+void test('a repeated paste reuses its snapshot while a different answer creates a new one', async () => {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1234A');
+  const firstLabel = 'GPT6';
+  const firstText = '第一条粘贴内容：按右端点排序后贪心。';
+  const secondLabel = '自己整理';
+  const secondText = '第二条粘贴内容：把区间离散化后跑最短路。';
+  await withBench({ sources: [{ instance: scope.instance }] }, async (bench) => {
+    await seedScope(bench.store, scope);
+    const platformUrl = 'https://codeforces.com/blog/entry/9001';
+    const platformSourceId = editorialSourceIdOf(scope.problem.ref, new URL(platformUrl).toString());
+    const platformSaved = await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: null,
+      editorial: { status: 'found', url: platformUrl, title: '平台题解', text: 'platform article body' },
+    });
+    await ok(bench, 'review.tag', {
+      problemKey: scope.problem.key,
+      taxonomyId: STACK,
+      action: 'accept',
+      note: 'manual decision before the paste',
+    });
+    const first = await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: platformSaved.snapshot.snapshotId,
+      answer: { sourceLabel: firstLabel, text: firstText },
+    });
+    const firstSourceId = userAnswerSourceIdOf(scope.problem.ref, firstLabel, firstText, null);
+
+    // An identical paste (timestamps alone differ) is the same source: the semantic content did not
+    // change, so the previous snapshot and its analyses stay valid and nothing is rewritten.
+    bench.clock.value = new Date(Date.parse(bench.clock.value)+60_000).toISOString();
+    const repeat = await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: first.snapshot.snapshotId,
+      answer: { sourceLabel: firstLabel, text: firstText },
+    });
+    assert.equal(repeat.snapshot.changed, false, 'an identical paste reuses the snapshot');
+    assert.equal(repeat.snapshot.snapshotId, first.snapshot.snapshotId);
+    assert.equal(repeat.snapshot.version, first.snapshot.version);
+    assert.equal(repeat.snapshot.contentHash, first.snapshot.contentHash);
+
+    const before = await snapshotSourceOf(bench, scope, firstSourceId);
+    assert.equal(before.snapshot.solutions.length, 2, 'the platform article and the first paste both survive');
+
+    const second = await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: first.snapshot.snapshotId,
+      answer: { sourceLabel: secondLabel, text: secondText },
+    });
+    const secondSourceId = userAnswerSourceIdOf(scope.problem.ref, secondLabel, secondText, null);
+    assert.notEqual(secondSourceId, firstSourceId);
+    assert.equal(second.snapshot.changed, true);
+    assert.equal(second.snapshot.version, first.snapshot.version + 1);
+
+    const after = await snapshotSourceOf(bench, scope, secondSourceId);
+    assert.equal(after.source?.title, `${USER_ANSWER_SOURCE_TITLE}（${secondLabel}）`);
+    assert.ok(after.snapshot.sources.some((entry) => entry.id === firstSourceId), 'the first paste is preserved');
+    assert.ok(after.snapshot.sources.some((entry) => entry.id === platformSourceId), 'the platform source is preserved');
+    assert.equal(after.snapshot.solutions.length, 3);
+    assert.equal(after.snapshot.solutions.find((solution) => solution.sourceId === firstSourceId)?.text, firstText);
+    assert.equal(after.snapshot.solutions.find((solution) => solution.sourceId === secondSourceId)?.text, secondText);
+
+    // A stale head is refused atomically: neither the older nor the newer paste is rewritten.
+    const stale = await refused(
+      bench,
+      'material.supplement',
+      {
+        problemKey: scope.problem.key,
+        expectedSnapshotId: first.snapshot.snapshotId,
+        answer: { sourceLabel: '过期粘贴', text: '第三条内容不会被写入。' },
+      },
+      409,
+    );
+    assert.equal(failureOf(stale).code, 'conflict');
+    const unchanged = await snapshotSourceOf(bench, scope, secondSourceId);
+    assert.equal(unchanged.head.snapshotId, second.snapshot.snapshotId);
+    assert.ok(
+      unchanged.snapshot.sources.every((entry) => entry.title !== `${USER_ANSWER_SOURCE_TITLE}（过期粘贴）`),
+      'a stale paste writes nothing',
+    );
+
+    // A user paste is not an automatic tag adoption: the raw tags and the one manual decision stand.
+    const problem = await bench.store.getProblem(scope.problem.key);
+    assert.deepEqual(problem?.rawTags.map((tag) => tag.raw), ['data structures', 'segment tree']);
+    const decisions = await bench.store.listTagDecisions(scope.problem.key);
+    assert.deepEqual(decisions.filter((decision) => decision.taxonomyId === STACK).map((decision) => decision.status), ['accepted']);
+    assert.deepEqual(
+      decisions.map((decision) => (decision.taxonomyId === STACK ? decision.origin : null)).filter((origin) => origin !== null),
+      ['manual'],
+      'no AI decision was adopted by pasting',
+    );
+  });
+});
+
+void test('a paste refills the same snapshot instead of replacing an existing article of the same id', async () => {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1234A');
+  const text = '同一条粘贴内容：先排序再去重。';
+  const sourceId = userAnswerSourceIdOf(scope.problem.ref, 'GPT6', text, null);
+  await withBench({ sources: [{ instance: scope.instance }] }, async (bench) => {
+    await seedScope(bench.store, scope);
+
+    await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: null,
+      statement: '手工补充的题面。',
+      answer: { sourceLabel: 'GPT6', text },
+    });
+    const once = await snapshotSourceOf(bench, scope, sourceId);
+    assert.equal(once.snapshot.solutions.length, 1);
+    assert.equal(once.snapshot.sources.filter((entry) => entry.id === sourceId).length, 1);
+    assert.equal((await bench.store.getProblem(scope.problem.key))?.statement, '手工补充的题面。');
+
+    // A statement may accompany a paste additively, and the merge stays keyed by the source id.
+    const again = await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: once.head.snapshotId,
+      statement: '手工补充的题面（第二版）。',
+      answer: { sourceLabel: 'GPT6', text },
+    });
+    const twice = await snapshotSourceOf(bench, scope, sourceId);
+    assert.equal(twice.snapshot.sources.filter((entry) => entry.id === sourceId).length, 1);
+    assert.equal(twice.snapshot.solutions.length, 1, 'the same paste keeps exactly one solution');
+    assert.equal(again.material.sources, 1);
+    assert.equal((await bench.store.getProblem(scope.problem.key))?.statement, '手工补充的题面（第二版）。');
+  });
+});
+
+void test('a malformed, blank, oversized or ambiguous answer is refused and writes nothing', async () => {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1234A');
+  await withBench({ sources: [{ instance: scope.instance }] }, async (bench) => {
+    await seedScope(bench.store, scope);
+    const base = { problemKey: scope.problem.key, expectedSnapshotId: null };
+    const editorial = { status: 'found', url: 'https://codeforces.com/blog/entry/1', title: 'T', text: 'body' };
+    const cases: readonly unknown[] = [
+      { ...base },
+      { ...base, answer: { sourceLabel: '   ', text: '正文' } },
+      { ...base, answer: { sourceLabel: 'GPT6', text: '   ' } },
+      { ...base, answer: { sourceLabel: 'x'.repeat(201), text: '正文' } },
+      { ...base, answer: { sourceLabel: 'GPT6', text: 'x'.repeat(200_001) } },
+      { ...base, answer: { sourceLabel: 'GPT6', text: '正文', url: 'ftp://example.org/a' } },
+      { ...base, answer: { sourceLabel: 'GPT6', text: '正文', url: 'https://user:pass@example.org/a' } },
+      { ...base, answer: { sourceLabel: 'GPT6', text: '正文', unknown: true } },
+      { ...base, answer: { text: '正文' } },
+      { ...base, answer: { sourceLabel: 'GPT6', text: '正文' }, editorial },
+      { ...base, answer: 'not an object' },
+      { ...base, answer: { sourceLabel: 'GPT6', text: 42 } },
+      { ...base, answer: { sourceLabel: 'GPT6', text: '正文' }, extra: 1 },
+    ];
+    for (const body of cases) {
+      const parsed = await refused(bench, 'material.supplement', body, 400);
+      assert.equal(failureOf(parsed).code, 'invalid_input', `${JSON.stringify(body).slice(0, 120)} must be refused`);
+    }
+    const head = await bench.store.getCurrentSnapshotHead(scope.problem.ref);
+    assert.equal(head, null, 'a refused paste never creates a snapshot');
+    assert.deepEqual(await bench.store.listTagDecisions(scope.problem.key), []);
+  });
+});
+
+void test('a withheld spoiler response carries no pasted text and no provenance detail', async () => {
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1234A');
+  const text = `这段粘贴内容在未揭示时不得出现 ${SECRET}`;
+  await withBench({ sources: [{ instance: scope.instance }] }, async (bench) => {
+    await seedScope(bench.store, scope);
+    await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: null,
+      answer: { sourceLabel: '教师解析', text },
+    });
+
+    const hidden = await ok(bench, 'problem.detail', { problemKey: scope.problem.key, accountId: null });
+    assert.equal(hidden.spoilersVisible, false);
+    assert.ok(hidden.snapshot, 'the snapshot head metadata stays visible');
+    const serialized = JSON.stringify(hidden);
+    assert.equal(serialized.includes(SECRET), false, 'no pasted body may travel while withheld');
+    assert.equal(serialized.includes('用户提供解析'), false, 'no provenance note may travel while withheld');
+    assert.equal(serialized.includes('user-answer-'), false, 'no user-answer source id may travel while withheld');
+    assert.equal(Object.hasOwn(hidden.snapshot, 'sources'), false);
+    assert.equal(Object.hasOwn(hidden.snapshot, 'solutions'), false);
+
+    const hiddenList = await ok(bench, 'problem.list', { limit: 10 });
+    assert.equal(JSON.stringify(hiddenList).includes(SECRET), false);
   });
 });
 

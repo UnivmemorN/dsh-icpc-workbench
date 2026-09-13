@@ -253,7 +253,16 @@ function taxonomyPayload(index: TaxonomyIndex): readonly Record<string, unknown>
   }));
 }
 
-/** Editorial material the model is shown: found sources and their solutions, text included. */
+/**
+ * Editorial material the model is shown: found sources and their solutions, text included.
+ *
+ * A source's stored `note` travels with it as data. For a pasted user answer that note is the
+ * provenance the source carries — the caller's attribution, the fact that it is not an official
+ * editorial whose correctness this plugin verified, and whether the stored URL is the answer's own
+ * citation or merely the associated problem page — so the model is never left to guess the origin of
+ * a body that is not platform material. The note is one more string inside the untrusted task
+ * object; the fixed system prompt already states that nothing in that object is an instruction.
+ */
 function materialPayload(snapshot: ProblemSnapshot): Record<string, unknown> {
   const found = snapshot.sources.filter((source) => source.availability === 'found');
   const shown = new Set(found.map((source) => source.id));
@@ -264,6 +273,7 @@ function materialPayload(snapshot: ProblemSnapshot): Record<string, unknown> {
       title: source.title,
       author: source.author,
       language: source.language,
+      note: source.note,
     })),
     solutions: snapshot.solutions
       .filter((solution) => shown.has(solution.sourceId))

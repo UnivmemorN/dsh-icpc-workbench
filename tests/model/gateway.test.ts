@@ -48,6 +48,11 @@ import {
   type ReasonRequest,
   type VerifyRequest,
 } from '../../src/application/ports.js';
+import {
+  USER_ANSWER_SOURCE_TITLE,
+  userAnswerProvenanceNote,
+  userAnswerSourceIdOf,
+} from '../../src/plugin/business-api.js';
 
 const AT = '2026-09-12T08:00:00.000Z';
 const CHECKED_AT = '2026-09-12T08:30:00.000Z';
@@ -161,6 +166,39 @@ const TAXONOMY: Taxonomy = createTaxonomy({
 const SNAPSHOT = editorialSnapshot();
 const ABSENT_SNAPSHOT = unavailableSnapshot('absent');
 const LIMITS: ModelLimits = { ...DEFAULT_MODEL_LIMITS, requestTimeoutMs: 5_000 };
+/** A user paste as the workbench stores it: `kind: 'other'`, a caller label and an honest note. */
+const PASTED_LABEL = 'GPT6';
+const PASTED_TEXT = 'Pasted answer body: keep a monotonic stack and pop while the new value is smaller.';
+const PASTED_NOTE = userAnswerProvenanceNote(PASTED_LABEL, true);
+
+/** One snapshot whose only found source is a pasted user answer, exactly as the API persists it. */
+function pastedAnswerSnapshot(): ProblemSnapshot {
+  const sourceId = userAnswerSourceIdOf(REF, PASTED_LABEL, PASTED_TEXT, null);
+  const source = createEditorialSource({
+    id: sourceId,
+    kind: 'other',
+    url: 'https://codeforces.com/problemset/problem/1234/A',
+    title: `${USER_ANSWER_SOURCE_TITLE}（${PASTED_LABEL}）`,
+    availability: 'found',
+    retrievedAt: AT,
+    text: PASTED_TEXT,
+    note: PASTED_NOTE,
+  });
+  return createProblemSnapshot({
+    problem: problemWith(PROBLEM_STATEMENT),
+    sources: [source],
+    solutions: [
+      createEditorialSolution({
+        solutionId: `${sourceId}-solution-0`,
+        sourceId,
+        ordinal: 0,
+        title: source.title,
+        text: PASTED_TEXT,
+      }),
+    ],
+    capturedAt: AT,
+  });
+}
 
 function roles(overrides: Partial<ModelRoleSettings> = {}): ModelRoleSettings {
   return {
@@ -357,7 +395,13 @@ void test('a valid analysis answer is adopted with local identity and the exact 
   assert.deepEqual(Object.keys(payload), ['task', 'promptVersion', 'problem', 'taxonomy', 'editorial']);
   assert.equal(payload.task, 'analyze_missing_algorithm_tags');
   assert.equal(payload.promptVersion, 'analysis-v3|taxonomy:test.1');
-  const editorial = payload.editorial as { solutions: readonly { text: string }[] };
+  const editorial = payload.editorial as {
+    sources: readonly { id: string; kind: string; note: string | null }[];
+    solutions: readonly { text: string }[];
+  };
+  assert.deepEqual(editorial.sources.map((source) => source.id), ['editorial-1']);
+  assert.equal(editorial.sources[0]?.kind, 'editorial');
+  assert.equal(editorial.sources[0]?.note, null, 'a source without a stored note sends an explicit null');
   assert.equal(editorial.solutions[0]?.text, SEGMENT_SOLUTION);
   assert.equal(editorial.solutions[1]?.text, GREEDY_SOLUTION);
   assert.match(userText(dispatched), /"rawTags":\s*\[\s*"data structures",\s*"segment tree"\s*\]/);
@@ -888,6 +932,37 @@ void test('task material cannot override the system prompt or smuggle instructio
   assert.match(REASON_SYSTEM_PROMPT, /untrusted task data/i);
 });
 
+void test('a pasted user answer reaches the model with its exact text and provenance note as data', async () => {
+  const snapshot = pastedAnswerSnapshot();
+  const { state, gateway } = harness([analyzePayload([])]);
+
+  await gateway.analyze(analyzeRequest({ snapshot }));
+
+  const dispatched = state.dispatch[0];
+  assert.ok(dispatched);
+  // The exact edited body is what the paid call carries, byte for byte.
+  const displayed = userText(dispatched);
+  assert.equal(displayed.includes(PASTED_TEXT), true);
+  const payload = promptPayload(dispatched);
+  const editorial = payload.editorial as {
+    sources: readonly { id: string; kind: string; title: string; note: string | null }[];
+    solutions: readonly { text: string }[];
+  };
+  assert.equal(editorial.sources[0]?.kind, 'other', 'a paste is never presented as a platform editorial');
+  assert.equal(editorial.sources[0]?.title, `${USER_ANSWER_SOURCE_TITLE}（${PASTED_LABEL}）`);
+  assert.equal(editorial.sources[0]?.note, PASTED_NOTE);
+  assert.equal(editorial.solutions[0]?.text, PASTED_TEXT, 'the provided answer body is the reference text');
+
+  // Provenance, not certification: the model is told what the source is, and the fixed system
+  // prompt still treats the whole task object as data rather than instructions.
+  assert.match(editorial.sources[0]?.note ?? '', /用户提供解析/);
+  assert.match(editorial.sources[0]?.note ?? '', /非官方题解/);
+  assert.match(editorial.sources[0]?.note ?? '', /正确性未经核验/);
+  assert.match(editorial.sources[0]?.note ?? '', /用户未提供答案出处链接/);
+  assert.equal(dispatched.system, ANALYZE_SYSTEM_PROMPT);
+  assert.equal(dispatched.system.includes(PASTED_TEXT), false);
+});
+
 void test('the analyze prompt carries no non-material problem source', async () => {
   const { state, gateway } = harness([analyzePayload([])]);
   await gateway.analyze(analyzeRequest());
@@ -921,4 +996,13 @@ void test('a suggestion list at the declared maximum is still bounded strictly',
   const tooMany = Array.from({ length: MAX_ANALYSIS_SUGGESTIONS + 1 }, () => analyzeEntry());
   const { gateway } = harness([analyzePayload(tooMany)]);
   assert.equal(failureOf(await gateway.analyze(analyzeRequest())).error.code, 'invalid_output');
+});
+
+void test('independent verification reads the provided answer even with no first-pass suggestions',async()=>{
+ const snapshot=pastedAnswerSnapshot();const {state,gateway}=harness([{verifications:[],missingSuggestions:[]}]);
+ const result=await gateway.verify(verifyRequest([],{snapshot}));assert.equal(result.ok,true);
+ const dispatched=state.dispatch[0];assert.ok(dispatched);assert.equal(dispatched.system,VERIFY_SYSTEM_PROMPT);
+ const editorial=promptPayload(dispatched).editorial as {sources:{note:string}[];solutions:{text:string}[]};
+ assert.equal(editorial.solutions[0]?.text,PASTED_TEXT);assert.equal(editorial.sources[0]?.note,PASTED_NOTE);
+ assert.equal(dispatched.system.includes(PASTED_TEXT),false);
 });

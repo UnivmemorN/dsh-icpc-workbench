@@ -10,13 +10,12 @@ export function Settings(){
  const {boot,refresh}=useWorkbench(),[draft,setDraft]=useState(()=>structuredClone(boot.settings.value)),[backup,setBackup]=useState<string|null>(null),action=useAction();
  useEffect(()=>setDraft(structuredClone(boot.settings.value)),[boot.settings.revision]);
  const catalog=useRequest('model.catalog',{provider:draft.provider});let valid=true;try{validateWorkbenchSettings(draft);}catch(error){valid=false;}
- const modelFields:[string,string,string][]=[['roles.analysisModel','题解标签分析',draft.roles.analysisModel],['roles.verificationModel','证据复核',draft.roles.verificationModel],['roles.reasoningModel','确认无题解时推理',draft.roles.reasoningModel],['coaching.model','逐级提示',draft.coaching.model]];
- const providers=catalog.data?.providers??boot.catalog.providers;
+ const modelFields:[string,string,string][]=[['roles.analysisModel','题解标签分析 / 训练计划',draft.roles.analysisModel],['roles.verificationModel','证据复核',draft.roles.verificationModel],['roles.reasoningModel','确认无题解时推理',draft.roles.reasoningModel],['coaching.model','逐级提示',draft.coaching.model]];
  return <><div className="icpc-page-heading"><div><p className="icpc-eyebrow">SETTINGS</p><h1>模型与训练设置</h1><p>更改设置后，新任务才会采用新的版本。当前版本 {boot.settings.revision}。</p></div></div>
  <ErrorNotice error={action.error??catalog.error}/>
- <Panel title="模型角色"><div className="icpc-form-grid"><label>提供方<select value={draft.provider} onChange={e=>setDraft({...draft,provider:e.target.value})}>{!providers.some(p=>p.id===draft.provider)&&<option value={draft.provider}>{draft.provider}（未注册）</option>}{providers.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
- {modelFields.map(([path,label,value])=><label key={path}>{label}<input value={value} list="icpc-model-options" onChange={e=>setDraft(setPath(draft,path,e.target.value))}/></label>)}<datalist id="icpc-model-options">{catalog.data?.models.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}</datalist></div>
- <Notice>推理强度固定为 max。模型目录仅供参考；可输入自定义模型 ID。只有明确确认无题解且有完整题面，才会调用推理角色。</Notice>
+ <Panel title="模型角色"><Notice>所有任务统一使用 DeepSeek V4.1 Flash（DSV4.1F），强度 max：标签分析、独立复核、无题解推理、逐级提示与训练计划均采用同一模型。模型不可用时会报告失败，不会改用 Pro 或其他模型。</Notice><div className="icpc-form-grid"><label>提供方<input value={draft.provider} readOnly/></label>
+ {modelFields.map(([path,label,value])=><label key={path}>{label}<input value={value} readOnly/></label>)}</div>
+ <p className="icpc-muted">旧配置会在升级时统一到 Flash，并保留原有额度与超时。确认无题解时仍可推理；也可以在题目详情粘贴从 GPT6、教师等处取得的解析。</p>
  {(catalog.data?.diagnostics??[]).map((d,i)=><Notice key={i}>{d.message}</Notice>)}{boot.modelDiagnostics.map((d,i)=><Notice key={'role'+i}>{d.role}：{d.message}</Notice>)}
  </Panel>
  <Panel title="调用额度与超时"><div className="icpc-form-grid">{numbers(draft).map(([path,value])=><label key={path}>{labels[path]??path}<input type="number" step={path==='roles.temperature'?'0.1':'1'} value={Number.isFinite(value)?value:''} onChange={e=>setDraft(setPath(draft,path,e.target.value===''?NaN:Number(e.target.value)))}/></label>)}</div><Notice>重试也占用调用额度。未知费用不会记为零；修改设置不会清除正在使用的额度。提示与计划使用各自独立的 24 小时计数器，但共用同一个上限值：计划调用不会消耗提示额度，反之亦然。Codeforces 请求至少间隔 2 秒。</Notice></Panel>

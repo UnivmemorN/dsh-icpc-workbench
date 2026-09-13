@@ -30,10 +30,13 @@ import type { HostConnectionFetch } from '@deepseek-ai/dsh-client-connection';
 import {
   DomainError,
   assertIsoTimestamp,
+  contentHashOf,
   createEditorialSolution,
   createEditorialSource,
+  invariant,
   problemKey as canonicalProblemKey,
   type CancellationToken,
+  type NormalizedProblem,
   type ProblemRef,
   type SourceInstance,
   type SourcePlatform,
@@ -58,6 +61,10 @@ import type {
   WorkbenchSettingsRecord,
 } from '../application/workbench-settings.js';
 import {
+  MAX_USER_ANSWER_LABEL_CHARS,
+  MAX_USER_ANSWER_TEXT_CHARS,
+  USER_ANSWER_SOURCE_ID_PREFIX,
+  USER_ANSWER_ASSOCIATED_LINK_NOTE,
   WORKBENCH_API_OPERATIONS,
   type ApiAccountCreateResult,
   type ApiAccountView,
@@ -78,6 +85,7 @@ import {
   type ApiSyncCheckpointView,
   type ApiSyncPageRequest,
   type ApiSyncPageResult,
+  type ApiUserAnswerInput,
   type WorkbenchApiInput,
   type WorkbenchApiMap,
   type WorkbenchApiOperation,
@@ -1096,6 +1104,21 @@ function editorialStatusView(report: RefreshMaterialReport): ApiEditorialStatusV
 
 /** The stored reference of one problem key; an unknown key is a not-found, never an empty row. */
 async function storedRef(context: ApiContext, problemKey: string, token: CancellationToken): Promise<ProblemRef> {
+  return (await storedProblem(context, problemKey, token)).ref;
+}
+
+/**
+ * The stored problem row of one key.
+ *
+ * A caller that needs more than the reference (the user-answer path needs the stored problem URL as
+ * the associated link) reads it here; the canonical-key check stays in one place, so a stored row
+ * that does not match the requested key can never be used by one caller and refused by another.
+ */
+async function storedProblem(
+  context: ApiContext,
+  problemKey: string,
+  token: CancellationToken,
+): Promise<NormalizedProblem> {
   const problem = await context.store.getProblem(problemKey);
   token.throwIfCancelled();
   if (problem === null) {
@@ -1109,7 +1132,7 @@ async function storedRef(context: ApiContext, problemKey: string, token: Cancell
       stored: problem.key,
     });
   }
-  return problem.ref;
+  return problem;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1117,12 +1140,15 @@ async function storedRef(context: ApiContext, problemKey: string, token: Cancell
 // ---------------------------------------------------------------------------------------
 
 /**
- * Add a manually supplied statement and/or editorial declaration to a stored problem.
+ * Add a manually supplied statement, official-editorial declaration or pasted user answer to a
+ * stored problem.
  *
  * The client never re-imports the problem: the stored row keeps its title, URL, ratings and raw
  * platform tags, and only the fields this request names are replaced. A supplied article becomes one
  * `solution` source addressed by the stable id derived from the problem and its URL, so editing the
- * same URL replaces exactly that source and leaves other articles intact.
+ * same URL replaces exactly that source and leaves other articles intact. A pasted answer becomes a
+ * user-provided source of its own namespace, so it never overwrites a platform article and previous
+ * pastes stay in the snapshot.
  */
 async function supplementMaterial(
   context: ApiContext,
@@ -1130,8 +1156,8 @@ async function supplementMaterial(
   token: CancellationToken,
 ): Promise<ApiMaterialSupplementResult> {
   requireCallToken(token);
-  const ref = await storedRef(context, input.problemKey, token);
-  const material = input.editorial === undefined ? null : supplementInput(context, ref, input.editorial);
+  const problem = await storedProblem(context, input.problemKey, token);
+  const material = supplementDeclaration(context, problem, input);
   const report: SupplementMaterialReport = await context.imports.supplementMaterial(
     {
       problemKey: input.problemKey,
@@ -1201,6 +1227,149 @@ function supplementInput(
     title: editorial.title,
     text: editorial.text,
     language,
+  });
+  return {
+    problemKey,
+    result: { status: 'found', sources: [source], solutions: [solution], retrievedAt },
+    url: null,
+    title: null,
+    note: null,
+  };
+}
+
+/**
+ * The one material declaration a supplement request describes, or `null` for a statement-only write.
+ *
+ * An official-editorial declaration and a pasted user answer are mutually exclusive: they carry
+ * different provenance, and one stored source must not claim an origin the request never settled.
+ * The route validator already refuses both at once; this second check keeps a programmatic caller
+ * from bypassing that decision.
+ */
+function supplementDeclaration(
+  context: ApiContext,
+  problem: NormalizedProblem,
+  input: ApiMaterialSupplementRequest,
+): ManualMaterialInput | null {
+  if (input.editorial !== undefined && input.answer !== undefined) {
+    throw new ApiTransportError(
+      'invalid_input',
+      'a supplement carries either an editorial declaration or a user-provided answer, never both',
+    );
+  }
+  if (input.answer !== undefined) {
+    return userAnswerInput(context, problem, input.answer);
+  }
+  return input.editorial === undefined ? null : supplementInput(context, problem.ref, input.editorial);
+}
+
+/** Title of every user-provided answer source; the caller's label is appended in parentheses. */
+export const USER_ANSWER_SOURCE_TITLE = '用户提供解析';
+
+/**
+ * Deterministic id of one user-provided answer source.
+ *
+ * Derived from the canonical problem key, the trimmed source label, the exact pasted text and the
+ * optional citation (the validated URL — never the associated problem link used as a fallback).
+ * Identical content therefore addresses the same source, so re-pasting reuses the snapshot and its
+ * hash, while a different label, text or citation creates a new source and leaves the previous one
+ * in place. The {@link USER_ANSWER_SOURCE_ID_PREFIX} namespace stays disjoint from the platform
+ * importers' ids and from the material-check namespace; the digest is lowercase hex, which the
+ * domain's id-part rule accepts.
+ */
+export function userAnswerSourceIdOf(
+  ref: ProblemRef,
+  sourceLabel: string,
+  text: string,
+  citation: string | null,
+): string {
+  const digest = contentHashOf({ problemKey: canonicalProblemKey(ref), sourceLabel, text, citation });
+  return `${USER_ANSWER_SOURCE_ID_PREFIX}${digest.slice(0, 32)}`;
+}
+
+/**
+ * Provenance note stored on a user-provided answer source.
+ *
+ * It names the caller's label, states that this is a user paste rather than an official editorial
+ * whose correctness the plugin verified, and — when the caller supplied no URL — that the linked
+ * page is only the associated problem, not the answer's origin. The note travels to the reveal view
+ * and to the model prompts as data, so neither has to guess what the source is.
+ */
+export function userAnswerProvenanceNote(sourceLabel: string, associatedProblemLink: boolean): string {
+  return [
+    '用户提供解析（非官方题解；本插件未抓取、未核验其内容，正确性未经核验）',
+    `来源标注：${sourceLabel}`,
+    associatedProblemLink
+      ? USER_ANSWER_ASSOCIATED_LINK_NOTE
+      : '来源链接由用户提供，仅作标注；本插件不会抓取该链接。',
+  ].join('；');
+}
+
+/**
+ * Build the material declaration of one pasted user answer.
+ *
+ * The declaration is an ordinary `found` source, so the accepted supplement, merge, snapshot and
+ * analysis paths need no new case; what makes it honest is its content: an id in the user-answer
+ * namespace, `kind: 'other'`, an unmistakable title/note naming the caller's label and the fact
+ * that correctness is not certified, and the exact pasted body as the solution text. The URL is
+ * attribution only — a supplied one is validated and stored, and is never fetched; without one the
+ * stored problem URL is used as an *associated problem link* and the note says so.
+ */
+function userAnswerInput(
+  context: ApiContext,
+  problem: NormalizedProblem,
+  answer: ApiUserAnswerInput,
+): ManualMaterialInput {
+  const label = answer.sourceLabel.trim();
+  invariant(
+    label.length > 0 && label.length <= MAX_USER_ANSWER_LABEL_CHARS,
+    'invalid_input',
+    `answer.sourceLabel must be a non-blank string of at most ${MAX_USER_ANSWER_LABEL_CHARS} characters`,
+    { reason: 'invalid_source_label' },
+  );
+  const text = answer.text;
+  invariant(typeof text === 'string' && text.trim().length > 0, 'invalid_input', 'answer.text must not be blank', {
+    reason: 'blank_answer_text',
+  });
+  invariant(
+    text.length <= MAX_USER_ANSWER_TEXT_CHARS,
+    'invalid_input',
+    `answer.text must be at most ${MAX_USER_ANSWER_TEXT_CHARS} characters`,
+    { reason: 'answer_text_too_long' },
+  );
+  // One URL rule for the whole module: the manual parser's own check (absolute http(s), no userinfo).
+  const citation = answer.url === undefined ? null : manualAttributionUrl(answer.url);
+  invariant(
+    answer.url === undefined || citation !== null,
+    'invalid_url',
+    'answer.url must be an absolute http(s) URL without credentials',
+    { reason: 'unsafe_answer_url' },
+  );
+  // Only the stored problem URL may stand in for the missing citation, and only as the associated
+  // problem link the note describes — an unsafe stored URL is refused instead of being stored.
+  const url = citation ?? manualAttributionUrl(problem.url);
+  invariant(url !== null, 'invalid_url', 'the stored problem URL is not an absolute http(s) URL', {
+    reason: 'unsafe_problem_url',
+  });
+  const problemKey = canonicalProblemKey(problem.ref);
+  const sourceId = userAnswerSourceIdOf(problem.ref, label, text, citation);
+  const retrievedAt = assertIsoTimestamp('now', context.now());
+  const title = `${USER_ANSWER_SOURCE_TITLE}（${label}）`;
+  const source = createEditorialSource({
+    id: sourceId,
+    kind: 'other',
+    url,
+    title,
+    availability: 'found',
+    retrievedAt,
+    text,
+    note: userAnswerProvenanceNote(label, citation === null),
+  });
+  const solution = createEditorialSolution({
+    solutionId: `${sourceId}-solution-0`,
+    sourceId,
+    ordinal: 0,
+    title,
+    text,
   });
   return {
     problemKey,

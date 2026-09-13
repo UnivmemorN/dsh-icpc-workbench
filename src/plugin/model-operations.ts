@@ -172,6 +172,7 @@ import type { WorkbenchPlanView } from '../application/workbench-types.js';
 import {
   defaultWorkbenchSettings,
   validateWorkbenchSettings,
+  requireFlashOnlySettings,
   type SettingsStore,
   type WorkbenchSettings,
   type WorkbenchSettingsRecord,
@@ -462,6 +463,7 @@ export class ModelOperations {
       let value: WorkbenchSettings;
       try {
         value = validateWorkbenchSettings(request.value);
+        requireFlashOnlySettings(value);
       } catch (error) {
         throw new ModelOperationError('invalid_input', 'the workbench settings are not a valid configuration', {
           cause: error,
@@ -1423,6 +1425,7 @@ export class ModelOperations {
     settings: WorkbenchSettings,
     token: CancellationToken,
   ): Promise<readonly ModelValidationDiagnostic[]> {
+    requireFlashOnlySettings(settings);
     const diagnostics = normalizeDiagnostics(await this.validateModels(settings, token));
     const errors = diagnostics.filter((entry) => entry.severity === 'error');
     if (errors.length > 0) {

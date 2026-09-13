@@ -46,6 +46,8 @@ import {
   MAX_SUPPLEMENT_STATEMENT_CHARS,
 } from '../application/import-types.js';
 import {
+  MAX_USER_ANSWER_LABEL_CHARS,
+  MAX_USER_ANSWER_TEXT_CHARS,
   WORKBENCH_API_ORIGINS,
   type ApiAccountCreateRequest,
   type ApiImportRequest,
@@ -68,6 +70,7 @@ import {
   type ApiReviewTagRequest,
   type ApiSupplementEditorial,
   type ApiSyncPageRequest,
+  type ApiUserAnswerInput,
   type ApiWeaknessRequest,
 } from '../application/workbench-api.js';
 import { ApiTransportError, type ApiErrorCode } from './api-transport.js';
@@ -517,18 +520,32 @@ export function validateMaterialRefresh(value: unknown): ApiMaterialRefreshReque
 
 export function validateMaterialSupplement(value: unknown): ApiMaterialSupplementRequest {
   const object = plainObject('material.supplement', value);
-  requireKeys('material.supplement', object, ['problemKey', 'expectedSnapshotId'], ['statement', 'editorial']);
+  requireKeys(
+    'material.supplement',
+    object,
+    ['problemKey', 'expectedSnapshotId'],
+    ['statement', 'editorial', 'answer'],
+  );
   const declaration = object['editorial'] === undefined ? undefined : validateSupplementEditorial(object['editorial']);
+  const answer = object['answer'] === undefined ? undefined : validateUserAnswer(object['answer']);
   let statement: string | undefined;
   if (object['statement'] !== undefined) {
     statement = requiredString('statement', object['statement'], MAX_API_MANUAL_STATEMENT_CHARS, {
       allowEmpty: false,
     });
   }
+  // An official editorial and a pasted answer describe different provenance; accepting both in one
+  // request would let one stored source claim an origin the caller never asserted for it.
   invariant(
-    statement !== undefined || declaration !== undefined,
+    declaration === undefined || answer === undefined,
     'invalid_input',
-    'a supplement needs a statement, an editorial declaration or both',
+    'a supplement carries either an editorial declaration or a user-provided answer, never both',
+    { reason: 'ambiguous_provenance' },
+  );
+  invariant(
+    statement !== undefined || declaration !== undefined || answer !== undefined,
+    'invalid_input',
+    'a supplement needs a statement, an editorial declaration, a user-provided answer or a combination',
     { reason: 'empty_supplement' },
   );
   return {
@@ -536,6 +553,28 @@ export function validateMaterialSupplement(value: unknown): ApiMaterialSupplemen
     expectedSnapshotId: nullableString('expectedSnapshotId', object['expectedSnapshotId'], MAX_API_ID_CHARS),
     ...(statement === undefined ? {} : { statement }),
     ...(declaration === undefined ? {} : { editorial: declaration }),
+    ...(answer === undefined ? {} : { answer }),
+  };
+}
+
+/**
+ * One pasted user answer.
+ *
+ * `sourceLabel` and `text` are bounded, non-blank strings; `text` keeps the caller's exact content
+ * (the domain factory stores the body verbatim, so the UI's "exact content" promise holds).
+ * `url` is optional attribution: its shape is checked here and its semantics (absolute http(s)
+ * without credentials) are enforced by the handler's own builder before anything is written,
+ * exactly like an editorial declaration URL. No URL is ever fetched.
+ */
+function validateUserAnswer(value: unknown): ApiUserAnswerInput {
+  const object = plainObject('answer', value);
+  requireKeys('answer', object, ['sourceLabel', 'text'], ['url']);
+  return {
+    sourceLabel: requiredString('answer.sourceLabel', object['sourceLabel'], MAX_USER_ANSWER_LABEL_CHARS),
+    text: requiredString('answer.text', object['text'], MAX_USER_ANSWER_TEXT_CHARS),
+    ...(object['url'] === undefined
+      ? {}
+      : { url: requiredString('answer.url', object['url'], MAX_API_TEXT_CHARS) }),
   };
 }
 

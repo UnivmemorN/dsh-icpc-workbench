@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件。独立工作区、独立 SQLite 数据库；基于题解证据补全标签，保留原始标签、人工决定和分析版本。
 
-**0.1.6 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与训练计划（AI 计划：免费准备、显式付费生成；以及免费规则计划）。已完成隔离宿主和浏览器流程验收；本轮功能与已知限制见 [0.1.6 验收报告](docs/reports/stage-11-acceptance.md)，早期模型质量评测见 [30 题报告](docs/reports/stage-05-acceptance.md)。
+**0.1.7 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与训练计划（AI 计划：免费准备、显式付费生成；以及免费规则计划）。已完成隔离宿主和浏览器流程验收；本轮功能与已知限制见 [0.1.7 验收报告](docs/reports/stage-12-acceptance.md)，早期模型质量评测见 [30 题报告](docs/reports/stage-05-acceptance.md)。
 
 ## 构建和隔离安装
 
@@ -14,7 +14,7 @@ npm run check
 npm pack
 # 首次创建隔离的 Web 配置，保持日常配置独立
 dsh --profile icpc-acceptance --from-default-profile web --help
-dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.6.tgz
+dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.7.tgz
 ```
 
 插件不需要位于 harness 源码树中，构建也不依赖相邻的 harness checkout。默认数据目录为系统应用数据目录中的 `dsh-icpc-workbench`。如需自定义，在宿主的配置覆盖文件中设置绝对路径：
@@ -48,11 +48,13 @@ dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
 
 ## 模型和训练规则
 
-默认分析、复核、提示使用 `deepseek-official/deepseek-flash`，无题解推理使用 `deepseek-v4-pro`；强度 **max**，输出上限 65536。模型目录仅供参考，可保留自定义 ID；已知不支持文本/max 的模型会被拒绝，不会静默替换。
+所有模型任务统一使用 **DSV4.1 Flash**（dsh 中的 `deepseek-official/deepseek-flash`）：标签分析、复核、无题解推理、逐级提示与训练计划均为 **max**，默认输出上限 65536。旧配置升级时会统一模型并保留额度和超时；新设置不接受 Pro 或其他模型。Flash 不可用会报错，不会自动切换。详见 [统一模型策略](docs/flash-only-policy.md)。
 
 批次默认 20 题、50 次分析/复核调用、5 次推理调用，并发 2；重试计入额度，未知费用保留为未知。先准备并查看设置版本，再显式启动；版本变化需重新确认，重启不自动续跑。
 
 已有平台标签不会阻止完整性分析。所有缺少当前快照、词表及审核版本完整性记录的题目均可准备；缺材料时会列出补充入口。第二次复核既检查错误标签，也独立查漏，即使首次分析没有建议也会执行。复核新发现的标签进入人工审核；勾选“重新分析（保留旧结果）”可重跑旧结果，原始标签、人工决定与历史分析分别保留。详见 [完整性审核](docs/completeness-review.md)。
+
+题目详情提供 **粘贴外部答案 / 用户提供解析** 入口：可粘贴 GPT6、教师或自己整理的文本、Markdown 与代码，标注来源即可，出处链接可选。保存只写本地；之后显式启动分析、复核或提示时，DS 会读取这份材料。它与平台题解分别保留，并不会因粘贴就被认证为正确答案。详见 [用户提供解析](docs/user-provided-answers.md)。
 
 自动标签必须引用实际题解片段并通过第二次复核。只有明确确认没有题解且存在完整题面，才允许进入大模型推理；鉴权、限流和网络错误不会触发该流程。尚未完成的题目默认隐藏标签、题解与提示正文，完整题解需要明确请求。
 

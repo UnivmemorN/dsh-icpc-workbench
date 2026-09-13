@@ -29,7 +29,7 @@ What is sent to the model is only the plan settings, the aggregate weakness rank
 
 ## Defaults and cost
 
-Planning borrows the analysis role's model — by default the `deepseek-flash` model on the `deepseek-official` provider — together with the configured role output cap and global request timeout, and always runs at the approved `max` effort. It adds no settings of its own.
+Planning uses the analysis role's fixed `deepseek-official/deepseek-flash` (DSV4.1 Flash) model together with the configured output cap and request timeout, always at `max`. Since 0.1.7 all product roles use Flash; legacy settings migrate once and other selections are refused. The planner still receives only aggregate evidence and candidate metadata, never pasted answer bodies.
 
 The planning quota is independent — it counts only planning attempts — but it borrows the coaching cap value (`coaching.maxCallsPer24Hours`, 10 by default) over a plugin-wide rolling 24-hour window, and only one planning call may be in flight at a time. The Settings page labels that value as `提示与计划各自的 24 小时调用上限` and says the two counters are separate while sharing the one limit value.
 

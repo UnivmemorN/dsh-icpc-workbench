@@ -36,7 +36,7 @@ void test('defaults are validated, concrete and detached on every call', () => {
   assert.equal(first.provider, DEFAULT_WORKBENCH_MODELS.provider);
   assert.equal(first.roles.analysisModel, 'deepseek-flash');
   assert.equal(first.roles.verificationModel, 'deepseek-flash');
-  assert.equal(first.roles.reasoningModel, 'deepseek-v4-pro');
+  assert.equal(first.roles.reasoningModel, 'deepseek-flash');
   assert.equal(first.roles.maxOutputTokens, 65_536);
   assert.equal(first.modelLimits.maxAnalysisCalls, 50);
   assert.equal(first.modelLimits.maxReasoningCalls, 5);

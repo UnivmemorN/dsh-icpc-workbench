@@ -2829,6 +2829,7 @@ function sourceView(source: ProblemSnapshot['sources'][number]): WorkbenchEditor
     publishedAt: source.publishedAt,
     availability: source.availability,
     contentHash: source.contentHash,
+    note: source.note,
   };
 }
 

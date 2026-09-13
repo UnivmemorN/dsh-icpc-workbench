@@ -185,6 +185,15 @@ export interface WorkbenchEditorialSourceView {
   readonly publishedAt: string | null;
   readonly availability: EditorialAvailability;
   readonly contentHash: string | null;
+  /**
+   * Stored provenance note.
+   *
+   * For a user-provided answer (see `USER_ANSWER_SOURCE_ID_PREFIX`) this is where the attribution,
+   * the "not an official editorial, correctness not certified" statement and the fact that the
+   * linked URL is merely the associated problem page are recorded, so the reveal view can render
+   * the distinction instead of presenting the paste as a platform article.
+   */
+  readonly note: string | null;
 }
 
 /** One editorial solution including its body; only projected when spoilers are visible. */

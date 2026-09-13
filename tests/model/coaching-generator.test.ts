@@ -277,11 +277,12 @@ void test('a level-1 hint is exactly one audited coaching call with the request 
   assert.equal(problem.statement, STATEMENT);
   assert.deepEqual(problem.rawTags, ['data structures', 'segment tree']);
   const editorial = payload.editorial as {
-    sources: readonly { id: string; title: string }[];
+    sources: readonly { id: string; title: string; note: string | null }[];
     solutions: readonly { solutionId: string; text: string }[];
   };
   assert.deepEqual(editorial.sources.map((source) => source.id), ['editorial-1']);
   assert.equal(editorial.sources[0]?.title, 'Editorial 1234A');
+  assert.equal(editorial.sources[0]?.note, null, 'a source without a stored note sends an explicit null');
   assert.equal(editorial.solutions[0]?.solutionId, 'solution-1');
   assert.equal(editorial.solutions[0]?.text, SOLUTION_TEXT);
   assert.deepEqual(payload.previousHints, []);
@@ -312,6 +313,55 @@ void test('the payload carries only found editorial material and the earlier low
   assert.equal(text.includes(SOLUTION_TEXT), true, 'the found solution text is sent');
   assert.equal(text.includes('editorial-2'), false, 'an absent source is not sent');
   assert.deepEqual(promptPayload(state.dispatch[0]).previousHints, [{ level: 1, text: '先考虑暴力枚举每个区间。' }]);
+  assert.equal(state.dispatch.length, 1);
+});
+
+void test('a pasted user answer reaches the coaching prompt with its text and provenance note', async () => {
+  const sourceId = 'user-answer-0123456789abcdef0123456789abcdef';
+  const answerText = 'Pasted answer body: binary search the answer, then check with a prefix-sum sweep.';
+  const note = '用户提供解析（非官方题解；本插件未抓取、未核验其内容，正确性未经核验）；来源标注：教师解析；来源链接由用户提供，仅作标注；本插件不会抓取该链接。';
+  const source = createEditorialSource({
+    id: sourceId,
+    kind: 'other',
+    url: 'https://codeforces.com/problemset/problem/1234/A',
+    title: '用户提供解析（教师解析）',
+    availability: 'found',
+    retrievedAt: AT,
+    text: answerText,
+    note,
+  });
+  const snapshot = createProblemSnapshot({
+    problem: problemWith(STATEMENT),
+    sources: [source],
+    solutions: [
+      createEditorialSolution({
+        solutionId: `${sourceId}-solution-0`,
+        sourceId,
+        ordinal: 0,
+        title: source.title,
+        text: answerText,
+      }),
+    ],
+    capturedAt: AT,
+  });
+  const { state, generator } = harness([{ payload: { text: ANSWER } }]);
+
+  const result = await generator.generate(request({ snapshot }));
+
+  assert.equal(valueOf<CoachingGenerationOutcome>(result).text, ANSWER);
+  const dispatched = state.dispatch[0];
+  assert.ok(dispatched);
+  const payload = promptPayload(dispatched);
+  const editorial = payload.editorial as {
+    sources: readonly { id: string; kind: string; note: string | null }[];
+    solutions: readonly { text: string }[];
+  };
+  assert.equal(editorial.sources[0]?.id, sourceId);
+  assert.equal(editorial.sources[0]?.kind, 'other');
+  assert.equal(editorial.sources[0]?.note, note, 'the user-provided provenance travels with the source');
+  assert.equal(editorial.solutions[0]?.text, answerText, 'the exact provided text is the reference material');
+  assert.equal(dispatched.system, COACHING_SYSTEM_PROMPT);
+  assert.equal(dispatched.system.includes(answerText), false, 'task data never enters the system prompt');
   assert.equal(state.dispatch.length, 1);
 });
 

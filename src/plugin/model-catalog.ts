@@ -61,7 +61,7 @@ export class ModelCatalog {
     for(const [role,model,maxOutput] of roles){
       const info=byId.get(model);
       const add=(code:string,severity:'warning'|'error',message:string)=>diagnostics.push({...diagnostic(code,severity,message),role,model});
-      if(!info){add('metadata_unknown','warning','模型元数据未知；保留自定义模型 ID，实际调用仍会校验。');continue;}
+      if(!info){add('metadata_unknown','warning','模型元数据未知；实际调用仍会校验，不会自动切换模型。');continue;}
       if(info.inputModalities!==undefined&&!info.inputModalities.includes('text'))add('text_unsupported','error','该模型明确不支持文本输入。');
       if(info.reasoningEfforts!==undefined&&!info.reasoningEfforts.includes('max'))add('max_unsupported','error','该模型未声明支持 max 推理强度。');
       if(info.contextWindow!==undefined&&maxOutput+4096>=info.contextWindow)add('context_too_small','error','模型上下文不足以容纳配置的输出额度和输入。');
