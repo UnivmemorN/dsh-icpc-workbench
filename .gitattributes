@@ -1,0 +1,3 @@
+# Keep exact upstream license bytes stable on Windows checkouts for SHA-256 verification.
+licenses/remark-math-6.0.0-MIT.txt text eol=lf
+licenses/rehype-katex-7.0.1-MIT.txt text eol=lf

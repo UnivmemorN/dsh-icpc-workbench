@@ -1,6 +1,6 @@
 {
   "name": "dsh-icpc-workbench",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "Personal ICPC training workbench plugin: normalized problems, evidence-checked tag analysis, weakness statistics and training plans.",
   "license": "MIT",
   "type": "module",
@@ -112,7 +112,11 @@
     "docs/completion-editing.md",
     "docs/reports/stage-23a-completion-edit.md",
     "docs/reports/stage-23b-completion-ui.md",
-    "docs/reports/stage-23-acceptance.md"
+    "docs/reports/stage-23-acceptance.md",
+    "docs/markdown-rendering.md",
+    "docs/reports/stage-24a-markdown-core.md",
+    "docs/reports/stage-24b-markdown-luogu.md",
+    "docs/reports/stage-24-acceptance.md"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
@@ -130,20 +134,36 @@
     "@deepseek-ai/dsh-client-ui-slots": "0.1.5-rc.2",
     "@deepseek-ai/dsh-llm": "0.1.5-rc.2",
     "@deepseek-ai/dsh-session": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-session-persistence": "0.1.5-rc.2",
+    "@rollup/plugin-commonjs": "29.0.3",
+    "@rollup/plugin-node-resolve": "16.0.3",
     "@rollup/wasm-node": "4.63.1",
+    "@types/hast": "3.0.5",
+    "@types/mdast": "4.0.4",
     "@types/node": "^24.3.0",
     "@types/react": "18.3.1",
+    "@types/react-dom": "18.3.7",
+    "postcss": "8.5.28",
     "react": "18.3.1",
+    "react-dom": "18.3.1",
     "tsx": "^4.20.3",
-    "typescript": "^5.9.2",
-    "@deepseek-ai/dsh-session-persistence": "0.1.5-rc.2"
+    "typescript": "^5.9.2"
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",
     "csv-parse": "7.0.2",
     "domhandler": "6.0.1",
     "domutils": "4.0.2",
-    "htmlparser2": "12.0.0"
+    "highlight.js": "11.12.0",
+    "htmlparser2": "12.0.0",
+    "katex": "0.16.47",
+    "lowlight": "3.3.0",
+    "react-markdown": "10.1.0",
+    "rehype-katex": "7.0.1",
+    "remark-directive": "4.0.0",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0",
+    "unist-util-visit": "5.1.0"
   },
   "dsh": {
     "bundle": {
@@ -160,14 +180,14 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-client-connection": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-client-ui-layout": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-client-ui-sidebar": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.5-rc.2",
     "@deepseek-ai/dsh-llm": "0.1.5-rc.2",
     "@deepseek-ai/dsh-session": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-client-connection": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-client-ui-slots": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-client-ui-layout": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-client-ui-sidebar": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-client-ui-renderer": "0.1.5-rc.2",
-    "react": "18.3.1",
-    "@deepseek-ai/dsh-session-persistence": "0.1.5-rc.2"
+    "@deepseek-ai/dsh-session-persistence": "0.1.5-rc.2",
+    "react": "18.3.1"
   }
 }

@@ -353,6 +353,27 @@ function parseLimitArray(value: unknown, label: string, operation: PlatformOpera
   });
 }
 
+/**
+ * Fence one sample body as literal text for the statement Markdown (Sprint 24b).
+ *
+ * Sample data is data, not prose: `$`, HTML-like text, heading-like lines, fence-like lines, blank
+ * lines and trailing blanks must survive a Markdown render unchanged. A fenced code block is the one
+ * Markdown construct with that property, and the fence is chosen strictly longer than every backtick
+ * run inside the body so a sample can never close its own block. `text` is a plain-but-unregistered
+ * info string, so the renderer shows no invented highlighting.
+ *
+ * Only newly assembled statements use this: existing stored statements and snapshot hashes are never
+ * migrated or rewritten, and the renderer's view-only legacy adapter covers them (`ui/markdown`).
+ */
+export function luoguSampleFence(text: string): string {
+  let size = 3;
+  for (const run of text.match(/`+/gu) ?? []) {
+    if (run.length >= size) size = run.length + 1;
+  }
+  const fence = '`'.repeat(size);
+  return `${fence}text\n${text}\n${fence}`;
+}
+
 /** Assemble every available section plus the samples, preserving Markdown and math verbatim. */
 export function buildLuoguStatement(
   sections: LuoguStatementSections,
@@ -369,7 +390,9 @@ export function buildLuoguStatement(
   push('输入格式', sections.formatI);
   push('输出格式', sections.formatO);
   samples.forEach((sample, index) => {
-    parts.push(`## 样例 #${index + 1}\n\n输入:\n\n${sample.input}\n\n输出:\n\n${sample.output}`);
+    parts.push(
+      `## 样例 #${index + 1}\n\n输入:\n\n${luoguSampleFence(sample.input)}\n\n输出:\n\n${luoguSampleFence(sample.output)}`,
+    );
   });
   push('提示', sections.hint);
   return parts.join('\n\n');

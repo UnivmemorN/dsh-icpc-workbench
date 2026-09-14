@@ -8,7 +8,7 @@
 
 ## npm dependencies
 
-The exact dependency tree is recorded in package-lock.json. Installed dependencies retain their own package licenses and notices. Host and React dependencies are shared with dsh; their implementation is not vendored into this repository. The browser factory bundles pure @noble/hashes code; its full MIT notice is retained in the factory header and [licenses/noble-hashes-MIT.txt](licenses/noble-hashes-MIT.txt). Other dependencies remain external.
+The exact dependency tree is recorded in package-lock.json. Installed dependencies retain their own package licenses and notices. Host and React dependencies are shared with dsh; their implementation is not vendored into this repository. The browser factory bundles pure @noble/hashes code; its full MIT notice is retained in the factory header and [licenses/noble-hashes-MIT.txt](licenses/noble-hashes-MIT.txt). Since Sprint 24a the factory also bundles the local Markdown rendering stack below with its transitive packages; the exact package names, versions, declared licenses and full notice texts are generated into `dist/client-LICENSES.txt` at build time. React, `react/jsx-runtime`, `react-dom/client` and `@deepseek-ai/cordis` remain shared with the dsh host and are not bundled; server-side dependencies (storage, platform adapters, CSV import) remain outside the browser factory.
 
 | Package | Version | Declared license |
 | --- | --- | --- |
@@ -27,6 +27,39 @@ The exact dependency tree is recorded in package-lock.json. Installed dependenci
 | @deepseek-ai/dsh-client-ui-sidebar | 0.1.5-rc.2 | MIT |
 | @deepseek-ai/dsh-client-ui-renderer | 0.1.5-rc.2 | MIT |
 | react | 18.3.1 | MIT |
+| react-markdown | 10.1.0 | MIT |
+| remark-gfm | 4.0.1 | MIT |
+| remark-math | 6.0.0 | MIT |
+| rehype-katex | 7.0.1 | MIT |
+| katex | 0.16.47 | MIT |
+| lowlight | 3.3.0 | MIT |
+| highlight.js | 11.12.0 | BSD-3-Clause |
+| remark-directive | 4.0.0 | MIT |
+| unist-util-visit | 5.1.0 | MIT |
+
+## Local Markdown rendering
+
+Sprint 24a renders stored problem statements, saved solution text and AI coaching text in the client
+with `react-markdown` (CommonMark/GFM through `remark-gfm`), `remark-math` + `rehype-katex` (KaTeX)
+for math, and `lowlight` + `highlight.js` for a small registered code-language subset. Nothing is
+fetched for parsing or math fonts; external images load only from their validated source URL. Raw HTML is never enabled, and the original stored string stays available
+behind a "查看原文" disclosure. `remark-directive` supplies the parser for the
+stage-24b Luogu directive/table transform.
+
+Sprint 24b implements that transform independently: fold directives, alignment, epigraph, the
+`::cute-table` decorator, `^`/`<` table-cell merges and fence meta (`line-numbers`, `lines=`) are
+recognized in the parsed AST and mapped onto fixed, scoped elements, and nothing is produced by
+rewriting an HTML string. The implemented behavior is specified against the public
+[Luogu Markdown handbook](https://help.luogu.com.cn/rules/academic/handbook/markdown), checked
+2026-09-14. Only the public syntax rules are referenced: no Luogu prose, example, screenshot, sample
+problem, editorial, code or dataset is copied, and every test fixture is synthetic.
+
+Installed license fields were verified on 2026-09-14: the Markdown libraries above are MIT and
+`highlight.js` is BSD-3-Clause, each with the full notice reproduced in `dist/client-LICENSES.txt`
+for every package that the browser bundle actually contains. Two bundled packages,
+`rehype-katex@7.0.1` and `remark-math@6.0.0`, publish no LICENSE file in their npm artifacts; that
+file reproduces verified full upstream notices from exact release commits retained under `licenses/`. The KaTeX stylesheet and all 60 referenced font files are inlined from the installed package as data URLs, accompanied by its published license; no runtime CDN request is needed. The bundle currently contains `highlight.js` twice, at 11.12.0 (direct) and
+11.11.2 (through lowlight's `~11.11.0` range); both notices are reproduced.
 
 ## Knowledge learning references
 
@@ -73,3 +106,5 @@ model is involved. Luogu does not license or endorse this plugin. See
 The balanced thinking/templates method implements this project user's design requirements. The optional deliberate-practice companion adapts teaching ideas from [USACO Guide — How to Practice](https://usaco.guide/general/practicing), Competitive Programming Initiative and credited page contributors including Darren Yao, Nathan Wang and Benjamin Qi, checked 2026-09-14. Its teaching text is separately licensed CC BY-NC-SA 4.0; JavaScript registration is MIT. Full attribution, adaptation notes and source license are included in that companion's NOTICE.md and LICENSE.method-text. No source code, problem statements, solutions or page images are copied.
 
 [Carrot](https://github.com/meooow25/carrot) is cited to explain a performance definition, not incorporated or executed. User-imported performance remains separate from official CF rating. The sources do not certify the workbench's AI assessment.
+
+The build reproduces full notices for every resolved client dependency. `remark-math@6.0.0` and `rehype-katex@7.0.1` omit their notice in npm; exact upstream notices are retained under `licenses/`, with commit provenance and SHA-256 verification in the build. PostCSS (MIT, https://github.com/postcss/postcss) is used only at build time to isolate formula styles. KaTeX fonts are embedded from its installed npm package with its published license notice.

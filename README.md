@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件。独立工作区、独立 SQLite 数据库；基于题解证据补全标签，保留原始标签、人工决定和分析版本。
 
-**0.1.18 实验版**新增完成方式逐题与批量修改：预览后保存，保留复盘备注与已确认知识点，支持单独确认共同使用的知识点。知识点掌握和规则能力评估读取最新记录；历史 AI 报告需主动重新生成。见 [完成方式说明](docs/completion-editing.md)、[本轮验收](docs/reports/stage-23-acceptance.md)、[洛谷同步说明](docs/luogu-sync.md) 与 [早期 30 题评测](docs/reports/stage-05-acceptance.md)。
+**0.1.19 实验版**新增题面、保存的题解与提示正文的 Markdown 渲染，保留查看原文入口。支持公式、代码高亮与复制，并兼容洛谷伸缩栏等扩展和样例排版；查看已有内容不调用 AI。见 [Markdown 使用说明](docs/markdown-rendering.md)、[本轮验收](docs/reports/stage-24-acceptance.md)。完成方式的逐题与批量修改见 [完成方式说明](docs/completion-editing.md)。
 
 ## 构建和隔离安装
 
@@ -14,7 +14,7 @@ npm run check
 npm pack
 # 首次创建隔离的 Web 配置，保持日常配置独立
 dsh --profile icpc-acceptance --from-default-profile web --help
-dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.18.tgz
+dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.19.tgz
 ```
 
 插件不需要位于 harness 源码树中，构建也不依赖相邻的 harness checkout。默认数据目录为系统应用数据目录中的 `dsh-icpc-workbench`。如需自定义，在宿主的配置覆盖文件中设置绝对路径：
