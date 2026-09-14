@@ -45,7 +45,11 @@
  *
  * A pass fetches at most {@link LUOGU_SYNC_MAX_PAGES_PER_PASS} history pages of
  * `min(LUOGU_SYNC_PAGE_SIZE, limits.pageSize)` rows and at most {@link LUOGU_SYNC_METADATA_PER_PASS}
- * metadata rows.
+ * metadata rows. The explicit `metadata` start mode skips the history half entirely — it reads no
+ * page and moves no history watermark, checkpoint or completion flag — and repairs the backlog
+ * present at its start once per key (at most {@link LUOGU_SYNC_MAX_METADATA_BACKLOG} keys), so a
+ * user can drain a large backlog without pretending it is a history scan. Neither half invokes a
+ * model: metadata repair stays the same anonymous platform read as before.
  * Completion is only ever derived from the adapter's `nextCursor: null`. `phase`/`historyComplete`
  * are independent of failures, a manual full reconciliation resets `historyComplete` without
  * deleting stored rows, and the whole-scan start instant is preserved across resumed passes so a
@@ -72,12 +76,13 @@ import {
   throwIfCancelled,
   type Account,
   type CancellationToken,
+  type ProblemRef,
   type SourceInstance,
 } from '../domain/index.js';
 import type { ImportService } from './import-service.js';
 import type { SyncMode, SyncPageReport, SyncPageSource } from './import-types.js';
 import { LuoguConnectionError, type LuoguConnectionManager } from './luogu-connection.js';
-import { isPlatformError, type PlatformErrorCode } from './platform-errors.js';
+import { PlatformError, isPlatformError, type PlatformErrorCode } from './platform-errors.js';
 import type { LuoguSourceGate } from './luogu-source-gate.js';
 import {
   LUOGU_SYNC_MAX_BACKOFF_MS,
@@ -105,7 +110,7 @@ import {
   type LuoguSyncStateRecord,
   type LuoguSyncStore,
 } from './luogu-sync-types.js';
-import { DEFAULT_PLATFORM_LIMITS, type PlatformAdapter, type PlatformLimits, type TrainingStore } from './ports.js';
+import { DEFAULT_PLATFORM_LIMITS, type AccountProfile, type PlatformAdapter, type PlatformLimits, type TrainingStore } from './ports.js';
 
 // ---------------------------------------------------------------------------------------
 // Errors
@@ -178,8 +183,15 @@ export class LuoguSyncError extends Error {
 // Public shapes
 // ---------------------------------------------------------------------------------------
 
-/** How a start request relates to the durable scan position. */
-export type LuoguSyncStartMode = 'resume' | 'full';
+/**
+ * How a start request relates to the durable scan position.
+ *
+ * `resume` continues the stored checkpoint (or starts the first backfill), `full` restarts an
+ * explicit whole-history reconciliation, and `metadata` repairs the missing-metadata backlog only:
+ * it never reads a history page and never moves a history watermark. A metadata pass and a history
+ * pass are incompatible and never queue behind each other.
+ */
+export type LuoguSyncStartMode = 'resume' | 'full' | 'metadata';
 
 /** How one `start` call was satisfied. */
 export type LuoguSyncStartOutcome = 'started' | 'coalesced' | 'queued';
@@ -305,10 +317,12 @@ interface Claim {
   readonly pageMode: SyncMode;
   /** Frozen time bound; `null` means the full window. */
   readonly since: string | null;
+  /** True for the explicit `metadata` mode: repair the backlog, read no history at all. */
+  readonly metadataOnly: boolean;
 }
 
 interface ClaimRequest {
-  readonly purpose: 'sync' | 'connect' | 'probe';
+  readonly purpose: 'sync' | 'metadata' | 'connect' | 'probe' | 'profile';
   readonly mode: LuoguSyncStartMode;
 }
 
@@ -461,6 +475,24 @@ function failureCodeOf(code: PlatformErrorCode): LuoguSyncFailureCode {
   }
 }
 
+/** Canonical external key of a user-created (private) Luogu problem: `U` followed by digits. */
+const PRIVATE_USER_PROBLEM_KEY = /^U\d+$/u;
+
+/**
+ * True when one metadata answer is an **item-level** refusal of a private/user-created problem.
+ *
+ * The platform publishes user-created personal problems under `U` ids, and its public problem guide
+ * documents private personal problems
+ * (<https://help.luogu.com.cn/manual/luogu/problem/>). An anonymous metadata read of one may
+ * therefore answer `auth_required` or `forbidden` while the session and every public problem remain
+ * fine, so this is a refusal of *that key* and never evidence that the stored session expired. The
+ * decision reads the canonical {@link ProblemRef.externalKey} of the parsed reference, so no raw
+ * string, URL or display name can be mistaken for the private-key prefix.
+ */
+function isPrivateProblemRefusal(ref: ProblemRef, code: LuoguSyncFailureCode): boolean {
+  return (code === 'auth_required' || code === 'forbidden') && PRIVATE_USER_PROBLEM_KEY.test(ref.externalKey);
+}
+
 /** True for the store's stale-revision refusal, the one expected compare-and-set loss. */
 function isStaleRevision(error: unknown): boolean {
   return (
@@ -468,6 +500,43 @@ function isStaleRevision(error: unknown): boolean {
     (error.code === 'invalid_transition' || error.code === 'duplicate_id') &&
     error.details['reason'] === 'stale_revision'
   );
+}
+
+/** Longest nickname this service accepts from a profile port; matches the platform field bound. */
+const MAX_PROFILE_NAME_CHARS = 256;
+
+/**
+ * Re-validate one profile answer against the account it claims to describe.
+ *
+ * The adapter already validated its own payload; this second check makes the service independent of
+ * a hostile or broken port: the answer must name this source instance and the account's own
+ * canonical uid, and its nickname must be a non-blank bounded string without control characters.
+ * A mismatch is a `changed_response`, never a nickname written onto another identity.
+ */
+function requireAccountProfile(account: Account, sourceInstanceId: string, profile: AccountProfile): string {
+  if (
+    profile === null ||
+    typeof profile !== 'object' ||
+    profile.sourceInstanceId !== sourceInstanceId ||
+    profile.uid !== account.handle
+  ) {
+    throw new PlatformError({
+      code: 'changed_response',
+      operation: 'profile',
+      retryable: false,
+      detail: 'the profile source answered a profile of another account',
+    });
+  }
+  const displayName = typeof profile.displayName === 'string' ? profile.displayName.trim() : '';
+  if (displayName.length === 0 || displayName.length > MAX_PROFILE_NAME_CHARS || /[\u0000-\u001f\u007f]/u.test(displayName)) {
+    throw new PlatformError({
+      code: 'changed_response',
+      operation: 'profile',
+      retryable: false,
+      detail: 'the profile source answered an unusable display name',
+    });
+  }
+  return displayName;
 }
 
 /**
@@ -682,6 +751,65 @@ export class LuoguSyncService {
   }
 
   /**
+   * Refresh one account's public nickname from the anonymous profile endpoint.
+   *
+   * This is a **public, anonymous** read: it needs no stored session, works before any connection
+   * exists and on a host whose credential backend is unsupported, and never touches the vault, the
+   * connection rows, the submissions reader or the model gateway. It still takes the service's one
+   * source slot and the durable per-account lease — through the same `runConnectionOp` path as
+   * `connect`/`probe` — so it is refused as `busy` while a pass or another source operation runs and
+   * is cancelled by {@link close}. Its claim records no history work and no failure: the phase,
+   * watermarks, checkpoint, missing-metadata backlog and any stored synchronization failure are
+   * preserved exactly as they were, and the lease is released with `clearPausingFailure: false`.
+   *
+   * The nickname is written only after the answer was re-validated against the account's own
+   * canonical uid, and only inside one transaction that re-reads the account, re-checks that its
+   * identity did not change and re-checks this operation's own live lease with a clock reading taken
+   * *inside* that transaction. The caller's combined token is checked after the fetch, on both sides
+   * of every awaited read, and immediately before and after the write, so a port that answers after
+   * the caller cancelled — or a store read that waited across a cancellation — rolls the nickname
+   * back instead of saving it. Every field except `displayName` stays exactly as stored; a failed,
+   * malformed or cancelled lookup leaves the previous nickname and every durable record untouched.
+   *
+   * A missing optional `fetchAccountProfile` capability is refused as the typed `unsupported`
+   * operation before any store or platform work: it is a capability gap of the configured source,
+   * not a credential-backend condition and not an internal failure.
+   *
+   * Returns the updated {@link Account}, never the platform payload the nickname came from.
+   */
+  async refreshProfile(accountId: string, token: CancellationToken): Promise<Account> {
+    this.assertUsable(token);
+    const account = await this.requireAccount(accountId);
+    const fetchProfile = this.metadataSource.fetchAccountProfile;
+    if (typeof fetchProfile !== 'function') {
+      throw new LuoguSyncError('unsupported', 'the configured Luogu source cannot read a public nickname', {
+        accountId: account.id,
+      });
+    }
+    return this.runConnectionOp(account.id, token, async (opToken) => {
+      await this.claim(account, { purpose: 'profile', mode: 'resume' }, opToken);
+      try {
+        const answer = await this.gate.run(opToken, async () => {
+          throwIfCancelled(opToken);
+          // The claim above is durable, but the shared gate may park this operation behind another
+          // source operation for a long time. The current lease is therefore re-taken and re-checked
+          // inside the callback, immediately before the request: a takeover or expiry during that
+          // wait must issue no public request and must never dispatch on a stale claim.
+          await this.renewLease(account.id, 'before a profile request');
+          throwIfCancelled(opToken);
+          return fetchProfile.call(this.metadataSource, { account, token: opToken, limits: this.limits });
+        });
+        // A port may answer after the caller cancelled; the answer is discarded instead of stored.
+        throwIfCancelled(opToken);
+        const displayName = requireAccountProfile(account, this.sourceInstance.id, answer);
+        return await this.storeProfile(account, displayName, opToken);
+      } finally {
+        await this.releaseLease(account.id, false);
+      }
+    });
+  }
+
+  /**
    * Stop this account's work, disable only its automation and remove its session.
    *
    * The order is the contract: cancel the pass, drain it (and any in-flight connect/probe of the
@@ -722,6 +850,11 @@ export class LuoguSyncService {
    * checkpoint before it considers an incremental window; `full` starts an explicit reconciliation
    * (resetting `historyComplete`, never deleting stored rows).
    *
+   * `metadata` reserves the same source-wide slot but repairs the durable backlog only: it reads no
+   * history page and leaves every history watermark, the checkpoint and `historyComplete` exactly as
+   * stored. It is the mode a user picks to drain a large backlog without running a history scan, and
+   * it never invokes a model — the metadata source is an anonymous platform read.
+   *
    * ## The source slot is taken synchronously
    *
    * The pass is published to `this.running` **before** its durable reservation is written, so every
@@ -731,7 +864,10 @@ export class LuoguSyncService {
    * the reservation committed the honest answer is `busy` (the documented choice of this build),
    * and once it committed the request coalesces with the launched pass — or queues its full
    * reconciliation behind it. A request for another account, or one that arrives while a connection
-   * operation holds the source lease, is refused as `busy` instead of overwriting the live owner.
+   * operation holds the source lease, is refused as `busy` instead of overwriting the live owner. A
+   * mode incompatible with the live pass (`metadata` against a history mode, or the reverse) is
+   * refused as `busy` for the same reason: a metadata pass owns no history position, so it must
+   * never be handed a queued full reconciliation or have one queued behind it.
    */
   async start(
     accountId: string,
@@ -739,7 +875,11 @@ export class LuoguSyncService {
     token?: CancellationToken,
   ): Promise<LuoguSyncStartResult> {
     this.assertUsable(token ?? null);
-    invariant(mode === 'resume' || mode === 'full', 'invalid_input', `unknown synchronization mode ${String(mode)}`);
+    invariant(
+      mode === 'resume' || mode === 'full' || mode === 'metadata',
+      'invalid_input',
+      `unknown synchronization mode ${String(mode)}`,
+    );
     // The attempt is tracked synchronously, before its first await: a `close()` that lands while
     // this reservation is still being written waits for the attempt, and the attempt refuses to
     // launch (releasing its own reservation) once the close began.
@@ -753,6 +893,16 @@ export class LuoguSyncService {
         if (running.accountId === account.id && running.launched) {
           if (running.mode === mode) {
             return { accountId: account.id, mode, outcome: 'coalesced', status: await this.status(account.id) };
+          }
+          // A metadata pass and a history pass are incompatible: queueing a full reconciliation
+          // behind a metadata pass (or the reverse) would run a mode the caller never asked for.
+          // The honest answer is `busy`, and nothing is queued.
+          if (running.mode === 'metadata' || mode === 'metadata') {
+            throw new LuoguSyncError(
+              'busy',
+              `account ${account.id} is already running the incompatible Luogu mode ${running.mode}`,
+              { accountId: running.accountId, leaseOwner: this.ownerId, runningMode: running.mode },
+            );
           }
           running.queuedFull = true;
           return { accountId: account.id, mode, outcome: 'queued', status: await this.status(account.id) };
@@ -857,8 +1007,10 @@ export class LuoguSyncService {
    * The whole source instance is scanned — every stored Luogu account and its state — because an
    * account that is connecting right now may not have a connection row yet and would be invisible
    * to a connection-only enumeration. A live foreign lease is refused; an expired one is recovered
-   * by simply overwriting it with this reservation. For a `sync` claim the checkpoint is read in
-   * the same transaction and the pass plan is derived from it:
+   * by simply overwriting it with this reservation. A `metadata` claim reads no checkpoint at all:
+   * it takes the owner slot and resets only the pass-scoped page counter, so draining a backlog can
+   * never be mistaken for a history scan. For a `sync` claim the checkpoint is read in the same
+   * transaction and the pass plan is derived from it:
    *
    * - an unfinished checkpoint is resumed with its own `since` and cursor;
    * - a first backfill starts with no bound at all;
@@ -910,9 +1062,14 @@ export class LuoguSyncService {
       }
       let next: LuoguSyncState;
       let claim: Claim;
-      if (request.purpose !== 'sync') {
+      if (request.purpose === 'metadata') {
+        // The metadata-only claim takes the same source-wide owner slot but touches only the lease:
+        // the phase, history watermarks, completion flag and checkpoint stay exactly as stored.
+        next = { ...state, owner, leaseExpiresAt, pagesInPass: 0, updatedAt: at };
+        claim = { pageMode: 'continue', since: null, metadataOnly: true };
+      } else if (request.purpose !== 'sync') {
         next = { ...state, owner, leaseExpiresAt, updatedAt: at };
-        claim = { pageMode: 'continue', since: null };
+        claim = { pageMode: 'continue', since: null, metadataOnly: false };
       } else {
         const checkpoint = await this.store.getSyncCheckpoint(this.checkpointRef(account.id));
         const resuming = checkpoint !== null && checkpoint.cursor !== null;
@@ -955,7 +1112,7 @@ export class LuoguSyncService {
           pagesInPass: 0,
           updatedAt: at,
         };
-        claim = { pageMode, since };
+        claim = { pageMode, since, metadataOnly: false };
       }
       // Last gate before the single write of this transaction: the reservation is never committed
       // after the service began closing or the caller cancelled.
@@ -994,6 +1151,53 @@ export class LuoguSyncService {
       }
       throw error;
     }
+  }
+
+  /**
+   * Persist one validated nickname under a live owned lease, preserving every identity field.
+   *
+   * The account is re-read **inside** the transaction (the platform call happened before it, so no
+   * transaction is ever held across IO): a row that vanished, moved to another source instance or
+   * changed its handle is refused instead of being overwritten, and the durable state read in the
+   * same transaction must still show this operation's own live lease. The caller's combined token is
+   * re-checked on both sides of every awaited read and immediately before and after the write, and
+   * the lease clock is read *inside* the transaction after those reads, so a store that waited
+   * across a cancellation — or a lease that expired while it waited — rolls the nickname back
+   * instead of saving it. Only `displayName` differs from the stored row; `id`, `sourceInstanceId`,
+   * `handle` and `profileUrl` are copied verbatim.
+   */
+  private async storeProfile(account: Account, displayName: string, opToken: CancellationToken): Promise<Account> {
+    const owner = this.ownerId;
+    return this.store.transaction(async () => {
+      throwIfCancelled(opToken);
+      const current = await this.store.getAccount(account.id);
+      throwIfCancelled(opToken);
+      if (current === null) {
+        throw new LuoguSyncError('account_missing', `account ${account.id} is not stored`, { accountId: account.id });
+      }
+      if (current.sourceInstanceId !== this.sourceInstance.id || current.handle !== account.handle) {
+        throw new LuoguSyncError('internal', `account ${account.id} no longer matches the requested identity`, {
+          accountId: account.id,
+        });
+      }
+      const state = await this.store.getLuoguSyncState(account.id);
+      throwIfCancelled(opToken);
+      // The clock is read here, after the awaited reads: a lease that expired while the store waited
+      // is not accepted on the strength of a reading taken before the transaction began.
+      const at = this.nowIso();
+      if (state === null || state.value.owner !== owner || !luoguLeaseLive(state.value, owner, at)) {
+        throw new DomainError('invalid_transition', 'the profile lease was lost before the nickname update', {
+          reason: 'lease_lost',
+        });
+      }
+      const next: Account = { ...current, displayName };
+      throwIfCancelled(opToken);
+      await this.store.upsertAccounts([next]);
+      // A cancellation that landed while the write ran must not commit the nickname: throwing here
+      // rolls the transaction back.
+      throwIfCancelled(opToken);
+      return next;
+    });
   }
 
   // -------------------------------------------------------------------------------------
@@ -1039,7 +1243,7 @@ export class LuoguSyncService {
   ): Promise<void> {
     let claim: Claim;
     try {
-      claim = await this.claim(account, { purpose: 'sync', mode }, token);
+      claim = await this.claim(account, { purpose: mode === 'metadata' ? 'metadata' : 'sync', mode }, token);
     } catch (error) {
       this.finishPass(pass);
       throw error;
@@ -1173,67 +1377,95 @@ export class LuoguSyncService {
   }
 
   /**
-   * One bounded pass: at most 20 history pages, then at most 10 metadata repairs.
+   * One bounded pass: at most 20 history pages, then metadata repairs bounded by
+   * {@link LUOGU_SYNC_METADATA_PER_PASS} — or, for the explicit metadata-only mode, one attempt per
+   * backlog key up to {@link LUOGU_SYNC_MAX_METADATA_BACKLOG}.
    *
    * The two halves are described separately. A failure of the authenticated history read (or of the
    * page commit under it) carries `stage: 'history'`; a failure of the anonymous metadata repair —
    * including an exception thrown while that work runs — carries `stage: 'metadata'`. A history
    * failure skips the metadata phase exactly as before, and neither half may clear the other's
    * evidence: history coverage, the backlog and the committed submissions are independent of
-   * `failure`.
+   * `failure`. A metadata-only reservation runs the metadata half alone and never touches the
+   * history half's durable facts, so it also reports the failure it found at its start: bookkeeping
+   * keeps a history failure this pass did not retry, while a previous metadata failure is exactly
+   * what a successful drain repaired. A cancellation keeps the failure an earlier item of the same
+   * phase already committed.
    */
   private async runPass(account: Account, claim: Claim, token: CancellationToken): Promise<void> {
     let failure: LuoguSyncFailure | null = null;
+    // What the pass started with. A metadata-only success must not erase a failure it could not
+    // have repaired: a history-stage (or legacy stage-less) failure survives because this pass read
+    // no history, while a previous *metadata* failure is exactly what the drain repaired and is
+    // cleared by a successful retry.
+    let priorFailure: LuoguSyncFailure | null = null;
     let historyThrew = false;
-    try {
-      let mode: SyncMode = claim.pageMode;
-      let since = claim.since;
-      // The platform's configured page size is an upper bound the adapter enforces: a deployment
-      // that lowers it (1..50) must be honored, while the 50-row cap of the metadata backlog report
-      // is never exceeded.
-      const pageSize = Math.min(LUOGU_SYNC_PAGE_SIZE, this.limits.pageSize);
-      for (let index = 0; index < LUOGU_SYNC_MAX_PAGES_PER_PASS; index += 1) {
-        // Backpressure before the fetch: a page may add up to a full page of new keys, so a pass
-        // that cannot record them must not fetch it. The checkpoint continuation is kept.
-        if (await this.backlogBlocksPaging(account.id)) {
-          break;
+    // A metadata-only claim skips the history half entirely: no page is requested, no checkpoint is
+    // read or written, and no history watermark or completion flag moves.
+    if (!claim.metadataOnly) {
+      try {
+        let mode: SyncMode = claim.pageMode;
+        let since = claim.since;
+        // The platform's configured page size is an upper bound the adapter enforces: a deployment
+        // that lowers it (1..50) must be honored, while the 50-row cap of the metadata backlog report
+        // is never exceeded.
+        const pageSize = Math.min(LUOGU_SYNC_PAGE_SIZE, this.limits.pageSize);
+        for (let index = 0; index < LUOGU_SYNC_MAX_PAGES_PER_PASS; index += 1) {
+          // Backpressure before the fetch: a page may add up to a full page of new keys, so a pass
+          // that cannot record them must not fetch it. The checkpoint continuation is kept.
+          if (await this.backlogBlocksPaging(account.id)) {
+            break;
+          }
+          const source = this.submissionsFor(account);
+          const report = await this.gate.run(token, () =>
+            this.imports.syncPage(source, {
+              resource: 'submissions',
+              account,
+              mode,
+              since,
+              limit: pageSize,
+              limits: this.limits,
+              token,
+              onPageCommitted: (page) => this.commitPage(account.id, page),
+            }),
+          );
+          mode = 'continue';
+          since = report.since;
+          if (report.complete) {
+            break;
+          }
         }
-        const source = this.submissionsFor(account);
-        const report = await this.gate.run(token, () =>
-          this.imports.syncPage(source, {
-            resource: 'submissions',
-            account,
-            mode,
-            since,
-            limit: pageSize,
-            limits: this.limits,
-            token,
-            onPageCommitted: (page) => this.commitPage(account.id, page),
-          }),
-        );
-        mode = 'continue';
-        since = report.since;
-        if (report.complete) {
-          break;
-        }
+      } catch (error) {
+        historyThrew = true;
+        failure = await this.describeFailure(account.id, error, 'history');
       }
-    } catch (error) {
-      historyThrew = true;
-      failure = await this.describeFailure(account.id, error, 'history');
     }
     // The metadata phase runs exactly when the history phase did not throw — the same rule as
     // before — so a cancelled or refused history pass still performs no metadata work at all.
+    let cancelled = false;
     if (!historyThrew) {
       try {
-        failure = await this.repairMetadata(account, token);
+        const repair = await this.repairMetadata(account, token, {
+          bound: claim.metadataOnly ? LUOGU_SYNC_MAX_METADATA_BACKLOG : LUOGU_SYNC_METADATA_PER_PASS,
+        });
+        priorFailure = repair.priorFailure;
+        failure = repair.failure;
       } catch (error) {
         // The pages this phase follows are already committed; an exception raised here is a metadata
         // failure and must never be recorded as a history failure, nor clear history coverage.
         failure = await this.describeFailure(account.id, error, 'metadata');
+        // A cancellation leaves the failure this phase already committed for an earlier item exactly
+        // where it is, instead of erasing the evidence of that item's failed request.
+        cancelled = this.isCancellation(error);
       }
     }
     try {
-      await this.settleState(account.id, failure);
+      await this.settleState(account.id, failure, {
+        // A pass cut short may not wipe the failure one of its own earlier items already recorded;
+        // and a history failure survives a metadata-only success because no history was retried.
+        keepPriorFailure: cancelled || (claim.metadataOnly && priorFailure?.stage !== 'metadata'),
+        priorFailure,
+      });
     } catch (error) {
       // The durable page data and checkpoint are already committed; only the bookkeeping write
       // failed. It is reported by `close()` instead of being swallowed.
@@ -1311,26 +1543,64 @@ export class LuoguSyncService {
   }
 
   /**
-   * Repair referenced problem metadata, at most {@link LUOGU_SYNC_METADATA_PER_PASS} rows per pass.
+   * Repair referenced problem metadata, at most `bound` keys per pass.
    *
    * Each key is attempted at most once per pass and a failed key is rotated to the end of the
    * durable backlog, so a permanently failing first key cannot starve the others; a failure never
    * discards the already imported submissions. Editorial material is never requested — only
    * `ImportService.refreshProblemMetadata` is used. A session-level failure or a rate limit stops
    * the phase with a typed, durable failure; transient failures just move on.
+   *
+   * ## Private user-created problems refuse the item, not the session
+   *
+   * `auth_required` or `forbidden` for a `U`-prefixed user-created problem is that item being denied
+   * to anonymous readers (see {@link isPrivateProblemRefusal}), not an expired session: the key is
+   * rotated and counted as failed exactly like any other item, the phase keeps its remaining keys,
+   * and the refusal is remembered as a **deferred** metadata failure so the backlog it leaves behind
+   * is still reported. A later session-level failure (a non-private refusal, a rate limit or a
+   * challenge) overwrites it and stops the phase, while any later success leaves it in place.
+   *
+   * ## Per-item commitment and the lease
+   *
+   * The lease is re-taken before every platform request and progress is persisted after every key,
+   * inside a transaction that re-validates that lease. A long metadata-only drain therefore shows a
+   * backlog that decreases while it runs, cannot outlive its lease, and stops — without one further
+   * request — the moment another owner takes the source over. The re-validation runs *inside* the
+   * gate's work callback, immediately before the request: the gate may park this operation for a
+   * while, and a lease that expired (or was taken over) during that wait must refuse the request
+   * rather than dispatch it on a stale claim.
+   *
+   * The returned `priorFailure` is the state's failure at entry, which the caller needs to tell a
+   * metadata failure this pass can repair from a history failure it never touched. The returned
+   * `failure` is the reason this phase stopped when it stopped, otherwise the remembered deferred
+   * private-key refusal, otherwise the last transient item failure.
    */
-  private async repairMetadata(account: Account, token: CancellationToken): Promise<LuoguSyncFailure | null> {
+  private async repairMetadata(
+    account: Account,
+    token: CancellationToken,
+    options: { readonly bound: number },
+  ): Promise<{ readonly failure: LuoguSyncFailure | null; readonly priorFailure: LuoguSyncFailure | null }> {
+    const bound = options.bound;
     const record = await this.store.getLuoguSyncState(account.id);
     if (record === null || record.value.owner !== this.ownerId) {
-      return null;
+      return { failure: null, priorFailure: null };
     }
+    const priorFailure = record.value.failure;
     const attempted = new Set<string>();
     const backlog = [...record.value.missingMetadata];
+    // Counters since the last durable save: each item is committed with its own delta, so a
+    // cumulative counter is never written twice.
     let resolved = 0;
     let failed = 0;
-    let failure: LuoguSyncFailure | null = null;
+    // Three distinct facts, kept apart on purpose: the loop must stop only for `stop`, while the
+    // durable failure it reports prefers `stop`, then the deferred item refusal, then the transient
+    // one. A deferred private-key refusal therefore survives every later success of this phase but
+    // is overwritten by a later session-level failure.
+    let stop: LuoguSyncFailure | null = null;
+    let deferred: LuoguSyncFailure | null = null;
+    let transient: LuoguSyncFailure | null = null;
     let fetches = 0;
-    while (fetches < LUOGU_SYNC_METADATA_PER_PASS && backlog.length > 0) {
+    while (fetches < bound && backlog.length > 0) {
       const key = backlog[0]!;
       if (attempted.has(key)) {
         // Every remaining key was already tried in this pass; the rest wait for the next one.
@@ -1339,39 +1609,96 @@ export class LuoguSyncService {
       attempted.add(key);
       fetches += 1;
       throwIfCancelled(token);
-      const report = await this.gate.run(token, () =>
-        this.imports.refreshProblemMetadata(this.metadataSource, {
-          problemRef: parseProblemKey(key),
+      // Parse once: the canonical reference decides both what is requested and whether a refusal is
+      // an item-level private-problem refusal instead of a session-level stop.
+      const problemRef = parseProblemKey(key);
+      // The lease is validated and renewed inside the gate callback, immediately before the request:
+      // the gate may park this operation for a long time, and a lease that expired or was taken over
+      // during that wait must refuse the request instead of dispatching it on a stale claim.
+      const report = await this.gate.run(token, async () => {
+        throwIfCancelled(token);
+        await this.renewLease(account.id, 'before a metadata request');
+        throwIfCancelled(token);
+        return this.imports.refreshProblemMetadata(this.metadataSource, {
+          problemRef,
           token,
           limits: this.limits,
-        }),
-      );
+        });
+      });
       backlog.shift();
       if (report.status === 'fetched') {
         resolved += 1;
-        continue;
+      } else {
+        failed += 1;
+        // Rotation is the durable fairness cursor: the failed key moves to the end of the backlog.
+        backlog.push(key);
+        const at = this.nowIso();
+        const code: LuoguSyncFailureCode = report.error === null ? 'internal' : failureCodeOf(report.error.code);
+        const itemFailure = this.buildFailure(
+          code,
+          at,
+          report.error === null ? null : report.error.retryAfterMs,
+          stop ?? deferred ?? transient,
+          'metadata',
+        );
+        if (isPrivateProblemRefusal(problemRef, code)) deferred = itemFailure;
+        else if (itemFailure.paused || code === 'rate_limited') stop = itemFailure;
+        else transient = itemFailure;
       }
-      failed += 1;
-      // Rotation is the durable fairness cursor: the failed key moves to the end of the backlog.
-      backlog.push(key);
-      const at = this.nowIso();
-      const code: LuoguSyncFailureCode = report.error === null ? 'internal' : failureCodeOf(report.error.code);
-      failure = this.buildFailure(
-        code,
-        at,
-        report.error === null ? null : report.error.retryAfterMs,
-        failure,
-        'metadata',
-      );
-      if (failure.paused || code === 'rate_limited') {
-        break;
+      const failure = stop ?? deferred ?? transient;
+      if (!(await this.saveMetadataProgress(account.id, { backlog, resolved, failed, failure }))) {
+        // The durable row belongs to another owner now: stop immediately, leave their row intact and
+        // let the keys still queued here be handled by whoever owns the source next.
+        throw new LuoguSyncError('lease_lost', 'another owner replaced the metadata pass lease', {
+          accountId: account.id,
+        });
       }
+      resolved = 0;
+      failed = 0;
+      if (stop !== null) break;
     }
-    await this.saveMetadataProgress(account.id, { backlog, resolved, failed, failure });
-    return failure;
+    return { failure: stop ?? deferred ?? transient, priorFailure };
   }
 
-  /** Persist backlog/rotation/counters under the pass's lease, never clobbering a newer owner. */
+  /**
+   * Re-take this pass's durable lease before one metadata request.
+   *
+   * The transaction only reads the state row and pushes the deadline forward; a missing row, a
+   * foreign owner or an already expired lease is a lost lease (`lease_lost`), never a silent renewal
+   * on behalf of someone else. No platform call and no wait happens inside the transaction.
+   */
+  private async renewLease(accountId: string, phase: string): Promise<void> {
+    const at = this.nowIso();
+    await this.store.transaction(async () => {
+      const record = await this.store.getLuoguSyncState(accountId);
+      if (
+        record === null ||
+        record.value.owner !== this.ownerId ||
+        !luoguLeaseLive(record.value, this.ownerId, at)
+      ) {
+        throw new DomainError('invalid_transition', `the synchronization lease was lost ${phase}`, {
+          reason: 'lease_lost',
+        });
+      }
+      await this.store.saveLuoguSyncState(
+        {
+          ...record.value,
+          leaseExpiresAt: new Date(Date.parse(at) + this.leaseMs).toISOString(),
+          updatedAt: at,
+        },
+        record.revision,
+      );
+    });
+  }
+
+  /**
+   * Persist backlog/rotation/counters under the pass's renewed lease.
+   *
+   * Returns `true` when the write committed, `false` when the durable row is owned by someone else
+   * (or changed under this pass). A long loop must stop on `false`: its remaining keys are stale,
+   * the newer owner's row must not be clobbered, and the problem rows of the answers already fetched
+   * are stored idempotently by the import service.
+   */
   private async saveMetadataProgress(
     accountId: string,
     progress: {
@@ -1380,13 +1707,17 @@ export class LuoguSyncService {
       readonly failed: number;
       readonly failure: LuoguSyncFailure | null;
     },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const at = this.nowIso();
     try {
-      await this.store.transaction(async () => {
+      return await this.store.transaction(async () => {
         const record = await this.store.getLuoguSyncState(accountId);
-        if (record === null || record.value.owner !== this.ownerId) {
-          return;
+        if (
+          record === null ||
+          record.value.owner !== this.ownerId ||
+          !luoguLeaseLive(record.value, this.ownerId, at)
+        ) {
+          return false;
         }
         await this.store.saveLuoguSyncState(
           {
@@ -1395,24 +1726,42 @@ export class LuoguSyncService {
             metadataResolved: record.value.metadataResolved + progress.resolved,
             metadataFailed: record.value.metadataFailed + progress.failed,
             failure: progress.failure ?? record.value.failure,
+            leaseExpiresAt: new Date(Date.parse(at) + this.leaseMs).toISOString(),
             updatedAt: at,
           },
           record.revision,
         );
+        return true;
       });
     } catch (error) {
       if (isStaleRevision(error)) {
         // A newer owner replaced the row while the metadata answers were being fetched. The fetched
         // problem rows are already stored (idempotent); the backlog update is dropped rather than
         // clobbering that owner, and the keys stay in the backlog for a later attempt.
-        return;
+        return false;
       }
       throw error;
     }
   }
 
-  /** Clear the lease and record the pass outcome; a newer owner's row is never overwritten. */
-  private async settleState(accountId: string, failure: LuoguSyncFailure | null): Promise<void> {
+  /**
+   * Clear the lease and record the pass outcome; a newer owner's row is never overwritten.
+   *
+   * A pass that produced no failure of its own settles `failure: null`, which is the documented rule
+   * for an ordinary, successful history+metadata pass: it retried both halves, so a previous failure
+   * is genuinely repaired. `keepPriorFailure` is the explicit exception, used by the two cases where
+   * `null` would report a success the pass did not achieve: a metadata-only run never reads history
+   * (so a stored history-stage or legacy stage-less failure is untouched evidence) and a pass cut
+   * short by a cancellation or a close must keep the failure one of its own earlier items already
+   * committed. `priorFailure` is the failure read at the start of the metadata phase; when the phase
+   * threw before returning it, the durable row is the honest fallback, because the per-item writes
+   * may already hold a newer failure committed by this same pass.
+   */
+  private async settleState(
+    accountId: string,
+    failure: LuoguSyncFailure | null,
+    options: { readonly keepPriorFailure: boolean; readonly priorFailure: LuoguSyncFailure | null },
+  ): Promise<void> {
     const at = this.nowIso();
     try {
       await this.store.transaction(async () => {
@@ -1420,8 +1769,10 @@ export class LuoguSyncService {
         if (record === null || record.value.owner !== this.ownerId) {
           return;
         }
+        const kept = options.priorFailure ?? record.value.failure;
+        const recorded = failure ?? (options.keepPriorFailure ? kept : null);
         await this.store.saveLuoguSyncState(
-          { ...record.value, owner: null, leaseExpiresAt: null, pagesInPass: 0, failure, updatedAt: at },
+          { ...record.value, owner: null, leaseExpiresAt: null, pagesInPass: 0, failure: recorded, updatedAt: at },
           record.revision,
         );
       });
@@ -1431,6 +1782,20 @@ export class LuoguSyncService {
       }
       throw error;
     }
+  }
+
+  /**
+   * True for the refusals that mean "this pass was stopped", not "this pass failed": a caller or
+   * service cancellation — including the platform-code form the metadata reader re-wraps it in — and
+   * a close. Each must keep the durable failure an earlier item of the same phase already committed
+   * instead of letting the pass settle as a fresh success.
+   */
+  private isCancellation(error: unknown): boolean {
+    return (
+      (error instanceof DomainError && error.code === 'cancelled') ||
+      (error instanceof LuoguSyncError && error.code === 'closing') ||
+      (isPlatformError(error) && error.code === 'cancelled')
+    );
   }
 
   /**
@@ -1471,6 +1836,11 @@ export class LuoguSyncService {
     let code: LuoguSyncFailureCode = 'internal';
     let retryAfterMs: number | null = null;
     if (error instanceof DomainError && error.code === 'cancelled') {
+      return null;
+    }
+    if (isPlatformError(error) && error.code === 'cancelled') {
+      // The metadata reader re-wraps a domain cancellation as this platform code; it is the same
+      // "the caller stopped this pass" signal, never a recorded failure of the platform read.
       return null;
     }
     if (isPlatformError(error)) {

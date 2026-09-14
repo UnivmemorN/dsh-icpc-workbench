@@ -66,8 +66,14 @@ export const LUOGU_SYNC_PAGE_SIZE = 50;
 /** History pages one pass may commit; the remainder resumes on the next pass. */
 export const LUOGU_SYNC_MAX_PAGES_PER_PASS = 20;
 
-/** Problem metadata rows one pass may fetch. */
-export const LUOGU_SYNC_METADATA_PER_PASS = 10;
+/**
+ * Problem metadata rows one **ordinary** pass may fetch.
+ *
+ * Raised from the original `10` by Sprint 22a so a routine pass repairs a useful batch; the explicit
+ * metadata-only start mode drains up to {@link LUOGU_SYNC_MAX_METADATA_BACKLOG} keys in one pass
+ * instead, one attempt per key.
+ */
+export const LUOGU_SYNC_METADATA_PER_PASS = 100;
 
 /**
  * Upper bound of the durable missing-metadata backlog.

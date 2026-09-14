@@ -9,7 +9,9 @@
  * 20-digit bound is an opaque format limit, not a claim about the numeric range behind the id.
  *
  * The profile URL is derived from the instance's own base URL, so a mirror or a future official
- * move keeps working, and the display name defaults to the user's own spelling of the number.
+ * move keeps working. The display name starts as `null` and stays optional: the numeric UID is the
+ * account's identity, while the platform nickname is a separate label refreshed from the public
+ * profile endpoint (`LuoguAdapter.fetchAccountProfile`), never derived from the number.
  */
 import { createAccount, parseAccountId, type Account, type SourceInstance } from '../../domain/index.js';
 import { PlatformError } from '../../application/platform-errors.js';

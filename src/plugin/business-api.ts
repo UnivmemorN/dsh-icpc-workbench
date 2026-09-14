@@ -672,24 +672,31 @@ async function createAccount(
   // Identity comes from the official factory only: a handle is canonicalized there (Codeforces
   // lowercases its own handle space, Luogu requires a canonical decimal UID), so this endpoint can
   // never create two accounts for one person by accepting a second spelling.
-  const account =
+  const buildAccount = (displayName: string | null) =>
     platform === 'codeforces'
-      ? createCodeforcesAccount(instance, input.handle, input.displayName ?? null)
+      ? createCodeforcesAccount(instance, input.handle, displayName)
       : platform === 'luogu'
-        ? createLuoguAccount(instance, input.handle, input.displayName ?? null)
+        ? createLuoguAccount(instance, input.handle, displayName)
         : neverPlatform(platform);
+  const draft = buildAccount(input.displayName ?? null);
   // Source and account are written together: an account whose instance row is missing could not be
-  // used for any later sync, and a half-written pair would stay invisible until then.
+  // used for any later sync, and a half-written pair would stay invisible until then. The stored
+  // row is read in the same transaction, so a repeated create that omits `displayName` keeps the
+  // nickname stored earlier (an explicit create or a `luogu.profile` refresh) instead of resetting
+  // it to null; an explicitly supplied name still replaces it as documented.
   const stored = await context.store.transaction(async () => {
     token.throwIfCancelled();
     await context.store.upsertSourceInstances([instance]);
     token.throwIfCancelled();
+    const existing = input.displayName === undefined ? await context.store.getAccount(draft.id) : null;
+    token.throwIfCancelled();
+    const account = existing?.displayName == null ? draft : buildAccount(existing.displayName);
     await context.store.upsertAccounts([account]);
     token.throwIfCancelled();
     return await context.store.getAccount(account.id);
   });
   if (stored === null) {
-    throw new DomainError('invalid_transition', `account ${account.id} was not stored`, { accountId: account.id });
+    throw new DomainError('invalid_transition', `account ${draft.id} was not stored`, { accountId: draft.id });
   }
   return { account: accountView(stored), source: sourceView(instance) };
 }

@@ -50,6 +50,7 @@ const OPERATIONS={
  'luogu.configure':true,
  'luogu.start':true,
  'luogu.cancel':true,
+ 'luogu.profile':true,
  'assessment.config':true,
  'assessment.prepare':true,
  'assessment.run':true,

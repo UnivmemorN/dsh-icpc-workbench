@@ -11,7 +11,7 @@ import { ModelOperations } from './model-operations.js';
 import { ApiTransportError, registerApiRoute, type ApiRouteOptions } from './api-transport.js';
 import { requestShape } from './model-api.js';
 import { disposeAll, rollback } from './lifecycle.js';
-export const PLUGIN_VERSION='0.1.16';
+export const PLUGIN_VERSION='0.1.17';
 export interface BootstrapApiOptions extends ApiRouteOptions {
   readonly registry:HostConnectionFetch; readonly store:TrainingStore&SettingsStore;
   readonly controller:ModelOperations; readonly catalog:ModelCatalog; readonly dataDir:string;

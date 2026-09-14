@@ -22,6 +22,11 @@ import {
   LUOGU_INTERVAL_MIN_MINUTES,
   LUOGU_MANUAL_STILL_AVAILABLE,
   LUOGU_METADATA_FAILURE_GUIDANCE,
+  LUOGU_METADATA_DRAIN_LABEL,
+  LUOGU_METADATA_DRAIN_NOTE,
+  LUOGU_METADATA_START_OUTCOMES,
+  LUOGU_NO_AI_NOTE,
+  LUOGU_ACTION_LABELS,
   LUOGU_POLL_ACTIVE_MS,
   LUOGU_POLL_IDLE_MS,
   LUOGU_RECENT_WINDOW_NOTE,
@@ -262,6 +267,8 @@ void test('the connection controls follow availability, the secret draft and the
 void test('start, full reconciliation and pause follow the durable status', () => {
   const idle = controls(status());
   assert.equal(idle.start.enabled, true);
+  assert.equal(idle.metadata.enabled, false, 'an empty backlog offers nothing to drain');
+  assert.match(idle.metadata.reason ?? '', /积压/);
   assert.equal(idle.reconcile.enabled, false);
   assert.match(idle.reconcile.reason ?? '', /勾选确认/);
   assert.equal(controls(status(), { fullConfirmed: true }).reconcile.enabled, true);
@@ -272,6 +279,8 @@ void test('start, full reconciliation and pause follow the durable status', () =
   assert.equal(running.start.enabled, false);
   assert.match(running.start.reason ?? '', /暂停本轮/);
   assert.equal(running.cancel.enabled, true);
+  assert.equal(running.metadata.enabled, false, 'a running pass blocks the drain action');
+  assert.match(running.metadata.reason ?? '', /暂停本轮/);
 
   // A live lease of another instance does not block the reservation: the service coalesces or queues
   // it, and the panel reports the returned outcome instead of guessing.
@@ -283,15 +292,43 @@ void test('start, full reconciliation and pause follow the durable status', () =
   assert.match(expired.start.reason ?? '', /登录已过期/);
 
   const closing = controls(status({ closing: true, running: true }));
-  for (const action of ['connect', 'probe', 'disconnect', 'start', 'reconcile', 'cancel', 'configure'] as const) {
+  for (const action of ['connect', 'probe', 'disconnect', 'start', 'metadata', 'reconcile', 'cancel', 'configure'] as const) {
     assert.equal(closing[action].enabled, false);
     assert.match(closing[action].reason ?? '', /关闭/);
   }
 });
 
+void test('the backlog drain action follows the backlog, the connection and a running pass', () => {
+  const backlog = controls(status({ metadataBacklog: 12 }));
+  assert.equal(backlog.metadata.enabled, true);
+  const unconnected = controls(status({ metadataBacklog: 12, connection: null }));
+  assert.equal(unconnected.metadata.enabled, false);
+  assert.match(unconnected.metadata.reason ?? '', /尚未连接/);
+  assert.equal(controls(status({ metadataBacklog: 12 }), { busy: 'metadata' }).metadata.enabled, false);
+  assert.match(controls(status({ metadataBacklog: 12 }), { busy: 'metadata' }).metadata.reason ?? '', /仍在进行/);
+});
+
+void test('the backlog drain copy states the batch, pacing, background and no-AI facts', () => {
+  assert.equal(LUOGU_METADATA_DRAIN_LABEL, '补齐全部积压资料（不使用 AI）');
+  assert.equal(LUOGU_ACTION_LABELS.metadata, '补齐积压资料');
+  assert.equal(
+    LUOGU_NO_AI_NOTE,
+    '洛谷同步直接读取洛谷平台数据，不调用 AI 模型，也不消耗 AI 额度。',
+    'the note states platform data, never the authenticated history as a public interface',
+  );
+  assert.match(LUOGU_METADATA_DRAIN_NOTE, /100 条/);
+  assert.match(LUOGU_METADATA_DRAIN_NOTE, /2 秒/);
+  assert.match(LUOGU_METADATA_DRAIN_NOTE, /几十分钟/);
+  assert.match(LUOGU_METADATA_DRAIN_NOTE, /不使用 AI/);
+  assert.match(LUOGU_METADATA_DRAIN_NOTE, /保持运行/);
+  assert.match(LUOGU_METADATA_DRAIN_NOTE, /不读取提交历史/);
+  assert.match(LUOGU_METADATA_DRAIN_NOTE, /每题只尝试一次/);
+  assert.deepEqual(Object.keys(LUOGU_METADATA_START_OUTCOMES).sort(), ['coalesced', 'queued', 'started']);
+});
+
 void test('one host action at a time and a missing status disable everything with a reason', () => {
   const busy = controls(status(), { busy: 'start', settingsDirty: true, fullConfirmed: true });
-  for (const action of ['connect', 'probe', 'disconnect', 'start', 'reconcile', 'cancel', 'configure'] as const) {
+  for (const action of ['connect', 'probe', 'disconnect', 'start', 'metadata', 'reconcile', 'cancel', 'configure'] as const) {
     assert.equal(busy[action].enabled, false);
     assert.match(busy[action].reason ?? '', /仍在进行/);
   }

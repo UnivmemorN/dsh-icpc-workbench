@@ -19,6 +19,8 @@ import {
 } from '../../src/application/local-credential-vault.js';
 import { PlatformError } from '../../src/application/platform-errors.js';
 import type {
+  AccountProfile,
+  FetchAccountProfileRequest,
   FetchProblemRequest,
   PlatformAdapter,
   PlatformCapabilities,
@@ -336,13 +338,19 @@ export interface MetadataHarness {
   readonly adapter: PlatformAdapter;
   readonly calls: string[];
   readonly fail: Map<string, PlatformError>;
+  /** Profiles the anonymous source answers per canonical uid; an absent uid is a `changed_response`. */
+  readonly profiles: Map<string, AccountProfile>;
+  /** Canonical uids `fetchAccountProfile` was asked for, in order. */
+  readonly profileCalls: string[];
   editorialCalls(): number;
 }
 
-/** Anonymous metadata source that answers only `fetchProblem` and never an editorial request. */
+/** Anonymous metadata source that answers `fetchProblem` and `fetchAccountProfile`, never editorial. */
 export function createMetadataAdapter(instance: SourceInstance, now: () => string): MetadataHarness {
   const calls: string[] = [];
   const fail = new Map<string, PlatformError>();
+  const profiles = new Map<string, AccountProfile>();
+  const profileCalls: string[] = [];
   let editorial = 0;
   const adapter: PlatformAdapter = {
     sourceInstance: instance,
@@ -388,8 +396,21 @@ export function createMetadataAdapter(instance: SourceInstance, now: () => strin
       editorial += 1;
       return { status: 'absent', detail: 'the sync service must never request editorial material' };
     },
+    async fetchAccountProfile(request: FetchAccountProfileRequest): Promise<AccountProfile> {
+      profileCalls.push(request.account.handle);
+      const profile = profiles.get(request.account.handle);
+      if (profile === undefined) {
+        throw new PlatformError({
+          code: 'changed_response',
+          operation: 'profile',
+          retryable: false,
+          detail: 'the synthetic profile source has no profile for this uid',
+        });
+      }
+      return profile;
+    },
   };
-  return { adapter, calls, fail, editorialCalls: () => editorial };
+  return { adapter, calls, fail, profiles, profileCalls, editorialCalls: () => editorial };
 }
 
 /** Let pending microtasks and one macrotask run until `predicate` holds. */

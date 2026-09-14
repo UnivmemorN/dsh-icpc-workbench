@@ -9,6 +9,7 @@
  * answers with its typed platform error rather than being mistaken for data.
  */
 import { PlatformError, type PlatformOperation } from '../../application/platform-errors.js';
+import { LUOGU_UID_PATTERN } from './account.js';
 
 /** Official Luogu problem ids: `P1000`, `CF20C`, `AT_abc123_a`, `SP1234`, ... */
 export const LUOGU_PID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
@@ -118,6 +119,65 @@ export function requirePid(value: unknown, label: string, operation: PlatformOpe
     throw payloadError(operation, `${label} must be an official Luogu problem id`);
   }
   return value.trim();
+}
+
+/** Longest accepted Luogu profile nickname; a longer name is a changed response, not truncated data. */
+export const MAX_LUOGU_DISPLAY_NAME_CHARS = 256;
+/** Control characters are never part of a display name and would corrupt a single-line answer. */
+const UNSAFE_DISPLAY_NAME = /[\u0000-\u001f\u007f]/u;
+
+/** Validated public profile of one Luogu account: the requested uid and its own nickname. */
+export interface LuoguAccountProfile {
+  readonly uid: string;
+  readonly displayName: string;
+}
+
+/**
+ * Parse one `GET /user/<uid>` answer.
+ *
+ * Only `data.user` is the requested profile. `root.user` is the **viewer** identity Lentille
+ * attaches to the anonymous request itself, so a payload that carries only the viewer (or a
+ * `data.user` of a different uid) is refused instead of showing one account's name on another.
+ * The answered uid must equal the requested canonical UID, accepted as a positive safe integer or
+ * as the canonical decimal string; the nickname must be a non-blank string within
+ * {@link MAX_LUOGU_DISPLAY_NAME_CHARS} characters and without control characters. Every other
+ * profile field is deliberately not read.
+ */
+export function parseAccountProfile(
+  root: Record<string, unknown>,
+  expectedUid: string,
+  operation: PlatformOperation = 'profile',
+): LuoguAccountProfile {
+  const data = luoguData(root, operation);
+  const user = requireRecord(data.user, 'data.user', operation);
+  const uid = requireProfileUid(user.uid, expectedUid, operation);
+  const displayName = requireNonEmptyString(user.name, 'data.user.name', operation);
+  if (displayName.length > MAX_LUOGU_DISPLAY_NAME_CHARS) {
+    throw payloadError(operation, `data.user.name exceeds ${MAX_LUOGU_DISPLAY_NAME_CHARS} characters`);
+  }
+  if (UNSAFE_DISPLAY_NAME.test(displayName)) {
+    throw payloadError(operation, 'data.user.name contains control characters');
+  }
+  return { uid, displayName };
+}
+
+/** The answered uid, canonicalized and proven to be exactly the requested account's uid. */
+function requireProfileUid(value: unknown, expectedUid: string, operation: PlatformOperation): string {
+  let uid: string;
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw payloadError(operation, 'data.user.uid must be a positive safe integer or a canonical decimal string');
+    }
+    uid = String(value);
+  } else if (typeof value === 'string' && LUOGU_UID_PATTERN.test(value)) {
+    uid = value;
+  } else {
+    throw payloadError(operation, 'data.user.uid must be a positive safe integer or a canonical decimal string');
+  }
+  if (uid !== expectedUid) {
+    throw payloadError(operation, `data.user.uid ${uid} does not match the requested account ${expectedUid}`);
+  }
+  return uid;
 }
 
 /**

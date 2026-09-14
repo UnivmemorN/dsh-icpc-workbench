@@ -56,6 +56,18 @@ The Luogu history adapter references the account-history workflow and public end
 
 Sprint 21a bundles a public id → display-name snapshot read from [Luogu's public tag payload](https://www.luogu.com.cn/_lfe/tags), retrieved 2026-09-14 (HTTP 200, 505 entries). Only public tag identifiers and their platform display names are stored; the snapshot contains no problem statements, editorials, submissions, account records or other user material, and no third-party code is copied. These names are platform metadata for Luogu's own raw tags, not an algorithm taxonomy and not a verification by this plugin: unknown future ids stay explicitly unnamed, the snapshot is versioned with the plugin, and stored records are never migrated, re-imported or rewritten. No third-party license is asserted for this factual metadata here; Luogu does not license or endorse this plugin. See [docs/luogu-tag-names.md](docs/luogu-tag-names.md).
 
+## Luogu public nickname presentation
+
+Sprint 22b2 presents a Luogu account's public nickname next to its UID. The read uses Luogu's own
+public profile page, `GET https://www.luogu.com.cn/user/<UID>` with the `x-lentille-request:
+content-only` request header, verified anonymously by the coordinator on 2026-09-14; the official
+reference page <https://www.luogu.com.cn/user/1> is cited only to identify that endpoint. Only
+`data.user.uid` and `data.user.name` are read — never `root.user` (the viewer identity a logged-in
+page may include), and never biography, scores, submissions or other profile content. The
+implementation here is independent: no profile body, upstream code or dataset is copied, and no AI
+model is involved. Luogu does not license or endorse this plugin. See
+[docs/luogu-account-names.md](docs/luogu-account-names.md).
+
 ## Installable training methods
 
 The balanced thinking/templates method implements this project user's design requirements. The optional deliberate-practice companion adapts teaching ideas from [USACO Guide — How to Practice](https://usaco.guide/general/practicing), Competitive Programming Initiative and credited page contributors including Darren Yao, Nathan Wang and Benjamin Qi, checked 2026-09-14. Its teaching text is separately licensed CC BY-NC-SA 4.0; JavaScript registration is MIT. Full attribution, adaptation notes and source license are included in that companion's NOTICE.md and LICENSE.method-text. No source code, problem statements, solutions or page images are copied.

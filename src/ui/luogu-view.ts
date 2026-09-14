@@ -422,12 +422,17 @@ export const LUOGU_FAILURE_GUIDANCE: Readonly<Record<LuoguSyncFailureCode, strin
  * evidence that the saved login expired: every sentence says so instead of sending the user to
  * reconnect for something a reconnect cannot fix. Codes without an entry keep the stage-less
  * sentence, which is already accurate for them (a rate limit or an outage preserves progress).
+ *
+ * A `U`-prefixed (user-created) problem that refuses anonymous readers is an item-level failure: it
+ * stays in the backlog while the drain keeps processing other keys, so a sentence below can describe
+ * a single pending item rather than a stopped pass. A refusal, a rate limit or an unexpected page on
+ * a public problem still stops the drain, and this repair never falls back to the saved login.
  */
 export const LUOGU_METADATA_FAILURE_GUIDANCE: Readonly<Partial<Record<LuoguSyncFailureCode, string>>> = {
   auth_required:
     '上一轮在补齐题目资料（公开题目数据）时被平台要求登录：这不代表保存的登录凭据已过期，也不能靠重新连接解决。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队。请先在普通浏览器里确认账号与网络可用，并点「检查登录」查看当前登录；若登录检查成功，可以稍后手动继续同步来补资料。',
   forbidden:
-    '上一轮在补齐题目资料时被平台拒绝访问：题目资料是公开数据，这不代表登录凭据失效。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队；请稍后在普通浏览器里确认能正常访问洛谷，再手动继续。',
+    '上一轮在补齐题目资料时被平台拒绝访问：此步骤使用匿名读取，这不代表登录凭据失效。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队；请稍后在普通浏览器里确认能正常访问洛谷，再手动继续。',
   changed_response:
     '上一轮在补齐题目资料时平台返回与预期不符：可能是人工验证或页面结构变化；此错误不表示本地记录损坏。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队，可稍后手动继续；不要为此做「全历史完整核对」。',
 };
@@ -511,6 +516,43 @@ export const LUOGU_START_OUTCOMES: Readonly<Record<ApiLuoguStartResult['outcome'
   queued: '已排队：会在一轮结束后开始，等待期间可以离开页面。',
 };
 
+/**
+ * Label of the explicit backlog-drain action (Sprint 22a).
+ *
+ * The parenthetical is the user-visible answer to "does synchronization cost AI credits?": this
+ * action reads public problem data from Luogu only and never invokes a model.
+ */
+export const LUOGU_METADATA_DRAIN_LABEL = '补齐全部积压资料（不使用 AI）';
+
+/**
+ * The one short, always-visible answer to whether synchronization uses AI (Sprint 22a).
+ *
+ * The full explanation is rendered once inside「同步详情」({@link LUOGU_METADATA_DRAIN_NOTE}).
+ */
+export const LUOGU_NO_AI_NOTE =
+  '洛谷同步直接读取洛谷平台数据，不调用 AI 模型，也不消耗 AI 额度。';
+
+/**
+ * Long guidance of the backlog-drain action, rendered exactly once inside「同步详情」(Sprint 22a).
+ *
+ * It states every fact a user needs before starting a long run: the ordinary per-pass batch, the
+ * source-wide pacing, the one-attempt-per-key rule, that the page may be left while dsh must stay
+ * open, that「暂停本轮」keeps finished items, and that no history or AI work is involved.
+ */
+export const LUOGU_METADATA_DRAIN_NOTE =
+  '普通「开始 / 继续同步」每轮最多补齐 100 条题目资料；积压较多时可以点「补齐全部积压资料（不使用 AI）」一次处理当前积压。' +
+  '该动作按题逐个请求洛谷公开题目数据，每个请求之间至少间隔 2 秒，开始时已有的积压每题只尝试一次，做完就停；积压较大时可能需要几十分钟。' +
+  '进度按题保存在本机，可以离开页面，但 dsh 需要保持运行；「暂停本轮」会保留已完成的进度，之后再点一次即可继续。' +
+  '自建或私有 U 类题目可能无法匿名读取；受限题保留待补，并继续处理其他题目。公开题访问受限、限流或页面异常仍会暂停。' +
+  '它不读取提交历史，也不改变历史覆盖、检查点、自动同步设置或计划。';
+
+/** Text of a `luogu.start` answer in the metadata-only mode; every outcome is stated as committed. */
+export const LUOGU_METADATA_START_OUTCOMES: Readonly<Record<ApiLuoguStartResult['outcome'], string>> = {
+  started: '已开始补齐积压资料（不使用 AI）：进度按题提交，页面可以离开，dsh 需要保持运行。',
+  coalesced: '已并入正在运行的同一轮补齐积压资料，没有重复开始。',
+  queued: '已排队：会在一轮结束后开始，等待期间可以离开页面。',
+};
+
 // ---------------------------------------------------------------------------------------
 // Controls
 // ---------------------------------------------------------------------------------------
@@ -527,6 +569,7 @@ export type LuoguAction =
   | 'disconnect'
   | 'start'
   | 'reconcile'
+  | 'metadata'
   | 'cancel'
   | 'configure';
 
@@ -536,6 +579,7 @@ export const LUOGU_ACTION_LABELS: Readonly<Record<LuoguAction, string>> = {
   disconnect: '断开连接',
   start: '开始 / 继续同步',
   reconcile: '全历史完整核对',
+  metadata: '补齐积压资料',
   cancel: '暂停本轮',
   configure: '保存自动同步设置',
 };
@@ -599,6 +643,12 @@ export function luoguControls(input: LuoguControlInput): Readonly<Record<LuoguAc
         ? ALLOWED
         : { enabled: false, reason: connectionReason },
     start: syncReason === null ? ALLOWED : { enabled: false, reason: syncReason },
+    metadata:
+      syncReason !== null
+        ? { enabled: false, reason: syncReason }
+        : status.metadataBacklog === 0
+          ? { enabled: false, reason: '当前没有待补的题目资料：积压为 0 时不会发起任何请求。' }
+          : ALLOWED,
     reconcile:
       syncReason !== null
         ? { enabled: false, reason: syncReason }
@@ -619,6 +669,7 @@ function denyAll(reason: string): Readonly<Record<LuoguAction, LuoguControl>> {
     probe: denied,
     disconnect: denied,
     start: denied,
+    metadata: denied,
     reconcile: denied,
     cancel: denied,
     configure: denied,

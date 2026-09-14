@@ -22,13 +22,19 @@ import { createLuoguSourceGate, type LuoguSourceGate } from '../../src/applicati
 import { LuoguSyncError, LuoguSyncService } from '../../src/application/luogu-sync-service.js';
 import {
   LUOGU_SYNC_MAX_METADATA_BACKLOG,
+  LUOGU_SYNC_METADATA_PER_PASS,
   LUOGU_SYNC_OVERLAP_MS,
   emptyLuoguSyncState,
+  type LuoguSyncFailure,
+  type LuoguSyncState,
 } from '../../src/application/luogu-sync-types.js';
 import { PlatformError } from '../../src/application/platform-errors.js';
 import { DEFAULT_PLATFORM_LIMITS, type PlatformLimits } from '../../src/application/ports.js';
 import {
+  DomainError,
+  accountIdOf,
   createCancellationSource,
+  createSourceInstance,
   type Account,
   type CancellationToken,
   type SourceInstance,
@@ -218,6 +224,24 @@ function checkpointOf(world: World, accountId: string): Promise<unknown> {
   });
 }
 
+/** Seed one account's durable state with a distinct missing-metadata backlog and no history work. */
+async function seedBacklog(
+  world: World,
+  accountId: string,
+  externalKeys: readonly string[],
+  overrides: Partial<LuoguSyncState> = {},
+): Promise<void> {
+  await world.store.saveLuoguSyncState(
+    {
+      ...emptyLuoguSyncState(accountId, world.instance.id, fx.AT),
+      missingMetadata: buildProblemKeys(world.instance, externalKeys),
+      ...overrides,
+      updatedAt: fx.AT,
+    },
+    null,
+  );
+}
+
 void test('connect, backfill, checkpoint, incremental resume, AC projection and reconnect persistence', async () => {
   const world = await createWorld({ alice: { total: 60, pids: ['P1000', 'P1001', 'P1002'] } });
   try {
@@ -387,19 +411,23 @@ void test('a nearly full metadata backlog blocks paging before the fetch and nev
     assert.equal(status.historyComplete, false);
     assert.equal(status.lastScanStartedAt, null, 'a metadata-only pass does not advance history watermarks');
     assert.equal(status.resumePending, false);
-    assert.equal(status.metadataResolved, 10);
+    assert.equal(status.metadataResolved, LUOGU_SYNC_METADATA_PER_PASS);
     assert.equal(status.metadataFailed, 0);
-    assert.equal(status.metadataBacklog, 1951 - 10);
+    assert.equal(status.metadataBacklog, 1951 - LUOGU_SYNC_METADATA_PER_PASS);
     assert.equal(status.metadataBacklogFull, false);
     assert.equal(status.backlogDropped, 0);
 
     const record = await world.store.getLuoguSyncState(world.alice.id);
     const backlog = record?.value.missingMetadata ?? [];
-    assert.equal(backlog.length, 1941);
-    assert.equal(new Set(backlog).size, 1941, 'every remaining key is distinct and still recorded');
+    assert.equal(backlog.length, 1951 - LUOGU_SYNC_METADATA_PER_PASS);
+    assert.equal(
+      new Set(backlog).size,
+      1951 - LUOGU_SYNC_METADATA_PER_PASS,
+      'every remaining key is distinct and still recorded',
+    );
     for (const key of buildProblemKeys(
       world.instance,
-      seededKeys.slice(0, 10),
+      seededKeys.slice(0, LUOGU_SYNC_METADATA_PER_PASS),
     )) {
       assert.equal(backlog.includes(key), false, `the resolved key ${key} left the backlog`);
     }
@@ -1260,6 +1288,1189 @@ void test('an exception thrown while repairing metadata is recorded as a metadat
     assert.equal(status.paused, true);
     assert.equal(status.metadataBacklog, 1);
     assert.equal(await countSubmissions(world.store, world.alice.id), 3);
+  } finally {
+    await world.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Sprint 22a: the raised ordinary metadata batch and the explicit backlog-drain action
+// ---------------------------------------------------------------------------------------
+
+void test('an ordinary pass repairs exactly the raised 100-item metadata batch and leaves the rest queued', async () => {
+  const world = await createWorld({ alice: { total: 3, pids: ['P1000'] } });
+  try {
+    const service = world.makeService('svc-batch-100');
+    const keys = ['P1000', ...Array.from({ length: 104 }, (_, index) => `R${index + 1}`)];
+    await seedBacklog(world, world.alice.id, keys, {
+      phase: 'incremental',
+      historyComplete: true,
+      historyCompletedAt: fx.AT,
+      lastScanStartedAt: fx.AT,
+      lastSuccessAt: fx.AT,
+    });
+    await service.connect(world.alice.id, cookieFor('100001'), world.token);
+    assert.equal(LUOGU_SYNC_METADATA_PER_PASS, 100, 'Sprint 22a raised the ordinary per-pass batch');
+
+    assert.equal((await service.start(world.alice.id, 'resume')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.equal(status.metadataResolved, 100, 'an ordinary pass repairs exactly one raised batch');
+    assert.equal(status.metadataFailed, 0);
+    assert.equal(status.metadataBacklog, keys.length - 100);
+    assert.equal(world.metadata.calls.length, 100, 'the ordinary batch is never exceeded');
+    assert.equal(status.historyComplete, true, 'the history half still completed normally');
+    const record = await world.store.getLuoguSyncState(world.alice.id);
+    assert.equal(record?.value.missingMetadata.length, keys.length - 100, 'the rest stays queued, never dropped');
+    assert.equal(record?.value.backlogDropped, 0);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('the metadata-only action drains a backlog larger than one ordinary pass without reading history', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-metadata-drain');
+    const keys = Array.from({ length: 105 }, (_, index) => `M${index + 1}`);
+    await seedBacklog(world, world.alice.id, keys);
+    const feedCallsBefore = world.feed.calls.length;
+
+    const started = await service.start(world.alice.id, 'metadata');
+    assert.equal(started.mode, 'metadata');
+    assert.equal(started.outcome, 'started');
+    await service.settle();
+
+    const status = await service.status(world.alice.id);
+    assert.deepEqual([...world.metadata.calls].sort(), [...keys].sort(), 'every key was attempted');
+    assert.equal(new Set(world.metadata.calls).size, 105, 'one attempt per key, never an infinite retry');
+    assert.equal(world.feed.calls.length, feedCallsBefore, 'the metadata-only action never reads a history page');
+    assert.equal(status.metadataResolved, 105);
+    assert.equal(status.metadataFailed, 0);
+    assert.equal(status.metadataBacklog, 0);
+    assert.equal(status.phase, 'backfill', 'no history phase was invented');
+    assert.equal(status.historyComplete, false, 'a metadata-only action never claims history coverage');
+    assert.equal(status.scanStartedAt, null);
+    assert.equal(status.lastScanStartedAt, null, 'the last successful history scan is untouched');
+    assert.equal(status.lastSuccessAt, null);
+    assert.equal(status.resumePending, false, 'no checkpoint continuation was created');
+    assert.equal(await checkpointOf(world, world.alice.id), null);
+    assert.equal(status.totalPages, 0);
+    assert.equal(status.running, false);
+    assert.equal(status.leaseOwner, null, 'the metadata-only pass released its lease');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('metadata progress is committed per item, is visible mid-run and survives a pause', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-metadata-progress');
+    const keys = Array.from({ length: 30 }, (_, index) => `D${index + 1}`);
+    await seedBacklog(world, world.alice.id, keys);
+    const originalFetch = world.metadata.adapter.fetchProblem.bind(world.metadata.adapter);
+    const gate = deferred();
+    let served = 0;
+    world.metadata.adapter.fetchProblem = async (request) => {
+      served += 1;
+      if (served === 3) {
+        await gate.promise;
+      }
+      return originalFetch(request);
+    };
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await until(() => served >= 3, 'the third request is held after two items were committed');
+    const during = await service.status(world.alice.id);
+    assert.equal(during.running, true, 'the pass is still running while progress is already visible');
+    assert.equal(during.metadataResolved, 2, 'finished items are durable before the pass ends');
+    assert.equal(during.metadataBacklog, 28);
+
+    const cancelled = service.cancel(world.alice.id);
+    await sleep(20);
+    gate.release();
+    await cancelled;
+
+    const after = await service.status(world.alice.id);
+    assert.equal(after.running, false);
+    assert.equal(after.metadataResolved, 2, 'pausing keeps every item committed before the pause');
+    assert.equal(
+      after.metadataBacklog,
+      28,
+      'the remaining queue is kept, including the key whose in-flight answer the cancellation discarded',
+    );
+    assert.equal(after.metadataFailed, 0);
+    assert.equal(after.leaseOwner, null, 'the paused pass released its lease');
+    assert.equal(world.metadata.calls.length, 3, 'no further request is issued after the pause');
+    assert.equal(await checkpointOf(world, world.alice.id), null, 'a metadata pause writes no checkpoint');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a metadata drain renews its lease and keeps working past the former lease duration', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-metadata-lease');
+    const keys = Array.from({ length: 5 }, (_, index) => `L${index + 1}`);
+    await seedBacklog(world, world.alice.id, keys);
+    const startedAt = world.clock.nowMs();
+    const originalFetch = world.metadata.adapter.fetchProblem.bind(world.metadata.adapter);
+    world.metadata.adapter.fetchProblem = async (request) => {
+      // Each synthetic request takes 30 seconds, so the run outlives the initial 120-second lease.
+      world.clock.advance(30_000);
+      return originalFetch(request);
+    };
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.equal(world.metadata.calls.length, 5);
+    assert.equal(status.metadataResolved, 5, 'renewal keeps the whole drain alive');
+    assert.equal(status.metadataBacklog, 0);
+    assert.equal(status.failure, null, 'no lease_lost failure is recorded while the lease is renewed');
+    assert.ok(world.clock.nowMs() - startedAt >= 150_000, 'the run really outlived the original lease');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a takeover during a metadata drain stops it without clobbering the new owner', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-metadata-takeover');
+    const keys = Array.from({ length: 12 }, (_, index) => `T${index + 1}`);
+    await seedBacklog(world, world.alice.id, keys);
+    const originalFetch = world.metadata.adapter.fetchProblem.bind(world.metadata.adapter);
+    const gate = deferred();
+    let served = 0;
+    world.metadata.adapter.fetchProblem = async (request) => {
+      served += 1;
+      if (served === 3) {
+        await gate.promise;
+      }
+      return originalFetch(request);
+    };
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await until(() => served >= 3, 'the third request is in flight after two items were committed');
+
+    // Another instance takes the source over while the third request of this pass is still running.
+    const record = await world.store.getLuoguSyncState(world.alice.id);
+    assert.ok(record !== null);
+    await world.store.saveLuoguSyncState(
+      {
+        ...record.value,
+        owner: 'svc-other',
+        leaseExpiresAt: new Date(world.clock.nowMs() + 120_000).toISOString(),
+        updatedAt: world.clock.now(),
+      },
+      record.revision,
+    );
+    gate.release();
+    await service.settle();
+
+    const after = await world.store.getLuoguSyncState(world.alice.id);
+    assert.equal(after?.value.owner, 'svc-other', 'the losing pass never clobbers the new owner');
+    assert.equal(after?.value.missingMetadata.length, 10, 'the two committed keys stay committed');
+    assert.equal(after?.value.failure, null, 'the losing pass writes no failure over the new owner');
+    assert.equal(world.metadata.calls.length, 3, 'no further request is issued after the lease is lost');
+    assert.equal((await service.status(world.alice.id)).running, false, 'the pass itself stopped');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a metadata action coalesces with itself and refuses an incompatible history action', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-metadata-modes');
+    const keys = Array.from({ length: 6 }, (_, index) => `C${index + 1}`);
+    await seedBacklog(world, world.alice.id, keys);
+    const originalFetch = world.metadata.adapter.fetchProblem.bind(world.metadata.adapter);
+    const gate = deferred();
+    let served = 0;
+    world.metadata.adapter.fetchProblem = async (request) => {
+      served += 1;
+      if (served === 2) {
+        await gate.promise;
+      }
+      return originalFetch(request);
+    };
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await until(() => served >= 2, 'the first item is committed and the second request is held');
+    const [first, second] = await Promise.all([
+      service.start(world.alice.id, 'metadata'),
+      service.start(world.alice.id, 'metadata'),
+    ]);
+    assert.equal(first.outcome, 'coalesced');
+    assert.equal(second.outcome, 'coalesced');
+    for (const mode of ['resume', 'full'] as const) {
+      await assert.rejects(
+        service.start(world.alice.id, mode),
+        (error: unknown) => error instanceof LuoguSyncError && error.code === 'busy',
+        `an incompatible ${mode} action is refused instead of being queued`,
+      );
+    }
+
+    gate.release();
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.equal(status.metadataResolved, 6, 'the metadata pass alone drained the backlog');
+    assert.equal(status.metadataBacklog, 0);
+    assert.equal(status.totalPages, 0, 'no history page was committed');
+    assert.equal(status.historyComplete, false, 'the refused history action queued nothing');
+    assert.equal(world.feed.calls.length, 0, 'the refused history action never touched the platform');
+    assert.equal(world.metadata.calls.length, 6);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('closing the service drains a held metadata pass and keeps its committed progress', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-metadata-close');
+    const keys = Array.from({ length: 8 }, (_, index) => `H${index + 1}`);
+    await seedBacklog(world, world.alice.id, keys);
+    const originalFetch = world.metadata.adapter.fetchProblem.bind(world.metadata.adapter);
+    const gate = deferred();
+    let served = 0;
+    world.metadata.adapter.fetchProblem = async (request) => {
+      served += 1;
+      if (served === 2) {
+        await gate.promise;
+      }
+      return originalFetch(request);
+    };
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await until(() => served >= 2, 'the first item is committed and the second request is held');
+    const closing = service.close();
+    await sleep(20);
+    gate.release();
+    await closing;
+
+    const status = await service.status(world.alice.id);
+    assert.equal(status.running, false);
+    assert.equal(status.metadataResolved, 1, 'the close keeps every item committed before it drained the pass');
+    assert.equal(
+      status.metadataBacklog,
+      7,
+      'the whole remaining queue is kept, including the key whose in-flight answer the cancellation discarded',
+    );
+    await assert.rejects(
+      service.start(world.alice.id, 'metadata'),
+      (error: unknown) => error instanceof LuoguSyncError && error.code === 'closing',
+    );
+    assert.equal(world.metadata.calls.length, 2, 'the close issued no further platform request');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a metadata action is refused as busy while a history pass owns the source', async () => {
+  const world = await createWorld({ alice: { total: 60, pids: ['P1000'] } });
+  try {
+    const service = world.makeService('svc-metadata-busy');
+    await service.connect(world.alice.id, cookieFor('100001'), world.token);
+    world.feed.holdNext = 1;
+    assert.equal((await service.start(world.alice.id, 'resume')).outcome, 'started');
+    await until(() => world.feed.heldCount() === 1, 'the history pass is parked inside its first page');
+    await assert.rejects(
+      service.start(world.alice.id, 'metadata'),
+      (error: unknown) => error instanceof LuoguSyncError && error.code === 'busy',
+      'a metadata action never queues behind a history pass',
+    );
+    world.feed.release();
+    await service.settle();
+    assert.equal(await countSubmissions(world.store, world.alice.id), 60);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a rate-limited metadata item is rotated once and stops the phase with its retry instant', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-metadata-rate-limited');
+    await seedBacklog(world, world.alice.id, ['P3001', 'P3002', 'P3003', 'P3004']);
+    world.metadata.fail.set(
+      'P3002',
+      new PlatformError({
+        code: 'rate_limited',
+        operation: 'problem',
+        retryable: true,
+        retryAfterMs: 30_000,
+        detail: 'the metadata read was rate limited',
+      }),
+    );
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.deepEqual(world.metadata.calls, ['P3001', 'P3002'], 'a rate limit stops the phase instead of hammering it');
+    assert.equal(status.metadataResolved, 1);
+    assert.equal(status.metadataFailed, 1);
+    assert.equal(status.failure?.code, 'rate_limited');
+    assert.equal(status.failure?.stage, 'metadata');
+    assert.equal(status.paused, false);
+    assert.equal(
+      Date.parse(status.failure?.retryAt ?? '') - Date.parse(status.failure?.at ?? ''),
+      30_000,
+      'the declared Retry-After is honored',
+    );
+    const record = await world.store.getLuoguSyncState(world.alice.id);
+    assert.equal(record?.value.missingMetadata.length, 3, 'the failed key stays queued');
+    assert.equal(
+      record?.value.missingMetadata[2],
+      problemKeyOf(world.instance, 'P3002'),
+      'the failed key is rotated to the end instead of being dropped',
+    );
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a successful metadata-only drain keeps a stored history failure and still records a new metadata failure', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-keep-history');
+    const historyFailure: LuoguSyncFailure = {
+      code: 'auth_required',
+      at: fx.AT,
+      retryAt: null,
+      paused: true,
+      stage: 'history',
+    };
+    await seedBacklog(world, world.alice.id, ['K1', 'K2'], { failure: historyFailure });
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const drained = await service.status(world.alice.id);
+    assert.equal(drained.metadataResolved, 2, 'the whole backlog was drained');
+    assert.equal(drained.metadataBacklog, 0);
+    assert.deepEqual(
+      drained.failure,
+      historyFailure,
+      'a metadata-only run clears no failure whose half it never retried',
+    );
+    assert.equal(drained.paused, true, 'the account stays paused until the user acts');
+
+    // A new metadata failure is still recorded normally, over the history failure it did not repair.
+    const record = await world.store.getLuoguSyncState(world.alice.id);
+    assert.ok(record !== null);
+    await world.store.saveLuoguSyncState(
+      {
+        ...record.value,
+        missingMetadata: buildProblemKeys(world.instance, ['K3']),
+        failure: historyFailure,
+        updatedAt: world.clock.now(),
+      },
+      record.revision,
+    );
+    world.metadata.fail.set(
+      'K3',
+      new PlatformError({
+        code: 'unavailable',
+        operation: 'problem',
+        retryable: true,
+        detail: 'the problem page is unavailable',
+      }),
+    );
+    world.clock.advance(1_000);
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const failed = await service.status(world.alice.id);
+    assert.equal(failed.failure?.code, 'unavailable', 'a new metadata failure is recorded normally');
+    assert.equal(failed.failure?.stage, 'metadata');
+    assert.equal(failed.metadataFailed, 1);
+    assert.equal(failed.metadataBacklog, 1, 'the failed key stays queued');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('an empty metadata action keeps a legacy stage-less failure untouched', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-keep-legacy');
+    const legacyFailure: LuoguSyncFailure = {
+      code: 'unavailable',
+      at: fx.AT,
+      retryAt: new Date(Date.parse(fx.AT) + 2_000).toISOString(),
+      paused: false,
+    };
+    await world.store.saveLuoguSyncState(
+      {
+        ...emptyLuoguSyncState(world.alice.id, world.instance.id, fx.AT),
+        failure: legacyFailure,
+        updatedAt: fx.AT,
+      },
+      null,
+    );
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.deepEqual(status.failure, legacyFailure, 'no history was read, so the stored failure is untouched');
+    assert.equal(status.failure?.stage, undefined, 'no stage is invented for a legacy record');
+    assert.equal(status.metadataBacklog, 0);
+    assert.equal(status.metadataResolved, 0);
+    assert.equal(status.metadataFailed, 0);
+    assert.equal(world.metadata.calls.length, 0, 'an empty drain requests no metadata');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a successful metadata retry clears the metadata failure it repaired', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-clear');
+    const metadataFailure: LuoguSyncFailure = {
+      code: 'unavailable',
+      at: fx.AT,
+      retryAt: new Date(Date.parse(fx.AT) + 2_000).toISOString(),
+      paused: false,
+      stage: 'metadata',
+    };
+    await seedBacklog(world, world.alice.id, ['C1', 'C2'], { failure: metadataFailure });
+    world.clock.advance(2_500);
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.equal(status.metadataResolved, 2);
+    assert.equal(status.metadataBacklog, 0);
+    assert.equal(status.failure, null, 'the repaired metadata failure is cleared by the successful retry');
+    assert.equal(status.paused, false);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a cancel during a metadata drain keeps the failure an earlier item committed', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-cancel-failure');
+    await seedBacklog(world, world.alice.id, ['X1', 'X2', 'X3']);
+    world.metadata.fail.set(
+      'X1',
+      new PlatformError({
+        code: 'unavailable',
+        operation: 'problem',
+        retryable: true,
+        detail: 'the first problem page is unavailable',
+      }),
+    );
+    const originalFetch = world.metadata.adapter.fetchProblem.bind(world.metadata.adapter);
+    const gate = deferred();
+    let served = 0;
+    world.metadata.adapter.fetchProblem = async (request) => {
+      served += 1;
+      if (served === 2) {
+        await gate.promise;
+      }
+      return originalFetch(request);
+    };
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await until(() => served >= 2, 'the second item is in flight after the first one failed');
+    const during = await service.status(world.alice.id);
+    assert.equal(during.failure?.code, 'unavailable', 'the failed item was committed durably');
+    assert.equal(during.failure?.stage, 'metadata');
+    assert.equal(during.metadataFailed, 1);
+
+    const cancelled = service.cancel(world.alice.id);
+    await sleep(20);
+    gate.release();
+    await cancelled;
+
+    const after = await service.status(world.alice.id);
+    assert.equal(after.running, false);
+    assert.equal(after.failure?.code, 'unavailable', 'the cancellation keeps that item failure instead of wiping it');
+    assert.equal(after.failure?.stage, 'metadata');
+    assert.equal(after.metadataFailed, 1);
+    assert.equal(after.metadataBacklog, 3, 'the whole queue, including the discarded in-flight key, is kept');
+    assert.equal(after.leaseOwner, null, 'the cancelled pass released its lease');
+    assert.equal(world.metadata.calls.length, 2, 'no further request is issued after the pause');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a lease lost while the metadata gate waits dispatches no request and clobbers no foreign row', async () => {
+  // A foreign takeover during the wait: the pass must not touch the new owner's row at all.
+  const takeover = await createWorld();
+  try {
+    const service = takeover.makeService('svc-gate-takeover');
+    await seedBacklog(takeover, takeover.alice.id, ['G1', 'G2']);
+    const gate = parkGate(takeover);
+
+    assert.equal((await service.start(takeover.alice.id, 'metadata')).outcome, 'started');
+    await until(() => gate.parked() >= 1, 'the metadata operation to park inside the source gate');
+    const record = await takeover.store.getLuoguSyncState(takeover.alice.id);
+    assert.ok(record !== null);
+    await takeover.store.saveLuoguSyncState(
+      {
+        ...record.value,
+        owner: 'svc-other',
+        leaseExpiresAt: new Date(takeover.clock.nowMs() + 120_000).toISOString(),
+        updatedAt: takeover.clock.now(),
+      },
+      record.revision,
+    );
+    gate.release();
+    await service.settle();
+
+    assert.equal(takeover.metadata.calls.length, 0, 'no metadata request is dispatched on a stale claim');
+    const after = await takeover.store.getLuoguSyncState(takeover.alice.id);
+    assert.equal(after?.value.owner, 'svc-other', 'the losing pass never overwrites the new owner');
+    assert.equal(after?.value.failure, null, 'nor writes its own failure over that row');
+    assert.equal(after?.value.missingMetadata.length, 2, 'the backlog is left exactly as the new owner has it');
+    assert.equal((await service.status(takeover.alice.id)).running, false);
+  } finally {
+    await takeover.dispose();
+  }
+
+  // Without a takeover, a lease that expired during the wait is refused the same way and recorded.
+  const expiry = await createWorld();
+  try {
+    const service = expiry.makeService('svc-gate-expiry');
+    await seedBacklog(expiry, expiry.alice.id, ['G1', 'G2']);
+    const gate = parkGate(expiry);
+
+    assert.equal((await service.start(expiry.alice.id, 'metadata')).outcome, 'started');
+    await until(() => gate.parked() >= 1, 'the metadata operation to park inside the source gate');
+    expiry.clock.advance(130_000);
+    gate.release();
+    await service.settle();
+
+    assert.equal(expiry.metadata.calls.length, 0, 'an expired lease dispatches no request either');
+    const status = await service.status(expiry.alice.id);
+    assert.equal(status.failure?.code, 'lease_lost');
+    assert.equal(status.failure?.stage, 'metadata');
+    assert.equal(status.metadataBacklog, 2, 'the backlog is untouched');
+    assert.equal(status.leaseOwner, null, 'the expired pass still releases its own row');
+    assert.equal(status.running, false);
+  } finally {
+    await expiry.dispose();
+  }
+});
+
+/** Park every source-gate operation before its work callback, so a test can race the durable lease. */
+function parkGate(world: World): { readonly release: () => void; readonly parked: () => number } {
+  const gate = deferred();
+  const originalRun = world.gate.run.bind(world.gate);
+  let parked = 0;
+  const run = async (
+    token: CancellationToken,
+    work: (token: CancellationToken) => Promise<unknown>,
+  ): Promise<unknown> => {
+    parked += 1;
+    await gate.promise;
+    return originalRun(token, work);
+  };
+  world.gate.run = run as LuoguSourceGate['run'];
+  return { release: gate.release, parked: () => parked };
+}
+
+// ---------------------------------------------------------------------------------------
+// Public nickname refresh (Sprint 22b)
+// ---------------------------------------------------------------------------------------
+
+void test('refreshProfile stores only the validated data.user nickname and preserves identity', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile');
+    await world.store.upsertAccounts([{ ...world.alice, displayName: '旧昵称' }]);
+    await seedBacklog(world, world.alice.id, ['P1000'], {
+      failure: { code: 'unavailable', at: fx.AT, retryAt: null, paused: true, stage: 'metadata' },
+    });
+    world.metadata.profiles.set('100001', {
+      sourceInstanceId: world.instance.id,
+      uid: '100001',
+      displayName: '示例选手',
+    });
+
+    const updated = await service.refreshProfile(world.alice.id, world.token);
+    assert.deepEqual(updated, {
+      id: world.alice.id,
+      sourceInstanceId: world.instance.id,
+      handle: '100001',
+      displayName: '示例选手',
+      profileUrl: world.alice.profileUrl,
+    });
+    const stored = await world.store.getAccount(world.alice.id);
+    assert.equal(stored?.displayName, '示例选手');
+    assert.equal(stored?.profileUrl, world.alice.profileUrl);
+    assert.deepEqual(world.metadata.profileCalls, ['100001']);
+    assert.deepEqual(world.metadata.calls, [], 'no problem metadata was requested');
+    assert.equal(world.metadata.editorialCalls(), 0);
+    assert.equal(world.vault.writes.length, 0, 'no credential was written');
+    assert.equal(world.feed.calls.length, 0, 'no history request was made');
+    // The durable records a profile refresh must not touch survive it unchanged.
+    const state = (await world.store.getLuoguSyncState(world.alice.id))?.value;
+    assert.deepEqual(state?.missingMetadata, buildProblemKeys(world.instance, ['P1000']));
+    assert.equal(state?.failure?.code, 'unavailable');
+    assert.equal(state?.failure?.paused, true);
+    assert.equal(state?.owner, null, 'the profile lease is released');
+    assert.equal(await checkpointOf(world, world.alice.id), null);
+    assert.equal((await service.status(world.alice.id)).connection, null, 'no connection is required');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a mismatched or missing profile answer keeps the previous nickname and releases the lease', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile-fail');
+    // The anonymous source answers a profile of a *different* uid; the service re-validates it.
+    world.metadata.profiles.set('100001', {
+      sourceInstanceId: world.instance.id,
+      uid: '100002',
+      displayName: '冒名昵称',
+    });
+    await assert.rejects(
+      service.refreshProfile(world.alice.id, world.token),
+      (error: unknown) =>
+        error instanceof PlatformError && error.code === 'changed_response' && error.operation === 'profile',
+    );
+    assert.equal((await world.store.getAccount(world.alice.id))?.displayName, null);
+    const refused = await service.status(world.alice.id);
+    assert.equal(refused.leaseOwner, null, 'a refused lookup releases its lease');
+    assert.equal(refused.running, false);
+
+    // The synthetic source has no profile for this uid at all; the nickname stays untouched too.
+    await assert.rejects(
+      service.refreshProfile(world.bob.id, world.token),
+      (error: unknown) => error instanceof PlatformError && error.code === 'changed_response',
+    );
+    assert.equal((await world.store.getAccount(world.bob.id))?.displayName, null);
+    assert.equal((await service.status(world.bob.id)).leaseOwner, null);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a cancelled profile refresh keeps the previous nickname and releases the source', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile-cancel');
+    const source = createCancellationSource();
+    let entered = false;
+    let release = (): void => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    world.metadata.adapter.fetchAccountProfile = async (request) => {
+      entered = true;
+      await blocked;
+      request.token.throwIfCancelled();
+      return { sourceInstanceId: world.instance.id, uid: request.account.handle, displayName: '示例选手' };
+    };
+    const pending = service.refreshProfile(world.alice.id, source.token);
+    await until(() => entered, 'the profile request to start');
+    source.cancel('cancelled by the test');
+    release();
+    await assert.rejects(pending, (error: unknown) => error instanceof DomainError && error.code === 'cancelled');
+    assert.equal((await world.store.getAccount(world.alice.id))?.displayName, null);
+    const status = await service.status(world.alice.id);
+    assert.equal(status.leaseOwner, null);
+    assert.equal(status.running, false);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a profile refresh holds the one source slot and refuses a concurrent operation', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile-busy');
+    // The synthetic source must actually own a profile for the pinned uid: the answering port is
+    // parked first, and an unseeded map would refuse the answer as `changed_response` instead.
+    world.metadata.profiles.set('100001', {
+      sourceInstanceId: world.instance.id,
+      uid: '100001',
+      displayName: '示例选手',
+    });
+    const original = world.metadata.adapter.fetchAccountProfile!.bind(world.metadata.adapter);
+    let entered = false;
+    let release = (): void => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    world.metadata.adapter.fetchAccountProfile = async (request) => {
+      entered = true;
+      await blocked;
+      return original(request);
+    };
+    const first = service.refreshProfile(world.alice.id, world.token);
+    await until(() => entered, 'the first profile request to start');
+    // The same account and another account of the same source are both refused while it runs.
+    await assert.rejects(
+      service.refreshProfile(world.alice.id, world.token),
+      (error: unknown) => error instanceof LuoguSyncError && error.code === 'busy',
+    );
+    await assert.rejects(
+      service.refreshProfile(world.bob.id, world.token),
+      (error: unknown) => error instanceof LuoguSyncError && error.code === 'busy',
+    );
+    release();
+    const updated = await first;
+    assert.equal(updated.displayName, '示例选手');
+    assert.equal((await world.store.getAccount(world.bob.id))?.displayName, null, 'another account is untouched');
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a profile answer that arrives after cancellation is discarded and never stored', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile-late');
+    const source = createCancellationSource();
+    let entered = false;
+    let release = (): void => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // A deliberately non-cooperating port: it neither observes the token nor fails, it just answers.
+    world.metadata.adapter.fetchAccountProfile = async () => {
+      entered = true;
+      await blocked;
+      return { sourceInstanceId: world.instance.id, uid: '100001', displayName: '迟到的昵称' };
+    };
+    const pending = service.refreshProfile(world.alice.id, source.token);
+    await until(() => entered, 'the non-cooperating profile request to start');
+    source.cancel('cancelled while the port was answering');
+    release();
+    await assert.rejects(pending, (error: unknown) => error instanceof DomainError && error.code === 'cancelled');
+    assert.equal((await world.store.getAccount(world.alice.id))?.displayName, null, 'the late answer is discarded');
+    assert.equal((await service.status(world.alice.id)).leaseOwner, null);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a cancellation while the nickname transaction waits on its account read saves nothing', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile-store-read');
+    world.metadata.profiles.set('100001', {
+      sourceInstanceId: world.instance.id,
+      uid: '100001',
+      displayName: '示例选手',
+    });
+    const source = createCancellationSource();
+    const store = world.store;
+    const realGetAccount = store.getAccount.bind(store);
+    const realFetch = world.metadata.adapter.fetchAccountProfile!.bind(world.metadata.adapter);
+    let answered = false;
+    let entered = false;
+    let release = (): void => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    world.metadata.adapter.fetchAccountProfile = async (request) => {
+      const profile = await realFetch(request);
+      answered = true;
+      return profile;
+    };
+    store.getAccount = async (id: string) => {
+      // The first read after the answer is the transaction's own re-read; park it.
+      if (answered && !entered) {
+        entered = true;
+        await blocked;
+      }
+      return realGetAccount(id);
+    };
+    const pending = service.refreshProfile(world.alice.id, source.token);
+    await until(() => entered, 'the nickname transaction read to start');
+    source.cancel('cancelled while the transaction waited');
+    release();
+    await assert.rejects(pending, (error: unknown) => error instanceof DomainError && error.code === 'cancelled');
+    assert.equal((await store.getAccount(world.alice.id))?.displayName, null);
+    assert.equal((await service.status(world.alice.id)).leaseOwner, null);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a cancellation that lands while the nickname write runs rolls the write back', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile-store-write');
+    world.metadata.profiles.set('100001', {
+      sourceInstanceId: world.instance.id,
+      uid: '100001',
+      displayName: '示例选手',
+    });
+    const source = createCancellationSource();
+    const store = world.store;
+    const realUpsert = store.upsertAccounts.bind(store);
+    let entered = false;
+    let writes = 0;
+    let release = (): void => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    store.upsertAccounts = async (accounts) => {
+      writes += 1;
+      entered = true;
+      await blocked;
+      return realUpsert(accounts);
+    };
+    const pending = service.refreshProfile(world.alice.id, source.token);
+    await until(() => entered, 'the nickname write to start');
+    source.cancel('cancelled while the transaction wrote');
+    release();
+    await assert.rejects(pending, (error: unknown) => error instanceof DomainError && error.code === 'cancelled');
+    assert.equal(writes, 1, 'the write was reached');
+    const stored = await store.getAccount(world.alice.id);
+    assert.equal(stored?.displayName, null, 'the write was rolled back');
+    assert.equal(stored?.profileUrl, world.alice.profileUrl, 'the stored account row survived');
+    assert.equal((await service.status(world.alice.id)).leaseOwner, null);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('refreshProfile refuses a source without the optional capability as unsupported', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile-unsupported');
+    (world.metadata.adapter as { fetchAccountProfile?: unknown }).fetchAccountProfile = undefined;
+    await assert.rejects(
+      service.refreshProfile(world.alice.id, world.token),
+      (error: unknown) => error instanceof LuoguSyncError && error.code === 'unsupported',
+    );
+    assert.deepEqual(world.metadata.profileCalls, [], 'a capability gap touches no platform');
+    assert.equal((await service.status(world.alice.id)).leaseOwner, null);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a lease lost while the profile gate waits dispatches no request and clobbers no foreign row', async () => {
+  // A foreign takeover during the wait: the profile operation must not touch the new owner's row.
+  const takeover = await createWorld();
+  try {
+    const service = takeover.makeService('svc-profile-gate-takeover');
+    const gate = parkGate(takeover);
+    const pending = service.refreshProfile(takeover.alice.id, takeover.token);
+    await until(() => gate.parked() >= 1, 'the profile operation to park inside the source gate');
+    const record = await takeover.store.getLuoguSyncState(takeover.alice.id);
+    assert.ok(record !== null, 'the claim is durable while the gate waits');
+    await takeover.store.saveLuoguSyncState(
+      {
+        ...record.value,
+        owner: 'foreign-owner',
+        leaseExpiresAt: new Date(takeover.clock.nowMs() + 120_000).toISOString(),
+        updatedAt: takeover.clock.now(),
+      },
+      record.revision,
+    );
+    gate.release();
+    await assert.rejects(
+      pending,
+      (error: unknown) => error instanceof DomainError && error.code === 'invalid_transition',
+    );
+    assert.deepEqual(takeover.metadata.profileCalls, [], 'no public request is dispatched on a stale claim');
+    assert.equal((await takeover.store.getLuoguSyncState(takeover.alice.id))?.value.owner, 'foreign-owner');
+    assert.equal((await takeover.store.getAccount(takeover.alice.id))?.displayName, null);
+    assert.equal((await service.status(takeover.alice.id)).running, false);
+  } finally {
+    await takeover.dispose();
+  }
+
+  // Without a takeover, a lease that expired during the wait is refused the same way.
+  const expiry = await createWorld();
+  try {
+    const service = expiry.makeService('svc-profile-gate-expiry');
+    const gate = parkGate(expiry);
+    const pending = service.refreshProfile(expiry.alice.id, expiry.token);
+    await until(() => gate.parked() >= 1, 'the profile operation to park inside the source gate');
+    const record = await expiry.store.getLuoguSyncState(expiry.alice.id);
+    assert.ok(record !== null);
+    await expiry.store.saveLuoguSyncState(
+      {
+        ...record.value,
+        leaseExpiresAt: new Date(expiry.clock.nowMs() - 1_000).toISOString(),
+        updatedAt: expiry.clock.now(),
+      },
+      record.revision,
+    );
+    gate.release();
+    await assert.rejects(
+      pending,
+      (error: unknown) => error instanceof DomainError && error.code === 'invalid_transition',
+    );
+    assert.deepEqual(expiry.metadata.profileCalls, [], 'an expired claim issues no public request');
+    const after = await expiry.store.getLuoguSyncState(expiry.alice.id);
+    assert.equal(after?.value.owner, null, 'the expired claim releases instead of being resurrected');
+    assert.equal((await expiry.store.getAccount(expiry.alice.id))?.displayName, null);
+  } finally {
+    await expiry.dispose();
+  }
+});
+
+void test('refreshProfile refuses a foreign or unknown account before touching the platform', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-profile-scope');
+    const mirror = createSourceInstance({
+      platform: 'luogu',
+      baseUrl: 'https://www.luogu.com.cn',
+      domain: 'mirror.example',
+      displayName: 'Mirror',
+    });
+    const foreign = createLuoguAccount(mirror, '100001');
+    await world.store.upsertSourceInstances([mirror]);
+    await world.store.upsertAccounts([foreign]);
+    await assert.rejects(
+      service.refreshProfile(foreign.id, world.token),
+      (error: unknown) => error instanceof LuoguSyncError && error.code === 'account_foreign',
+    );
+    await assert.rejects(
+      service.refreshProfile(accountIdOf(world.instance.id, '999999'), world.token),
+      (error: unknown) => error instanceof LuoguSyncError && error.code === 'account_missing',
+    );
+    assert.deepEqual(world.metadata.profileCalls, []);
+  } finally {
+    await world.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Sprint 22c: a private (U-prefixed) problem refusal is an item failure, not a session stop
+// ---------------------------------------------------------------------------------------
+
+for (const code of ['auth_required', 'forbidden'] as const) {
+  void test(`a ${code} refusal of a U-prefixed problem is remembered per item and the drain continues`, async () => {
+    const world = await createWorld();
+    try {
+      const service = world.makeService(`svc-meta-private-${code}`);
+      await seedBacklog(world, world.alice.id, ['U700001', 'P1001']);
+      const feedCallsBefore = world.feed.calls.length;
+      world.metadata.fail.set(
+        'U700001',
+        new PlatformError({
+          code,
+          operation: 'problem',
+          retryable: false,
+          detail: 'synthetic private refusal',
+        }),
+      );
+
+      assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+      await service.settle();
+      const status = await service.status(world.alice.id);
+      assert.deepEqual(
+        world.metadata.calls,
+        ['U700001', 'P1001'],
+        'the refused private key never stops the keys behind it',
+      );
+      assert.equal(status.metadataResolved, 1, 'the public key after the refusal was still fetched');
+      assert.equal(status.metadataFailed, 1, 'the refused key counts as one failed item');
+      assert.equal(status.failure?.code, code, 'the item refusal is remembered as the durable failure');
+      assert.equal(status.failure?.stage, 'metadata');
+      assert.equal(status.metadataBacklog, 1, 'the refused key stays queued instead of being dropped');
+      assert.equal(world.feed.calls.length, feedCallsBefore, 'a metadata drain never reads a history page');
+      const record = await world.store.getLuoguSyncState(world.alice.id);
+      assert.equal(record?.value.missingMetadata.length, 1);
+      assert.equal(
+        record?.value.missingMetadata[0],
+        problemKeyOf(world.instance, 'U700001'),
+        'the refused key is rotated to the end of the durable backlog',
+      );
+    } finally {
+      await world.dispose();
+    }
+  });
+}
+
+void test('a rate limit after a deferred private refusal stops the drain and replaces the failure', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-private-then-rate-limited');
+    await seedBacklog(world, world.alice.id, ['U700002', 'P2002', 'P2003']);
+    world.metadata.fail.set(
+      'U700002',
+      new PlatformError({
+        code: 'auth_required',
+        operation: 'problem',
+        retryable: false,
+        detail: 'synthetic private refusal',
+      }),
+    );
+    world.metadata.fail.set(
+      'P2002',
+      new PlatformError({
+        code: 'rate_limited',
+        operation: 'problem',
+        retryable: true,
+        retryAfterMs: 30_000,
+        detail: 'synthetic 429',
+      }),
+    );
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.deepEqual(world.metadata.calls, ['U700002', 'P2002'], 'the 429 stops the pass before P2003');
+    assert.equal(status.failure?.code, 'rate_limited', 'a session-level stop replaces the deferred item refusal');
+    assert.equal(status.failure?.stage, 'metadata');
+    assert.equal(status.metadataResolved, 0);
+    assert.equal(status.metadataFailed, 2);
+    assert.equal(status.metadataBacklog, 3, 'no queued key is dropped when the pass stops');
+    const record = await world.store.getLuoguSyncState(world.alice.id);
+    assert.equal(
+      record?.value.missingMetadata[2],
+      problemKeyOf(world.instance, 'P2002'),
+      'the stopped key is rotated to the end',
+    );
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a changed_response after a deferred private refusal still stops the drain', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-private-then-changed');
+    await seedBacklog(world, world.alice.id, ['U700003', 'P3002', 'P3003']);
+    world.metadata.fail.set(
+      'U700003',
+      new PlatformError({
+        code: 'forbidden',
+        operation: 'problem',
+        retryable: false,
+        detail: 'synthetic private refusal',
+      }),
+    );
+    world.metadata.fail.set(
+      'P3002',
+      new PlatformError({
+        code: 'changed_response',
+        operation: 'problem',
+        retryable: false,
+        detail: 'synthetic unexpected page',
+      }),
+    );
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.deepEqual(world.metadata.calls, ['U700003', 'P3002'], 'an unexpected page stops the pass before P3003');
+    assert.equal(status.failure?.code, 'changed_response', 'a session-level stop replaces the deferred item refusal');
+    assert.equal(status.failure?.stage, 'metadata');
+    assert.equal(status.metadataResolved, 0);
+    assert.equal(status.metadataFailed, 2);
+    assert.equal(status.metadataBacklog, 3, 'no queued key is dropped when the pass stops');
+    const record = await world.store.getLuoguSyncState(world.alice.id);
+    assert.equal(
+      record?.value.missingMetadata[2],
+      problemKeyOf(world.instance, 'P3002'),
+      'the stopped key is rotated to the end',
+    );
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a cancel after a deferred private refusal keeps the refusal and the rotation', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-private-cancel');
+    await seedBacklog(world, world.alice.id, ['U700004', 'P4002', 'P4003']);
+    world.metadata.fail.set(
+      'U700004',
+      new PlatformError({
+        code: 'auth_required',
+        operation: 'problem',
+        retryable: false,
+        detail: 'synthetic private refusal',
+      }),
+    );
+    const originalFetch = world.metadata.adapter.fetchProblem.bind(world.metadata.adapter);
+    const gate = deferred();
+    let served = 0;
+    world.metadata.adapter.fetchProblem = async (request) => {
+      served += 1;
+      if (served === 2) {
+        await gate.promise;
+      }
+      return originalFetch(request);
+    };
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await until(() => served >= 2, 'the second key is in flight after the private refusal was committed');
+    const during = await service.status(world.alice.id);
+    assert.equal(during.failure?.code, 'auth_required', 'the refused item was committed durably');
+    assert.equal(during.failure?.stage, 'metadata');
+    assert.equal(during.metadataFailed, 1);
+
+    const cancelled = service.cancel(world.alice.id);
+    await sleep(20);
+    gate.release();
+    await cancelled;
+
+    const after = await service.status(world.alice.id);
+    assert.equal(after.running, false);
+    assert.equal(after.failure?.code, 'auth_required', 'the cancel keeps the item refusal instead of wiping it');
+    assert.equal(after.failure?.stage, 'metadata');
+    assert.equal(after.metadataFailed, 1);
+    assert.equal(after.metadataBacklog, 3, 'the whole queue, including the discarded in-flight key, is kept');
+    assert.equal(after.leaseOwner, null, 'the cancelled pass released its lease');
+    assert.equal(world.metadata.calls.length, 2, 'no further request is issued after the pause');
+    const record = await world.store.getLuoguSyncState(world.alice.id);
+    assert.equal(
+      record?.value.missingMetadata[2],
+      problemKeyOf(world.instance, 'U700004'),
+      'the rotated private key stays at the end of the durable backlog',
+    );
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a backlog of only private U keys attempts every key at most once per pass', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-private-once');
+    await seedBacklog(world, world.alice.id, ['U700005', 'U700006']);
+    for (const pid of ['U700005', 'U700006']) {
+      world.metadata.fail.set(
+        pid,
+        new PlatformError({
+          code: 'auth_required',
+          operation: 'problem',
+          retryable: false,
+          detail: 'synthetic private refusal',
+        }),
+      );
+    }
+
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.equal(new Set(world.metadata.calls).size, 2, 'the rotation never retries a key inside the same pass');
+    assert.deepEqual(
+      world.metadata.calls,
+      ['U700005', 'U700006'],
+      'every private key is attempted exactly once and the pass ends',
+    );
+    assert.equal(status.metadataFailed, 2);
+    assert.equal(status.metadataResolved, 0);
+    assert.equal(status.metadataBacklog, 2, 'both refused keys stay queued for a later pass');
+    assert.equal(status.failure?.code, 'auth_required');
+    assert.equal(status.failure?.stage, 'metadata');
   } finally {
     await world.dispose();
   }

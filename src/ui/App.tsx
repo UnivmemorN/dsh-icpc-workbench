@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { WorkbenchContext, useRequest, ErrorNotice, Empty, type PageName } from './common.js';
+import { accountOptionLabel, sourceOfAccount } from './account-name.js';
 import { Review } from './Review.js';
 import { Weakness } from './Weakness.js';
 import { Plans } from './Plans.js';
@@ -14,6 +15,11 @@ import { Settings } from './Settings.js';
  * Account creation, import and synchronization live on the accounts page (Sprint 20a); the header
  * keeps only the current-account selector plus a `管理账号` shortcut, so no form opens globally and
  * navigating never triggers an account or sync action by itself.
+ *
+ * The selector option text comes from `account-name.ts` (Sprint 22b2): a Luogu account reads
+ * `nickname · UID <handle> · 洛谷` so duplicate nicknames stay distinguishable, while the other
+ * platforms keep their existing spelling. The account's platform is looked up in the real bootstrap
+ * source list, never parsed out of the opaque instance id.
  */
 export function App({ onExit }: { onExit: () => void }) {
   const bootstrap = useRequest('bootstrap', {});
@@ -31,6 +37,9 @@ export function App({ onExit }: { onExit: () => void }) {
     setProblemKey(null);
     setSelectedKeys([]);
   };
+  /** The bootstrap source entry of one account, from the real list rather than its id. */
+  const sourceOf = (account: { readonly sourceInstanceId: string }) =>
+    sourceOfAccount(bootstrap.data?.sources ?? [], account);
   return (
     <div className="icpc-root">
       <header className="icpc-header">
@@ -52,7 +61,7 @@ export function App({ onExit }: { onExit: () => void }) {
               <option value="">未选择账号</option>
               {bootstrap.data?.accounts.map((account) => (
                 <option key={account.id} value={account.id}>
-                  {account.displayName ?? account.handle} · {account.sourceInstanceId.split(':')[0]}
+                  {accountOptionLabel(account, sourceOf(account))}
                 </option>
               ))}
             </select>

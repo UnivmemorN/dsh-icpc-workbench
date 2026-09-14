@@ -28,7 +28,7 @@ export const ACCOUNT_HELP_ID = 'icpc-account-help';
 export const ACCOUNT_ERROR_ID = 'icpc-account-error';
 /** What adding an account does, and the explicit next step that actually obtains records. */
 export const ACCOUNT_SAVE_NOTE =
-  '添加只保存公开账号标识，不需要密码，也不会自动同步；下一步在本页下方的同步面板导入或同步，才能获取做题记录。';
+  '添加只保存公开账号标识，不需要密码；洛谷账号会自动读取一次公开昵称（不需要 Cookie），这不会同步做题记录——历史记录仍要单独在本页下方同步或导入。';
 
 /**
  * Platform-specific onboarding copy.

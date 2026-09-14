@@ -170,6 +170,33 @@ export type EditorialFetchResult =
   | { readonly status: 'changed_response'; readonly detail: string; readonly sample: string | null };
 
 /**
+ * One account's validated public profile.
+ *
+ * Only what the product displays is representable: the source instance the answer belongs to, the
+ * canonical uid it was requested for, and the platform's own nickname. A profile answer never
+ * carries the other fields a profile endpoint may return (biography, scores, followers, ...).
+ */
+export interface AccountProfile {
+  readonly sourceInstanceId: string;
+  /** Canonical decimal uid the profile was requested for; must equal the account's own handle. */
+  readonly uid: string;
+  readonly displayName: string;
+}
+
+/**
+ * Direct public-profile request.
+ *
+ * Anonymous on platforms whose profile page is public, so it carries no credential; an adapter must
+ * validate the answered identity against `account` and must not fabricate a name for a payload
+ * whose shape it does not recognize.
+ */
+export interface FetchAccountProfileRequest {
+  readonly account: Account;
+  readonly token: CancellationToken;
+  readonly limits: PlatformLimits;
+}
+
+/**
  * One platform implementation bound to one source instance.
  * Implementations must honour `limits`, observe `token`, and normalise payloads into
  * domain types (runtime validation of external payloads happens here, not in the domain).
@@ -179,6 +206,14 @@ export interface PlatformAdapter {
   capabilities(): PlatformCapabilities;
   /** Optional official contest-rating capability; absent on unsupported platforms. */
   fetchOfficialRating?(request: { readonly account: Account; readonly token: CancellationToken; readonly limits: PlatformLimits }): Promise<import('../domain/official-rating.js').OfficialRatingData>;
+  /**
+   * Optional public-profile read: the requested account's own nickname.
+   *
+   * Absent on platforms that cannot answer it, so a caller must check for the method instead of
+   * assuming a nickname can be fetched at all. An answer names only the source instance, the uid and
+   * the nickname, and is never a fallback for an unrecognized payload.
+   */
+  fetchAccountProfile?(request: FetchAccountProfileRequest): Promise<AccountProfile>;
   listProblems(request: ListProblemsRequest): Promise<Page<NormalizedProblem>>;
   listSubmissions(request: ListSubmissionsRequest): Promise<Page<Submission>>;
   /** Fetch one problem's full detail, including its statement when the platform has one. */

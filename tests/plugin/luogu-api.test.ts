@@ -23,6 +23,7 @@ import {
 import { ImportService } from '../../src/application/import-service.js';
 import { createLuoguSourceGate } from '../../src/application/luogu-source-gate.js';
 import { LuoguSyncService } from '../../src/application/luogu-sync-service.js';
+import { emptyLuoguSyncState } from '../../src/application/luogu-sync-types.js';
 import { DEFAULT_PLATFORM_LIMITS } from '../../src/application/ports.js';
 import { LUOGU_API_OPERATIONS } from '../../src/application/workbench-api.js';
 import { accountIdOf, createSourceInstance, type Account, type SourceInstance } from '../../src/domain/index.js';
@@ -43,6 +44,7 @@ interface Bench {
   readonly vault: sfx.MemoryVault;
   readonly feed: sfx.RecordFeed;
   readonly metadataCalls: string[];
+  readonly metadata: sfx.MetadataHarness;
   readonly service: LuoguSyncService;
   readonly routes: Map<string, ConnectionFetchRoute>;
   post(operation: string, body: unknown): Promise<Response>;
@@ -154,6 +156,7 @@ async function withBench(
     vault,
     feed,
     metadataCalls: metadata.calls,
+    metadata,
     get service() {
       return service;
     },
@@ -204,7 +207,7 @@ const ALL_OPERATIONS = Object.values(LUOGU_API_OPERATIONS);
 
 void test('the Luogu route map is exact and every answer uses the versioned envelope', async () => {
   await withBench({}, async (bench) => {
-    assert.equal(ALL_OPERATIONS.length, 7);
+    assert.equal(ALL_OPERATIONS.length, 8);
     assert.deepEqual(
       [...bench.routes.keys()].sort(),
       ALL_OPERATIONS.map((operation) => `${API_PREFIX}${operation}`).sort(),
@@ -336,6 +339,7 @@ void test('malformed input is refused before any store, vault or platform side e
       ['luogu.configure', { accountId, expectedRevision: null, intervalMinutes: 1441 }],
       ['luogu.configure', { accountId, expectedRevision: null, automaticEnabled: true, unknown: 1 }],
       ['luogu.start', { accountId, mode: 'restart' }],
+      ['luogu.start', { accountId, mode: 'metadata', extra: true }],
       ['luogu.start', { accountId }],
       ['luogu.probe', { accountId, mode: 'resume' }],
       ['luogu.disconnect', { accountId: '' }],
@@ -380,6 +384,68 @@ void test('a foreign or unknown account is refused before any credential or plat
 
     const refusedStoredForeign = await bench.refused('luogu.probe', { accountId: foreign.id }, 400);
     assert.equal(refusedStoredForeign.code, 'invalid_input');
+    assert.equal(bench.vault.writes.length, 0);
+    assert.equal(bench.feed.calls.length, 0);
+  });
+});
+
+void test('luogu.profile resolves a public nickname with no vault, session or connection', async () => {
+  // `implemented: false` is a host whose credential backend is unsupported: the anonymous nickname
+  // lookup must still work, before any connection exists, and echo nothing secret.
+  await withBench({ implemented: false }, async (bench) => {
+    bench.metadata.profiles.set('800001', {
+      sourceInstanceId: bench.instance.id,
+      uid: '800001',
+      displayName: '示例选手',
+    });
+    const result = await bench.ok('luogu.profile', { accountId: bench.account.id });
+    assert.deepEqual(result, {
+      account: {
+        id: bench.account.id,
+        sourceInstanceId: bench.instance.id,
+        handle: '800001',
+        displayName: '示例选手',
+        profileUrl: bench.account.profileUrl,
+      },
+    });
+    assert.deepEqual(bench.metadata.profileCalls, ['800001']);
+    assert.equal(bench.vault.writes.length, 0, 'no credential was written');
+    assert.equal(bench.feed.calls.length, 0, 'no history request was made');
+    assert.equal((await bench.store.getAccount(bench.other.id))?.displayName, null, 'another account is untouched');
+    assert.equal(JSON.stringify(result).includes('luogu.session'), false, 'no vault reference is echoed');
+
+    const unknown = await bench.post('luogu.profile', { accountId: accountIdOf(bench.instance.id, '999999') });
+    const parsed = (await unknown.json()) as ApiEnvelope<unknown>;
+    assert.equal(unknown.status, 404);
+    assert.equal(parsed.ok, false);
+    assert.deepEqual(bench.metadata.profileCalls, ['800001'], 'a refused account dispatches no lookup');
+  });
+});
+
+void test('a captured luogu.profile route is refused after disposal without any lookup', async () => {
+  await withBench({}, async (bench) => {
+    bench.metadata.profiles.set('800001', {
+      sourceInstanceId: bench.instance.id,
+      uid: '800001',
+      displayName: '示例选手',
+    });
+    const route = bench.routes.get(`${API_PREFIX}${LUOGU_API_OPERATIONS.profile}`);
+    assert.ok(route, 'luogu.profile must be registered');
+    await bench.disposeApi();
+    const late = await route.fetch(
+      new Request(`http://localhost${API_PREFIX}${LUOGU_API_OPERATIONS.profile}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ accountId: bench.account.id }),
+      }),
+    );
+    const lateBody = (await late.json()) as ApiEnvelope<unknown>;
+    assert.equal(late.status, 409, 'a captured route reference is refused after disposal');
+    if (lateBody.ok) {
+      assert.fail('a late handler must not answer a successful envelope');
+    }
+    assert.equal(lateBody.error.code, 'conflict');
+    assert.deepEqual(bench.metadata.profileCalls, [], 'a closed request performs no lookup');
     assert.equal(bench.vault.writes.length, 0);
     assert.equal(bench.feed.calls.length, 0);
   });
@@ -458,6 +524,35 @@ void test('start, progress, completion and cancel answer the safe status project
     const cancelled = await bench.ok('luogu.cancel', { accountId: bench.account.id });
     assert.equal(cancelled.running, false);
     assert.equal(cancelled.closing, false);
+  });
+});
+
+void test('luogu.start accepts the metadata-only mode and drains the backlog without a history read', async () => {
+  await withBench({}, async (bench) => {
+    await bench.store.saveLuoguSyncState(
+      {
+        ...emptyLuoguSyncState(bench.account.id, bench.instance.id, AT),
+        missingMetadata: sfx.buildProblemKeys(bench.instance, ['P4001', 'P4002', 'P4003']),
+        updatedAt: AT,
+      },
+      null,
+    );
+    await bench.ok('luogu.connect', { accountId: bench.account.id, sessionCookie: sfx.cookieFor('800001') });
+    const feedCallsBefore = bench.feed.calls.length;
+
+    const started = await bench.ok('luogu.start', { accountId: bench.account.id, mode: 'metadata' }, 202);
+    assert.equal(started.accountId, bench.account.id);
+    assert.equal(started.mode, 'metadata');
+    assert.equal(started.outcome, 'started');
+    await bench.service.settle();
+
+    const view = await bench.ok('luogu.status', { accountId: bench.account.id });
+    assert.equal(view.metadataBacklog, 0);
+    assert.equal(view.metadataResolved, 3);
+    assert.equal(view.historyComplete, false, 'a metadata-only action never claims a history scan');
+    assert.equal(view.totalPages, 0);
+    assert.equal(bench.feed.calls.length, feedCallsBefore, 'no history page was requested');
+    assert.deepEqual(bench.metadataCalls, ['P4001', 'P4002', 'P4003']);
   });
 });
 
@@ -681,7 +776,7 @@ void test('disposal removes every route even when one disposer throws and retain
       connectionPlatform: 'win32',
       now: bench.clock.now,
     });
-    assert.equal(routes.size, 7);
+    assert.equal(routes.size, 8);
     await assert.rejects(() => dispose(), /probe disposer exploded/);
     assert.equal(routes.size, 0, 'every route was disposed despite the one failure');
     await assert.rejects(() => dispose(), /probe disposer exploded/, 'the cached disposal keeps the failure');

@@ -315,6 +315,25 @@ void test('account.create canonicalizes the handle and stores one instance+accou
   });
 });
 
+void test('a repeated account.create keeps a resolved nickname until an explicit one replaces it', async () => {
+  await withBench({}, async (bench) => {
+    await ok(bench, 'account.create', { platform: 'luogu', handle: '100001', displayName: '已解析昵称' });
+
+    // Omitting `displayName` on the repeat is not "clear it": the stored nickname is preserved.
+    const repeated = await ok(bench, 'account.create', { platform: 'luogu', handle: '100001' });
+    assert.equal(repeated.account.displayName, '已解析昵称');
+    assert.equal((await bench.store.getAccount(accountIdOf(LG.id, '100001')))?.displayName, '已解析昵称');
+
+    const replaced = await ok(bench, 'account.create', {
+      platform: 'luogu',
+      handle: '100001',
+      displayName: '新昵称',
+    });
+    assert.equal(replaced.account.displayName, '新昵称');
+    assert.equal((await bench.store.listAccounts(LG.id)).length, 1, 'the repeat reuses the same row');
+  });
+});
+
 void test('an official factory refusal is the caller 400, never a 500', async () => {
   await withBench({}, async (bench) => {
     for (const body of [

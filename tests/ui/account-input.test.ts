@@ -164,8 +164,11 @@ void test('every platform explains its own identifier and the neutral next step'
   assert.match(ACCOUNT_GUIDES.luogu.help, /不是昵称/);
   assert.notEqual(ACCOUNT_GUIDES.codeforces.label, ACCOUNT_GUIDES.luogu.label);
   assert.match(ACCOUNT_SAVE_NOTE, /不需要密码/);
-  assert.match(ACCOUNT_SAVE_NOTE, /不会自动同步/);
-  assert.match(ACCOUNT_SAVE_NOTE, /导入或同步/);
+  assert.match(ACCOUNT_SAVE_NOTE, /公开昵称/);
+  assert.match(ACCOUNT_SAVE_NOTE, /不需要 Cookie/);
+  assert.match(ACCOUNT_SAVE_NOTE, /不会同步做题记录/);
+  assert.match(ACCOUNT_SAVE_NOTE, /单独/);
+  assert.match(ACCOUNT_SAVE_NOTE, /导入/);
 });
 
 void test('the example links are the contract examples, never submitted values', () => {

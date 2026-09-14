@@ -5,7 +5,9 @@
  * {@link LUOGU_API_OPERATIONS} and delegates every operation to the application-level
  * `LuoguSyncService`. It builds no transport, opens no socket, touches no model and never reads a
  * credential: the OS vault and the authenticated reader live behind the injected connection manager
- * and submissions source, and no operation here can make a paid call.
+ * and submissions source, and no operation here can make a paid call. `luogu.profile` is the one
+ * public read — it refreshes the account's own nickname from the official profile endpoint through
+ * the same service, so it is available even where no credential backend exists.
  *
  * Four rules shape every handler:
  *
@@ -50,9 +52,11 @@ import { isPlatformError, type PlatformErrorCode } from '../application/platform
 import type { TrainingStore } from '../application/ports.js';
 import {
   LUOGU_API_OPERATIONS,
+  type ApiAccountView,
   type ApiLuoguAccountRequest,
   type ApiLuoguConfigureRequest,
   type ApiLuoguConnectRequest,
+  type ApiLuoguProfileResult,
   type ApiLuoguStartRequest,
   type ApiLuoguStartResult,
   type ApiLuoguStatusView,
@@ -323,8 +327,8 @@ function validateStartRequest(instance: SourceInstance) {
   return (value: unknown): ApiLuoguStartRequest => {
     const record = requireObject('luogu.start', value, ['accountId', 'mode']);
     const mode = record['mode'];
-    if (mode !== 'resume' && mode !== 'full') {
-      refuse('mode 必须是 resume 或 full。');
+    if (mode !== 'resume' && mode !== 'full' && mode !== 'metadata') {
+      refuse('mode 必须是 resume、full 或 metadata。');
     }
     return { accountId: requireAccountId(instance, record['accountId']), mode };
   };
@@ -482,6 +486,17 @@ async function projectStatus(context: LuoguApiContext, account: Account): Promis
     metadataFailed: status.metadataFailed,
     backlogDropped: status.backlogDropped,
     closing: status.closing,
+  };
+}
+
+/** Project one stored account into the public account shape; no other field exists on it. */
+function projectAccount(account: Account): ApiAccountView {
+  return {
+    id: account.id,
+    sourceInstanceId: account.sourceInstanceId,
+    handle: account.handle,
+    displayName: account.displayName,
+    profileUrl: account.profileUrl,
   };
 }
 
@@ -693,6 +708,19 @@ export async function registerLuoguApi(options: RegisterLuoguApiOptions): Promis
         const account = await requireStoredAccount(context, input.accountId);
         await context.service.cancel(account.id);
         return projectStatus(context, account);
+      },
+    );
+    add(
+      LUOGU_API_OPERATIONS.profile,
+      validateAccountRequest(options.sourceInstance),
+      async (input, token): Promise<ApiLuoguProfileResult> => {
+        const account = await requireStoredAccount(context, input.accountId);
+        // Anonymous and public: no `requireConnectionBackend` check, no vault and no reader. The
+        // disposal check after the call keeps a handler whose route lifetime ended from reporting
+        // a nickname refresh as a success.
+        const updated = await context.service.refreshProfile(account.id, token);
+        context.assertOpen();
+        return { account: projectAccount(updated) };
       },
     );
     return disposeLifetime;

@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   LUOGU_BASE_URL,
+  createLuoguAccount,
   createLuoguAdapter,
   encodeLuoguListCursor,
   luoguSourceInstance,
@@ -757,4 +758,135 @@ test('a description-only statement is accepted and keeps null background, format
   assert.ok(!(problem.statement ?? '').includes('## 题目背景'));
   assert.ok(!(problem.statement ?? '').includes('## 输入格式'));
   assert.ok(!(problem.statement ?? '').includes('## 提示'));
+});
+
+// ---------------------------------------------------------------------------------------
+// Public profile nickname (Sprint 22b)
+// ---------------------------------------------------------------------------------------
+
+const PROFILE_ACCOUNT = createLuoguAccount(SOURCE, '123');
+
+function profileRequest(account = PROFILE_ACCOUNT) {
+  return { account, token: createCancellationSource().token, limits: LIMITS };
+}
+
+test('fetchAccountProfile reads data.user only and ignores the viewer identity', async () => {
+  const h = harness({
+    '/user/123': () =>
+      jsonResponse({
+        // `root.user` is the anonymous viewer identity Lentille attaches to the request; it must
+        // never be mistaken for the requested account's own nickname.
+        user: { uid: 999999, name: '查看者昵称' },
+        data: { user: { uid: 123, name: '示例选手', biography: 'must not be read', followerCount: 7 } },
+      }),
+  });
+  const profile = await adapterFor(h).fetchAccountProfile(profileRequest());
+  assert.deepEqual(profile, { sourceInstanceId: SOURCE.id, uid: '123', displayName: '示例选手' });
+  assert.equal(h.requests.length, 1, 'exactly one profile request was made');
+  assert.equal(new URL(h.requests[0]!.url).pathname, '/user/123');
+  assert.equal(h.requests[0]?.init.headers['x-lentille-request'], 'content-only');
+});
+
+test('a canonical decimal uid string is accepted as the answered identity', async () => {
+  const h = harness({ '/user/123': () => jsonResponse({ data: { user: { uid: '123', name: '示例选手' } } }) });
+  const profile = await adapterFor(h).fetchAccountProfile(profileRequest());
+  assert.equal(profile.uid, '123');
+  assert.equal(profile.displayName, '示例选手');
+});
+
+test('a foreign uid, missing/blank/oversized name or declared error is refused', async () => {
+  const cases: readonly (readonly [string, unknown, string])[] = [
+    ['viewer-only payload', { user: { uid: 123, name: '查看者昵称' }, data: {} }, 'changed_response'],
+    ['viewer uid substituted', { data: { user: { uid: 999999, name: '别人' } } }, 'changed_response'],
+    ['missing name', { data: { user: { uid: 123 } } }, 'changed_response'],
+    ['blank name', { data: { user: { uid: 123, name: '   ' } } }, 'changed_response'],
+    ['non-string name', { data: { user: { uid: 123, name: 42 } } }, 'changed_response'],
+    ['oversized name', { data: { user: { uid: 123, name: 'x'.repeat(257) } } }, 'changed_response'],
+    ['non-canonical uid', { data: { user: { uid: '0123', name: '示例选手' } } }, 'changed_response'],
+    ['declared 404', { data: { errorCode: 404, user: { uid: 123, name: '示例选手' } } }, 'unavailable'],
+  ];
+  for (const [label, payload, code] of cases) {
+    const h = harness({ '/user/123': () => jsonResponse(payload) });
+    await rejectsWithCode(adapterFor(h).fetchAccountProfile(profileRequest()), code);
+    assert.equal(h.requests.length, 1, `${label}: the refusal is about the answer, not a missing request`);
+  }
+});
+
+test('HTML, invalid JSON and an unrecognized root are changed responses, never a nickname', async () => {
+  const html = harness({ '/user/123': () => htmlResponse('<html><body>login required</body></html>') });
+  await rejectsWithCode(adapterFor(html).fetchAccountProfile(profileRequest()), 'changed_response');
+
+  const broken = harness({
+    '/user/123': () => new Response('{not json', { status: 200, headers: { 'content-type': 'application/json' } }),
+  });
+  await rejectsWithCode(adapterFor(broken).fetchAccountProfile(profileRequest()), 'changed_response');
+
+  const array = harness({ '/user/123': () => jsonResponse([{ uid: 123, name: '示例选手' }]) });
+  await rejectsWithCode(adapterFor(array).fetchAccountProfile(profileRequest()), 'changed_response');
+});
+
+test('a refused profile answer never quotes the page body, a sample or a cause', async () => {
+  // A unique synthetic secret stands in for the biography/follower text a whole public profile page
+  // carries. It may travel through the transport, the HTML check, JSON.parse or the declared-error
+  // branch, but it must never appear in the refusal that leaves the adapter.
+  const marker = 'PRIVATE_PROFILE_MARKER_7c41f0';
+  const cases: readonly (readonly [string, Response])[] = [
+    ['html page', htmlResponse(`<html><body><p>${marker}</p></body></html>`)],
+    [
+      'malformed json',
+      new Response(`{"biography":"${marker}",`, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ],
+    [
+      'declared error',
+      jsonResponse({ data: { errorCode: 404, errorMessage: marker, user: { uid: 123, name: marker } } }),
+    ],
+    [
+      'http refusal',
+      new Response(`<html><body>${marker}</body></html>`, { status: 403, headers: { 'content-type': 'text/html' } }),
+    ],
+  ];
+  for (const [label, response] of cases) {
+    const h = harness({ '/user/123': () => response });
+    let caught: unknown = null;
+    try {
+      await adapterFor(h).fetchAccountProfile(profileRequest());
+    } catch (error) {
+      caught = error;
+    }
+    assert.ok(caught instanceof Error, `${label}: the profile answer must be refused`);
+    const serialized = [
+      String(caught),
+      caught.message,
+      caught.stack ?? '',
+      JSON.stringify(caught, Object.getOwnPropertyNames(caught)),
+    ].join('\n');
+    assert.ok(!serialized.includes(marker), `${label}: the profile body leaked into the refusal`);
+    assert.equal((caught as { sample?: unknown }).sample ?? null, null, `${label}: no sample may be attached`);
+    assert.equal((caught as { cause?: unknown }).cause ?? null, null, `${label}: no cause may be attached`);
+  }
+});
+
+test('a non-canonical account is refused before any profile request', async () => {
+  const h = harness({ '/user/007': () => jsonResponse({ data: { user: { uid: 7, name: '示例选手' } } }) });
+  const account = createAccount({ sourceInstanceId: SOURCE.id, handle: '007' });
+  await rejectsWithCode(adapterFor(h).fetchAccountProfile(profileRequest(account)), 'invalid_input');
+  assert.equal(h.requests.length, 0);
+});
+
+test('fetchAccountProfile observes cancellation before dispatch and during a request', async () => {
+  const h = harness({ '/user/123': hangUntilAbort });
+  const adapter = adapterFor(h);
+  const pre = createCancellationSource();
+  pre.cancel('before start');
+  await rejectsWithCode(adapter.fetchAccountProfile({ ...profileRequest(), token: pre.token }), 'cancelled');
+  assert.equal(h.requests.length, 0);
+
+  const during = createCancellationSource();
+  const pending = adapter.fetchAccountProfile({ ...profileRequest(), token: during.token });
+  await tick();
+  during.cancel('mid flight');
+  await rejectsWithCode(pending, 'cancelled');
 });

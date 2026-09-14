@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.js';
+import { luoguPrimaryName } from './account-name.js';
 import {
   Empty,
   ErrorNotice,
@@ -22,6 +23,10 @@ import {
   LUOGU_INTERVAL_MAX_MINUTES,
   LUOGU_INTERVAL_MIN_MINUTES,
   LUOGU_MANUAL_STILL_AVAILABLE,
+  LUOGU_METADATA_DRAIN_LABEL,
+  LUOGU_METADATA_DRAIN_NOTE,
+  LUOGU_METADATA_START_OUTCOMES,
+  LUOGU_NO_AI_NOTE,
   LUOGU_PHASE_LABELS,
   LUOGU_POLL_IDLE_MS,
   LUOGU_RECENT_WINDOW_NOTE,
@@ -71,8 +76,11 @@ const CREDENTIALS_ID = 'icpc-luogu-credentials';
  *
  * - **The default view is a few lines.** Connection state, last login check, history coverage, metadata
  *   backlog and automation state, then the primary「开始 / 继续同步」action.「暂停本轮」is rendered only
- *   while this instance is actually running. No textbox, textarea, statistics grid or tutorial
- *   paragraph exists until the user asks for it, and a failure is still stated in one short sentence.
+ *   while this instance is actually running.「补齐全部积压资料（不使用 AI）」sits next to the primary
+ *   action and is enabled only while a nonempty backlog exists and no pass is running; one short line
+ *   states that synchronization calls the platform and never a model. No textbox, textarea, statistics
+ *   grid or tutorial paragraph exists until the user asks for it, and a failure is still stated in one
+ *   short sentence.
  * - **One credential trigger, one form.** The single「连接洛谷」/「更新登录凭据」control
  *   ({@link luoguCredentialActionLabel}) mounts the credential form. Closing it unmounts the inputs and
  *   drops both drafts *and* the mode; an attempted submission clears them and collapses the form; a
@@ -273,16 +281,17 @@ export function LuoguSyncPanel({
     });
   }
 
-  function start(mode: 'resume' | 'full'): void {
+  function start(mode: 'resume' | 'full' | 'metadata'): void {
     const target = accountId;
     if (target === null) {
       return;
     }
-    void submit(mode === 'full' ? 'reconcile' : 'start', async (signal) => {
+    const action = mode === 'full' ? 'reconcile' : mode === 'metadata' ? 'metadata' : 'start';
+    void submit(action, async (signal) => {
       const result = await api.request('luogu.start', { accountId: target, mode }, signal);
+      const outcomes = mode === 'metadata' ? LUOGU_METADATA_START_OUTCOMES : LUOGU_START_OUTCOMES;
       setMessage(
-        LUOGU_START_OUTCOMES[result.outcome] +
-          (mode === 'full' ? ' 完成之前，历史覆盖仍按「未完成」显示。' : ''),
+        outcomes[result.outcome] + (mode === 'full' ? ' 完成之前，历史覆盖仍按「未完成」显示。' : ''),
       );
     });
   }
@@ -317,6 +326,9 @@ export function LuoguSyncPanel({
   }
 
   const accountLabel = account === null ? '未选择账号' : account.displayName ?? account.handle;
+  // A Luogu account's primary label is its public nickname or the neutral 洛谷用户 — never the UID,
+  // which is stated separately next to it; the other platforms keep their existing label.
+  const luoguLabel = account === null ? '未选择账号' : luoguPrimaryName(account);
   let body: ReactNode;
   if (panelState === 'no-account') {
     body = (
@@ -343,7 +355,7 @@ export function LuoguSyncPanel({
     body = (
       <>
         <p className="icpc-muted">
-          账号：{accountLabel} · 洛谷 UID：读取中 · 来源：{source?.displayName ?? '洛谷'}
+          账号：{luoguLabel} · 洛谷 UID：读取中 · 来源：{source?.displayName ?? '洛谷'}
         </p>
         <ErrorNotice error={status.error} />
         {status.error === null ? (
@@ -387,7 +399,7 @@ export function LuoguSyncPanel({
     body = (
       <>
         <p className="icpc-muted">
-          账号：{accountLabel} · 洛谷 UID：{value.uid} · 来源：{source?.displayName ?? '洛谷'}
+          账号：{luoguLabel} · 洛谷 UID：{value.uid} · 来源：{source?.displayName ?? '洛谷'}
         </p>
         <p className="icpc-luogu-status">
           <strong>{compact.connection}</strong>
@@ -397,6 +409,7 @@ export function LuoguSyncPanel({
           历史覆盖：{compact.history}
           <span className="icpc-muted"> · {compact.backlog} · {compact.automation}</span>
         </p>
+        <p className="icpc-muted">{LUOGU_NO_AI_NOTE}</p>
         <ErrorNotice error={hostAction.error ?? status.error} />
         {message !== null && <Notice>{message}</Notice>}
         {/* The compact card never hides a failure: one short sentence names it and the long,
@@ -427,6 +440,14 @@ export function LuoguSyncPanel({
             onClick={() => start('resume')}
           >
             {pending === 'start' ? '提交中…' : '开始 / 继续同步'}
+          </button>
+          <button
+            type="button"
+            disabled={!controls.metadata.enabled}
+            aria-busy={pending === 'metadata'}
+            onClick={() => start('metadata')}
+          >
+            {pending === 'metadata' ? '提交中…' : LUOGU_METADATA_DRAIN_LABEL}
           </button>
           {value.running && (
             <button
@@ -596,6 +617,7 @@ export function LuoguSyncPanel({
               </p>
             )}
             <p>{luoguBacklogSummary(value)}</p>
+            <p className="icpc-muted">{LUOGU_METADATA_DRAIN_NOTE}</p>
             <p className="icpc-muted">{LUOGU_RECENT_WINDOW_NOTE}</p>
             <p className="icpc-muted">{LUOGU_AC_EVIDENCE_NOTE}</p>
           </div>

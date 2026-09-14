@@ -209,6 +209,8 @@ export const PERFORMANCE_API_OPERATIONS = {
  * authenticated synchronization service and the OS credential vault. `luogu.connect` is the single
  * operation of the whole API whose request carries secret material; every other operation names
  * only a stored account, an explicit action, a settings patch or a compare-and-set revision.
+ * `luogu.profile` is the one public, anonymous read: it refreshes the account's own nickname from
+ * the official profile endpoint, needs no stored session and touches no credential.
  */
 export const LUOGU_API_OPERATIONS = {
   status: 'luogu.status',
@@ -218,6 +220,7 @@ export const LUOGU_API_OPERATIONS = {
   configure: 'luogu.configure',
   start: 'luogu.start',
   cancel: 'luogu.cancel',
+  profile: 'luogu.profile',
 } as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
 
 // ---------------------------------------------------------------------------------------
@@ -612,10 +615,16 @@ export interface ApiLuoguConfigureRequest {
   readonly intervalMinutes?: number;
 }
 
-/** Request of `luogu.start`: `resume` continues the durable position, `full` reconciles history. */
+/**
+ * Request of `luogu.start`: `resume` continues the durable position, `full` reconciles history,
+ * `metadata` drains the missing problem-metadata backlog only.
+ *
+ * The metadata-only mode never reads a history page, never moves a history watermark and never
+ * invokes a model: it re-fetches public problem metadata from the platform, one key at a time.
+ */
 export interface ApiLuoguStartRequest {
   readonly accountId: string;
-  readonly mode: 'resume' | 'full';
+  readonly mode: 'resume' | 'full' | 'metadata';
 }
 
 /** Safe projection of one stored connection; never a reference, a cookie or a vault detail. */
@@ -683,9 +692,19 @@ export interface ApiLuoguStatusView {
 /** Result of `luogu.start`; the durable plan itself is visible in `status`. */
 export interface ApiLuoguStartResult {
   readonly accountId: string;
-  readonly mode: 'resume' | 'full';
+  readonly mode: 'resume' | 'full' | 'metadata';
   readonly outcome: 'started' | 'coalesced' | 'queued';
   readonly status: ApiLuoguStatusView;
+}
+
+/**
+ * Result of `luogu.profile`: the account whose nickname was refreshed.
+ *
+ * The fetched profile payload is not returned — only the stored account projection, in which
+ * `displayName` is the refreshed nickname and every identity field is unchanged.
+ */
+export interface ApiLuoguProfileResult {
+  readonly account: ApiAccountView;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -820,6 +839,7 @@ export interface WorkbenchApiMap {
   'luogu.configure': ApiEndpoint<ApiLuoguConfigureRequest, ApiLuoguStatusView>;
   'luogu.start': ApiEndpoint<ApiLuoguStartRequest, ApiLuoguStartResult>;
   'luogu.cancel': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguStatusView>;
+  'luogu.profile': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguProfileResult>;
   'assessment.config': ApiEndpoint<Record<string,never>,AssessmentConfigView>;
   'assessment.prepare': ApiEndpoint<AssessmentPrepareRequest,ApiAssessmentView>;
   'assessment.run': ApiEndpoint<AssessmentRunRequest,{readonly started:boolean;readonly attempt:ApiAssessmentView}>;
