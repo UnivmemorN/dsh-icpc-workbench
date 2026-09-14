@@ -339,8 +339,8 @@ export function parseProblemDetail(
       tagIds: parseTagIds(problem.tags, 'data.problem.tags', operation),
     },
     statement,
-    timeLimitsMs: parseLimitArray(limits.time, 'data.problem.limits.time', operation),
-    memoryLimitsKib: parseLimitArray(limits.memory, 'data.problem.limits.memory', operation),
+    timeLimitsMs: parseLimitArray(limits.time, 'data.problem.limits.time', operation, false),
+    memoryLimitsKib: parseLimitArray(limits.memory, 'data.problem.limits.memory', operation, true),
   };
 }
 
@@ -364,15 +364,28 @@ function parseSamples(value: unknown, operation: PlatformOperation): readonly Lu
   });
 }
 
-/** Luogu never declares an absent limit: a missing or invalid value is a changed response. */
-function parseLimitArray(value: unknown, label: string, operation: PlatformOperation): readonly number[] {
+/**
+ * Luogu never declares an absent limit: a missing or invalid value is a changed response.
+ *
+ * Only memory allows zero; time remains strictly positive. The official payload sends `memory: [0]` when it
+ * supplies no positive limit, so a raw `0` memory entry is kept verbatim: it is the platform's
+ * raw value, not a proven unlimited or zero-byte limit. Time keeps strictly positive validation
+ * because no changed shape is evidenced for it.
+ */
+function parseLimitArray(
+  value: unknown,
+  label: string,
+  operation: PlatformOperation,
+  allowZero: boolean,
+): readonly number[] {
   const entries = requireArray(value, label, operation);
   if (entries.length === 0) {
     throw payloadError(operation, `${label} must not be empty`);
   }
+  const shape = allowZero ? 'a non-negative finite number' : 'a positive finite number';
   return entries.map((entry, index) => {
-    if (typeof entry !== 'number' || !Number.isFinite(entry) || entry <= 0) {
-      throw payloadError(operation, `${label}[${index}] must be a positive finite number`);
+    if (typeof entry !== 'number' || !Number.isFinite(entry) || entry < 0 || (!allowZero && entry === 0)) {
+      throw payloadError(operation, `${label}[${index}] must be ${shape}`);
     }
     return entry;
   });
