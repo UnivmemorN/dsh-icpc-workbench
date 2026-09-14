@@ -26,12 +26,15 @@ import {
 } from '../../src/adapters/sqlite/index.js';
 import {
   SCHEMA_VERSION_V3,
+  SCHEMA_VERSION_V8,
   STORE_TABLES_V4,
+  STORE_TABLES_V8,
   applySchemaV1,
   applySchemaV3,
   initializeSchemaV2,
   initializeSchemaV3,
   migrateSchemaV1ToV2,
+  migrateToSchemaV8,
 } from '../../src/adapters/sqlite/schema.js';
 import { createAnalysisBatch } from '../../src/application/batch-types.js';
 import { defaultWorkbenchSettings } from '../../src/application/workbench-settings.js';
@@ -293,11 +296,11 @@ void test('a database from a newer schema is rejected before anything is written
   rawExec(paths.path, [
     'CREATE TABLE problems (x TEXT)',
     `INSERT INTO problems (x) VALUES ('foreign data')`,
-    // Explicitly verify a v9 database is refused by this build's v8 store before any write.
+    // Explicitly verify a v10 database is refused by this build's v9 store before any write.
     `PRAGMA user_version = ${STORE_SCHEMA_VERSION + 1}`,
   ]);
-  assert.equal(STORE_SCHEMA_VERSION, 8);
-  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 9);
+  assert.equal(STORE_SCHEMA_VERSION, 9);
+  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 10);
   const before = fingerprint(paths.path);
   const beforeBytes = readFileSync(paths.path);
   assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');
@@ -317,6 +320,65 @@ void test('a database from a newer schema is rejected before anything is written
   );
   assert.equal(rawScalar(paths.path, 'SELECT x FROM problems'), 'foreign data');
   assert.equal(after.tables.includes('store_meta'), false, 'no store metadata was added');
+  fx.removeDirectory(paths.dir);
+});
+
+/**
+ * A genuine v8 database, built with the frozen v8 helper, is the compatibility boundary of v9.
+ *
+ * v9 changes no table, so the only difference between the two shapes is the version marker and the
+ * JSON contract inside `luogu_sync_states.body`. This fixture therefore proves both halves: the
+ * frozen helper still writes the literal `user_version = 8` with exactly the v8 table set, and the
+ * current store copies that file at v8 before migrating it to v9 without rewriting a row.
+ */
+void test('a genuine v8 database is backed up at v8 and migrated to v9 with every row kept', async () => {
+  const paths = fx.tempDatabase();
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'carol', '3C');
+  const db = new DatabaseSync(paths.path);
+  try {
+    migrateToSchemaV8(db, 0);
+    db.prepare(
+      `INSERT INTO problems (key, source_instance_id, domain, external_key, title, fetched_at, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      scope.problem.key,
+      scope.problem.ref.sourceInstanceId,
+      scope.problem.ref.domain,
+      scope.problem.ref.externalKey,
+      scope.problem.title,
+      scope.problem.fetchedAt,
+      canonicalJson(scope.problem),
+    );
+  } finally {
+    db.close();
+  }
+  const before = fingerprint(paths.path);
+  assert.equal(before.userVersion, SCHEMA_VERSION_V8, 'the fixture is a schema-v8 database');
+  assert.deepEqual(before.tables, [...STORE_TABLES_V8].sort(), 'the fixture is exactly a v8 store');
+
+  const store = new SqliteTrainingStore({ path: paths.path, now: () => fx.LATER });
+  try {
+    assert.equal(store.capabilities().schemaVersion, STORE_SCHEMA_VERSION);
+    assert.deepEqual(await store.getProblem(scope.problem.key), scope.problem, 'the v8 problem body survived');
+  } finally {
+    await store.close();
+  }
+
+  const migrated = fingerprint(paths.path);
+  assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION, 'the genuine v8 file ends at the current v9');
+  assert.equal(migrated.marker, STORE_MARKER);
+  assert.equal(migrated.integrity, 'ok');
+  assert.deepEqual(migrated.tables, [...STORE_TABLES_V8].sort(), 'v9 uses exactly the v8 table set');
+  assert.equal(rawScalar(paths.path, 'SELECT body FROM problems'), canonicalJson(scope.problem));
+
+  const backups = readdirSync(paths.dir).filter((name) => name.includes('.backup-v8-') && name.endsWith('.sqlite'));
+  assert.equal(backups.length, 1, 'exactly one pre-migration copy at the literal v8 is kept');
+  const backup = fingerprint(join(paths.dir, backups[0]!));
+  assert.equal(backup.userVersion, SCHEMA_VERSION_V8, 'the copy is the database as found');
+  assert.equal(backup.marker, STORE_MARKER);
+  assert.equal(backup.integrity, 'ok');
+  assert.deepEqual(backup.tables, [...STORE_TABLES_V8].sort());
+  assert.equal(rawScalar(join(paths.dir, backups[0]!), 'SELECT body FROM problems'), canonicalJson(scope.problem));
   fx.removeDirectory(paths.dir);
 });
 

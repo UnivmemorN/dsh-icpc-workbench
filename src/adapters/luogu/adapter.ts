@@ -682,6 +682,7 @@ export class LuoguAdapter implements PlatformAdapter {
         retryable: false,
         detail: `${label} answered an HTML page instead of JSON`,
         sample: bodySnippet(response.body),
+        reason: 'html_response',
       });
     }
     let parsed: unknown;
@@ -694,10 +695,11 @@ export class LuoguAdapter implements PlatformAdapter {
         retryable: false,
         detail: `${label} is not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
         sample: bodySnippet(response.body),
+        reason: 'invalid_json',
       });
     }
     if (!isJsonRecord(parsed)) {
-      throw payloadError(operation, `${label} must be a JSON object`, bodySnippet(response.body));
+      throw payloadError(operation, `${label} must be a JSON object`, bodySnippet(response.body), 'invalid_payload');
     }
     return parsed;
   }

@@ -79,6 +79,7 @@ import type { SyncCheckpoint, SyncCheckpointRef } from './storage-types.js';
 import {
   IMPORT_PAGE_LIMITS,
   MAX_SUPPLEMENT_STATEMENT_CHARS,
+  MAX_SUPPLEMENT_TITLE_CHARS,
   MISSING_PROBLEM_KEY_LIMIT,
   editorialSourceIdOf,
   type EditorialRefreshOutcome,
@@ -95,6 +96,8 @@ import {
   type SnapshotWrite,
   type StatementRefreshOutcome,
   type SubmissionPageCounts,
+  type SupplementLocalProblemReport,
+  type SupplementLocalProblemRequest,
   type SupplementMaterialReport,
   type SupplementMaterialRequest,
   type SyncPageReport,
@@ -242,63 +245,179 @@ export class ImportService {
   ): Promise<SupplementMaterialReport> {
     throwIfCancelled(token);
     const validated = validateSupplementRequest(request);
-    const key = validated.problemKey;
     const observedAt = assertIsoTimestamp('observedAt', this.now());
+    const committed = await this.commitSupplement({
+      key: validated.problemKey,
+      expectedSnapshotId: validated.expectedSnapshotId,
+      statement: validated.statement,
+      material: validated.material,
+      absentSeed: null,
+      beforeCommit: null,
+      token,
+      observedAt,
+    });
+    return {
+      problemKey: committed.problemKey,
+      snapshot: committed.snapshot,
+      material: committed.material,
+    } satisfies SupplementMaterialReport;
+  }
 
+  /**
+   * Record one **locally supplied** problem body for a key the store may not know yet.
+   *
+   * This is the application half of the manual recovery of a queued Luogu key (Sprint 25a4): a
+   * problem the platform will not serve can still be completed with the real title and statement
+   * the user typed. It shares the entire merge and snapshot discipline of
+   * {@link supplementMaterial} through {@link commitSupplement}; the only additions are the
+   * optional absent-problem seed (an identity and URL derived by the caller from the configured
+   * source, never from a request body) and the caller's `beforeCommit` hook, which lets the
+   * caller dequeue the recovered key in the very same transaction.
+   *
+   * The public business operation stays strictly stored-only: this method is internal plumbing
+   * for the synchronization service and is not registered as an endpoint.
+   */
+  async supplementLocalProblem(request: SupplementLocalProblemRequest): Promise<SupplementLocalProblemReport> {
+    invariant(
+      request !== null && typeof request === 'object' && !Array.isArray(request),
+      'invalid_input',
+      'local supplement request must be an object',
+    );
+    const validated = validateLocalSupplementRequest(request);
+    throwIfCancelled(request.token);
+    const observedAt = assertIsoTimestamp('observedAt', this.now());
+    const committed = await this.commitSupplement({
+      key: validated.key,
+      expectedSnapshotId: validated.expectedSnapshotId,
+      statement: validated.statement,
+      material: null,
+      absentSeed: { ref: validated.ref, url: validated.url, title: validated.title },
+      beforeCommit: request.beforeCommit ?? null,
+      token: request.token,
+      observedAt,
+    });
+    return {
+      problemKey: committed.problemKey,
+      snapshot: committed.snapshot,
+      created: committed.created,
+    } satisfies SupplementLocalProblemReport;
+  }
+
+  /**
+   * The one transaction both supplementation paths share.
+   *
+   * The problem is rebuilt from the **stored** reference, title, url, ratings and raw tags when a
+   * row exists, so a client that deliberately hides that metadata cannot erase it; when no row
+   * exists, a seed is required and the row is created with the supplied title, no rating and no
+   * raw tag (unknown stays unknown). The caller's `expectedSnapshotId` is compared with the
+   * stored head **before the first write**, so a supplement built on a superseded snapshot — or a
+   * creation whose claimed snapshot exists — is refused instead of being merged. Material follows
+   * the shared merge rules, and no platform or model is ever called here.
+   *
+   * The optional `beforeCommit` hook runs after the problem row and its snapshot were written and
+   * before the transaction commits: a throw (a lost lease, a cancellation, a CAS loss) rolls the
+   * problem, its snapshot and every mutation the hook made back together.
+   */
+  private async commitSupplement(args: SupplementCommit): Promise<SupplementCommitResult> {
+    const key = args.key;
     return this.store.transaction(async () => {
-      throwIfCancelled(token);
+      throwIfCancelled(args.token);
       const stored = await this.store.getProblem(key);
-      throwIfCancelled(token);
-      if (stored === null) {
-        throw new DomainError('missing_reference', `problem ${key} is not stored`, { problemKey: key });
-      }
-      invariant(
-        stored.key === key && problemKey(stored.ref) === key,
-        'invalid_input',
-        `stored problem ${stored.key} does not match the requested reference`,
-        { requested: key, stored: stored.key, derived: problemKey(stored.ref) },
-      );
-      // The source instance owns the problem; a problem whose instance is gone is a dangling
-      // reference and must not gain new snapshots.
-      const source = await this.store.getSourceInstance(stored.ref.sourceInstanceId);
-      throwIfCancelled(token);
-      invariant(
-        source !== null,
-        'missing_reference',
-        `source instance ${stored.ref.sourceInstanceId} is not stored`,
-        { problemKey: key },
-      );
+      throwIfCancelled(args.token);
 
-      const previous = await this.readCurrentSnapshot(stored.ref, token);
+      let problem: NormalizedProblem;
+      let created = false;
+      if (stored === null) {
+        const seed = args.absentSeed;
+        invariant(
+          seed !== null,
+          'missing_reference',
+          `problem ${key} is not stored`,
+          { problemKey: key },
+        );
+        invariant(
+          problemKey(seed.ref) === key,
+          'invalid_input',
+          `local problem seed ${problemKey(seed.ref)} does not match ${key}`,
+          { requested: key },
+        );
+        invariant(
+          args.statement !== null,
+          'invalid_input',
+          'creating a missing problem requires a supplied statement',
+          { problemKey: key },
+        );
+        // A new problem row belongs to a stored source instance; creating one under a dangling
+        // instance id would corrupt the identity the snapshot is keyed by.
+        const source = await this.store.getSourceInstance(seed.ref.sourceInstanceId);
+        throwIfCancelled(args.token);
+        invariant(
+          source !== null,
+          'missing_reference',
+          `source instance ${seed.ref.sourceInstanceId} is not stored`,
+          { problemKey: key },
+        );
+        problem = createNormalizedProblem({
+          ref: seed.ref,
+          title: seed.title,
+          url: seed.url,
+          statement: args.statement,
+          fetchedAt: args.observedAt,
+          // Locally supplied material is not platform material: no rating and no raw tag is
+          // invented for a problem the platform never answered for.
+          ratings: [],
+          rawTags: [],
+        });
+        created = true;
+      } else {
+        invariant(
+          stored.key === key && problemKey(stored.ref) === key,
+          'invalid_input',
+          `stored problem ${stored.key} does not match the requested reference`,
+          { requested: key, stored: stored.key, derived: problemKey(stored.ref) },
+        );
+        // The source instance owns the problem; a problem whose instance is gone is a dangling
+        // reference and must not gain new snapshots.
+        const source = await this.store.getSourceInstance(stored.ref.sourceInstanceId);
+        throwIfCancelled(args.token);
+        invariant(
+          source !== null,
+          'missing_reference',
+          `source instance ${stored.ref.sourceInstanceId} is not stored`,
+          { problemKey: key },
+        );
+        problem = createNormalizedProblem({
+          ref: stored.ref,
+          title: stored.title,
+          url: stored.url,
+          statement: args.statement ?? stored.statement,
+          fetchedAt: args.observedAt,
+          ratings: stored.ratings.map((rating) => ({
+            dimension: rating.dimension,
+            value: rating.value,
+            scale: rating.scale === null ? null : { min: rating.scale.min, max: rating.scale.max },
+            raw: rating.raw,
+          })),
+          rawTags: stored.rawTags.map((tag) => tag.raw),
+        });
+      }
+
+      const previous = await this.readCurrentSnapshot(problem.ref, args.token);
       const currentSnapshotId = previous === null ? null : previous.snapshotId;
-      if (currentSnapshotId !== validated.expectedSnapshotId) {
+      if (currentSnapshotId !== args.expectedSnapshotId) {
         throw new DomainError(
           'invalid_transition',
           'supplement is stale: the snapshot head changed since it was read',
-          { expected: validated.expectedSnapshotId, current: currentSnapshotId },
+          { expected: args.expectedSnapshotId, current: currentSnapshotId, reason: 'stale_snapshot' },
         );
       }
 
-      const merged = createNormalizedProblem({
-        ref: stored.ref,
-        title: stored.title,
-        url: stored.url,
-        statement: validated.statement ?? stored.statement,
-        fetchedAt: observedAt,
-        ratings: stored.ratings.map((rating) => ({
-          dimension: rating.dimension,
-          value: rating.value,
-          scale: rating.scale === null ? null : { min: rating.scale.min, max: rating.scale.max },
-          raw: rating.raw,
-        })),
-        rawTags: stored.rawTags.map((tag) => tag.raw),
-      });
-      await this.store.upsertProblems([merged]);
-      throwIfCancelled(token);
+      await this.store.upsertProblems([problem]);
+      throwIfCancelled(args.token);
 
-      const declaration = validated.material;
+      const declaration = args.material;
       const editorial = mergeEditorialMaterial({
-        problem: merged,
+        problem,
         previous,
         result: declaration === null ? null : declaredMaterialResult(declaration),
         attribution: declaration,
@@ -306,21 +425,29 @@ export class ImportService {
           declaration === null || declaration.url === null
             ? null
             : assertHttpUrl('material url', declaration.url),
-        retrievedAt: observedAt,
+        retrievedAt: args.observedAt,
       });
       const snapshot = await this.persistSnapshot({
-        problem: merged,
+        problem,
         sources: editorial.sources,
         solutions: editorial.solutions,
         previous,
-        token,
+        token: args.token,
       });
-      throwIfCancelled(token);
+      throwIfCancelled(args.token);
+      // The caller's hook shares this transaction on purpose: the manual-recovery path re-checks
+      // its source lease and dequeues the recovered key here, so the problem row, its snapshot and
+      // the queue mutation commit together or not at all.
+      if (args.beforeCommit !== null) {
+        await args.beforeCommit();
+      }
+      throwIfCancelled(args.token);
       return {
         problemKey: key,
         snapshot,
         material: declaration === null ? null : editorial.report,
-      } satisfies SupplementMaterialReport;
+        created,
+      };
     });
   }
 
@@ -723,6 +850,11 @@ export class ImportService {
     return this.store.transaction(async () => {
       throwIfCancelled(token);
       const written = await this.writeProblems([fetched], token);
+      throwIfCancelled(token);
+      // The optional hook shares this transaction: a lease re-check or a durable progress update
+      // inside it can abort the metadata write, so a caller's record and the problem row commit
+      // together or not at all.
+      await request.beforeCommit?.();
       throwIfCancelled(token);
       const problem = await this.store.getProblem(key);
       // A cancellation observed after the merge write rolls the whole metadata write back.
@@ -1294,6 +1426,136 @@ function validateSupplementSource(source: EditorialSource): void {
     'a found editorial source must carry a sha256 content hash',
     { id: source.id },
   );
+}
+
+// ---------------------------------------------------------------------------------------
+// Local supplementation (manual recovery of a queued key)
+// ---------------------------------------------------------------------------------------
+
+/** Inputs of the single transaction shared by the stored-only and the local supplement paths. */
+interface SupplementCommit {
+  readonly key: string;
+  readonly expectedSnapshotId: string | null;
+  /** `null` keeps the stored statement; both paths require a stored row in that case. */
+  readonly statement: string | null;
+  readonly material: ManualMaterialInput | null;
+  /** Present only for the manual-recovery path; enables creating a missing problem row. */
+  readonly absentSeed: { readonly ref: ProblemRef; readonly url: string; readonly title: string } | null;
+  readonly beforeCommit: (() => Promise<void> | void) | null;
+  readonly token: CancellationToken;
+  readonly observedAt: string;
+}
+
+interface SupplementCommitResult {
+  readonly problemKey: string;
+  readonly snapshot: SnapshotWrite;
+  readonly material: MaterialReport | null;
+  readonly created: boolean;
+}
+
+interface ValidatedLocalSupplement {
+  readonly ref: ProblemRef;
+  readonly key: string;
+  readonly url: string;
+  readonly title: string;
+  readonly statement: string;
+  readonly expectedSnapshotId: string | null;
+}
+
+/**
+ * Recheck one local-supplement request before any read or write.
+ *
+ * The caller owns the seed (the Luogu service derives the reference from the canonical queued key
+ * and the URL from its configured instance), but this pass protects the store from a caller that
+ * bypassed it: a non-canonical reference, a blank or oversized title/statement, a missing
+ * cancellation token and an `expectedSnapshotId` that cannot be this problem's head are refused
+ * here, before the transaction opens.
+ */
+function validateLocalSupplementRequest(request: SupplementLocalProblemRequest): ValidatedLocalSupplement {
+  invariant(
+    request.token !== null &&
+      typeof request.token === 'object' &&
+      typeof request.token.throwIfCancelled === 'function',
+    'invalid_input',
+    'local supplement requires a cancellation token',
+  );
+  const seed = request.problem;
+  invariant(
+    seed !== null && typeof seed === 'object' && !Array.isArray(seed),
+    'invalid_input',
+    'local supplement requires a problem seed',
+  );
+  const rawRef: unknown = seed.ref;
+  invariant(
+    rawRef !== null && typeof rawRef === 'object',
+    'invalid_input',
+    'local supplement requires a canonical problem reference',
+  );
+  const declared = rawRef as ProblemRef;
+  const ref: ProblemRef = {
+    sourceInstanceId: declared.sourceInstanceId,
+    domain: declared.domain ?? null,
+    externalKey: declared.externalKey,
+  };
+  const key = problemKey(ref);
+  // Strict canonical shape: the derived key is parsed back and compared field by field, so a
+  // reference `problemKey` would normalize (an unencoded external key, a padded domain, ...) is a
+  // caller error here instead of a lookup that silently addresses another identity.
+  const canonical = parseProblemKey(key);
+  invariant(
+    canonical.sourceInstanceId === ref.sourceInstanceId &&
+      (canonical.domain ?? null) === (ref.domain ?? null) &&
+      canonical.externalKey === ref.externalKey,
+    'invalid_input',
+    'local supplement reference is not canonical',
+    { key },
+  );
+  invariant(
+    typeof seed.url === 'string' && seed.url.length > 0,
+    'invalid_input',
+    'local supplement requires a problem url string',
+    { problemKey: key },
+  );
+  const url = assertHttpUrl('local problem url', seed.url);
+  invariant(typeof seed.title === 'string', 'invalid_input', 'local supplement requires a title string');
+  const title = seed.title.trim();
+  invariant(title.length > 0, 'invalid_input', 'local supplement title must not be blank', { problemKey: key });
+  invariant(
+    seed.title.length <= MAX_SUPPLEMENT_TITLE_CHARS,
+    'invalid_input',
+    `local supplement title exceeds ${MAX_SUPPLEMENT_TITLE_CHARS} characters`,
+    { problemKey: key, length: seed.title.length },
+  );
+  const statement = request.statement;
+  invariant(typeof statement === 'string', 'invalid_input', 'local supplement requires a statement string');
+  invariant(statement.trim().length > 0, 'invalid_input', 'local supplement statement must not be blank', {
+    problemKey: key,
+  });
+  invariant(
+    statement.length <= MAX_SUPPLEMENT_STATEMENT_CHARS,
+    'invalid_input',
+    `local supplement statement exceeds ${MAX_SUPPLEMENT_STATEMENT_CHARS} characters`,
+    { problemKey: key, length: statement.length },
+  );
+  const expected = request.expectedSnapshotId;
+  invariant(
+    expected === null || (typeof expected === 'string' && expected.length > 0),
+    'invalid_input',
+    'expectedSnapshotId must be a snapshot id or null',
+    { problemKey: key },
+  );
+  invariant(
+    expected === null || expected.startsWith(`${key}@`),
+    'invalid_input',
+    'expectedSnapshotId does not belong to the requested problem',
+    { problemKey: key, expectedSnapshotId: expected },
+  );
+  invariant(
+    request.beforeCommit === undefined || typeof request.beforeCommit === 'function',
+    'invalid_input',
+    'beforeCommit must be a function when supplied',
+  );
+  return { ref, key, url, title, statement, expectedSnapshotId: expected };
 }
 
 // ---------------------------------------------------------------------------------------

@@ -60,6 +60,14 @@ import {
   type LuoguSettingsDraft,
   type LuoguSyncProgressState,
 } from './luogu-view.js';
+import { LuoguMetadataPanel } from './LuoguMetadata.js';
+import {
+  luoguMetadataDisclosureLabel,
+  luoguMetadataPointer,
+  luoguStartNotice,
+  luoguStartNoticeStep,
+  type LuoguStartNotice,
+} from './luogu-metadata-view.js';
 
 /** Stable id of the one revealed credential region, so its trigger can name what it controls. */
 const CREDENTIALS_ID = 'icpc-luogu-credentials';
@@ -92,6 +100,11 @@ const CREDENTIALS_ID = 'icpc-luogu-credentials';
  * - **Editable means the host can accept a change.** The automatic-sync fields are disabled only while
  *   an action is in flight or the plugin is closing ({@link luoguSettingsEditable}), never because the
  *   draft happens to be unchanged, while the save button still requires a real change.
+ * - **Recovery lives in one disclosure (Sprint 25b).**「待补题目与手动处理（N）」sits next to the compact
+ *   backlog action and always states the pending item count; it is collapsed by default, and
+ *   {@link LuoguMetadataPanel} — which reads one bounded page of `luogu.metadataBacklog` and owns the
+ *   single open supplement form — is mounted only while it is open. A metadata failure or a nonempty
+ *   backlog adds one sentence pointing at exactly this disclosure.
  *
  * The rules it keeps from Stage 17d2/19:
  *
@@ -141,6 +154,10 @@ export function LuoguSyncPanel({
   const [fullConfirm, setFullConfirm] = useState(false);
   const [draft, setDraft] = useState<LuoguSettingsDraft | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // Sprint 25b: whether the one recovery disclosure is open (its panel is mounted only then) and the
+  // transient answer of this panel's own `luogu.start` request, which the durable status later clears.
+  const [metadataOpen, setMetadataOpen] = useState(false);
+  const [runNotice, setRunNotice] = useState<string | null>(null);
 
   // A draft is never carried into another account: switching accounts clears the secret immediately,
   // collapses the credential form, and unmount clears the drafts by dropping the only copy there is.
@@ -151,6 +168,10 @@ export function LuoguSyncPanel({
     setFullCookie('');
     setFullConfirm(false);
     setMessage(null);
+    // The backlog disclosure and its transient answer belong to one account: clearing them here means
+    // no page position, row notice or open form can be carried into another account's backlog.
+    setMetadataOpen(false);
+    setRunNotice(null);
   }, [accountId]);
 
   // Adopt the durable settings once per account/revision (and after every save); a plain poll of the
@@ -193,6 +214,30 @@ export function LuoguSyncPanel({
     }
   }, [value, onChange, refresh]);
 
+  // The transient「已开始新一轮同步…」line is cleared by the durable run it announced, never by a
+  // guess: a new success, a failure observed after the click, and a run that was seen running and then
+  // ended all drop it — while an initial idle read of the older status keeps it, because that read
+  // proves nothing about the request that was just committed.
+  const runStart = useRef<LuoguStartNotice | null>(null);
+  useEffect(() => {
+    if (value === null) {
+      return;
+    }
+    const step = luoguStartNoticeStep(runStart.current, {
+      accountId: value.accountId,
+      running: value.running,
+      leaseActive: value.leaseActive,
+      lastSuccessAt: value.lastSuccessAt,
+      scanStartedAt: value.scanStartedAt,
+      failureAt: value.failure?.at ?? null,
+      closing: value.closing,
+    });
+    runStart.current = step.notice;
+    if (step.decision === 'succeeded' || step.decision === 'failed' || step.decision === 'ended') {
+      setRunNotice(null);
+    }
+  }, [value]);
+
   const pollDelay = luoguPollDelayMs(value, pending === 'start' || pending === 'reconcile');
   usePollAfterSettle(pollDelay !== null, status.pending, status.refresh, pollDelay ?? LUOGU_POLL_IDLE_MS);
 
@@ -217,6 +262,8 @@ export function LuoguSyncPanel({
   async function submit(label: LuoguAction, work: (signal: AbortSignal) => Promise<void>): Promise<void> {
     setPending(label);
     setMessage(null);
+    // A new host action replaces whatever the previous start request announced.
+    setRunNotice(null);
     try {
       await hostAction.run(async (signal) => {
         await work(signal);
@@ -286,11 +333,23 @@ export function LuoguSyncPanel({
     if (target === null) {
       return;
     }
+    // The click instant and the durable baselines are captured before the request; the fold in the
+    // status effect uses them to prove that this run actually started, succeeded or failed instead of
+    // reading an older status as the answer to this request.
+    const requestedAt = new Date().toISOString();
+    const baseline = value;
     const action = mode === 'full' ? 'reconcile' : mode === 'metadata' ? 'metadata' : 'start';
     void submit(action, async (signal) => {
       const result = await api.request('luogu.start', { accountId: target, mode }, signal);
       const outcomes = mode === 'metadata' ? LUOGU_METADATA_START_OUTCOMES : LUOGU_START_OUTCOMES;
-      setMessage(
+      runStart.current = luoguStartNotice({
+        accountId: target,
+        outcome: result.outcome,
+        requestedAt,
+        lastSuccessAt: baseline?.lastSuccessAt ?? null,
+        scanStartedAt: baseline?.scanStartedAt ?? null,
+      });
+      setRunNotice(
         outcomes[result.outcome] + (mode === 'full' ? ' 完成之前，历史覆盖仍按「未完成」显示。' : ''),
       );
     });
@@ -376,6 +435,8 @@ export function LuoguSyncPanel({
     const credentialLabel = luoguCredentialActionLabel(value);
     const settingsEditable = luoguSettingsEditable(value, pending !== null);
     const primaryReason = luoguPrimaryActionReason(value, controls.start, pending !== null);
+    // The compact card always names the one place where a pending or failed problem key is handled.
+    const metadataPointer = luoguMetadataPointer(value);
     // A login check newer than the failure is shown as a successful check *now*; it never retracts
     // the failure and is never rendered as a successful synchronization.
     const loginCheck = luoguLoginCheckSummary(value);
@@ -412,6 +473,9 @@ export function LuoguSyncPanel({
         <p className="icpc-muted">{LUOGU_NO_AI_NOTE}</p>
         <ErrorNotice error={hostAction.error ?? status.error} />
         {message !== null && <Notice>{message}</Notice>}
+        {/* The start notice is its own line: it can be cleared by the durable run without disturbing
+            the result of the last explicit action. */}
+        {runNotice !== null && <Notice>{runNotice}</Notice>}
         {/* The compact card never hides a failure: one short sentence names it and the long,
             stage-aware next-action sentence is rendered once inside「同步详情」. */}
         {compact.alert !== null && (
@@ -481,6 +545,37 @@ export function LuoguSyncPanel({
             {primaryReason}
           </small>
         )}
+        {metadataPointer !== null && (
+          <p className="icpc-muted" role="status">
+            {metadataPointer}
+          </p>
+        )}
+
+        {/* Sprint 25b: the one discoverable place for pending or failed problem material. The panel is
+            mounted only while this disclosure is open, so a closed disclosure issues no request and
+            holds no draft; closing it unmounts every row and the single open supplement form. */}
+        <details
+          className="icpc-luogu-detail"
+          open={metadataOpen}
+          onToggle={(event) => {
+            if (event.target === event.currentTarget) {
+              setMetadataOpen(event.currentTarget.open);
+            }
+          }}
+        >
+          <summary>{luoguMetadataDisclosureLabel(value.metadataBacklog)}</summary>
+          <div className="icpc-luogu-detail-body">
+            {metadataOpen && (
+              <LuoguMetadataPanel
+                key={value.accountId}
+                accountId={value.accountId}
+                status={value}
+                onStatusRefresh={status.refresh}
+                onBankChange={onChange}
+              />
+            )}
+          </div>
+        </details>
 
         {supported && credentialsOpen && (
           <section className="icpc-luogu-credentials" id={CREDENTIALS_ID} aria-label="洛谷登录凭据">

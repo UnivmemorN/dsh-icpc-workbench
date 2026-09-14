@@ -21,6 +21,7 @@ import {
   createStoredSubmissionsSource,
 } from '../../src/adapters/luogu/index.js';
 import { ImportService } from '../../src/application/import-service.js';
+import { MAX_SUPPLEMENT_STATEMENT_CHARS, MAX_SUPPLEMENT_TITLE_CHARS } from '../../src/application/import-types.js';
 import { createLuoguSourceGate } from '../../src/application/luogu-source-gate.js';
 import { LuoguSyncService } from '../../src/application/luogu-sync-service.js';
 import { emptyLuoguSyncState } from '../../src/application/luogu-sync-types.js';
@@ -207,7 +208,7 @@ const ALL_OPERATIONS = Object.values(LUOGU_API_OPERATIONS);
 
 void test('the Luogu route map is exact and every answer uses the versioned envelope', async () => {
   await withBench({}, async (bench) => {
-    assert.equal(ALL_OPERATIONS.length, 8);
+    assert.equal(ALL_OPERATIONS.length, 11);
     assert.deepEqual(
       [...bench.routes.keys()].sort(),
       ALL_OPERATIONS.map((operation) => `${API_PREFIX}${operation}`).sort(),
@@ -344,6 +345,91 @@ void test('malformed input is refused before any store, vault or platform side e
       ['luogu.probe', { accountId, mode: 'resume' }],
       ['luogu.disconnect', { accountId: '' }],
       ['luogu.cancel', { accountId: null }],
+      // A smuggled-in session cookie (and any other undeclared field) is refused, not dropped.
+      [
+        'luogu.supplementMetadata',
+        {
+          accountId,
+          problemKey: sfx.problemKeyOf(bench.instance, 'P9101'),
+          title: '本地补全',
+          statement: '用户题面。',
+          expectedSnapshotId: null,
+          sessionCookie: cookie,
+        },
+      ],
+      [
+        'luogu.supplementMetadata',
+        {
+          accountId,
+          problemKey: sfx.problemKeyOf(bench.instance, 'P9101'),
+          title: '本地补全',
+          statement: '用户题面。',
+        },
+      ],
+      [
+        'luogu.supplementMetadata',
+        {
+          accountId,
+          problemKey: sfx.problemKeyOf(bench.instance, 'P9101'),
+          title: '   ',
+          statement: '用户题面。',
+          expectedSnapshotId: null,
+        },
+      ],
+      [
+        'luogu.supplementMetadata',
+        {
+          accountId,
+          problemKey: sfx.problemKeyOf(bench.instance, 'P9101'),
+          title: '本地补全',
+          statement: '\n\t ',
+          expectedSnapshotId: null,
+        },
+      ],
+      [
+        'luogu.supplementMetadata',
+        {
+          accountId,
+          problemKey: sfx.problemKeyOf(bench.instance, 'P9101'),
+          title: '本地补全',
+          statement: 'x'.repeat(MAX_SUPPLEMENT_STATEMENT_CHARS + 1),
+          expectedSnapshotId: null,
+        },
+      ],
+      [
+        'luogu.supplementMetadata',
+        {
+          accountId,
+          problemKey: sfx.problemKeyOf(bench.instance, 'P9101'),
+          title: '标'.repeat(MAX_SUPPLEMENT_TITLE_CHARS + 1),
+          statement: '用户题面。',
+          expectedSnapshotId: null,
+        },
+      ],
+      [
+        'luogu.supplementMetadata',
+        {
+          accountId,
+          problemKey: sfx.problemKeyOf(bench.instance, 'P9101'),
+          title: '本地补全',
+          statement: '用户题面。',
+          expectedSnapshotId: 7,
+        },
+      ],
+      [
+        'luogu.supplementMetadata',
+        {
+          accountId,
+          problemKey: sfx.problemKeyOf(bench.instance, 'P9101'),
+          title: '本地补全',
+          statement: '用户题面。',
+          expectedSnapshotId: 'x'.repeat(600),
+        },
+      ],
+      [
+        'luogu.supplementMetadata',
+        { accountId, problemKey: 'not-a-canonical-key', title: '本地补全', statement: '用户题面。', expectedSnapshotId: null },
+      ],
     ];
     for (const [operation, body] of cases) {
       const error = await bench.refused(operation, body, 400);
@@ -776,9 +862,89 @@ void test('disposal removes every route even when one disposer throws and retain
       connectionPlatform: 'win32',
       now: bench.clock.now,
     });
-    assert.equal(routes.size, 8);
+    assert.equal(routes.size, ALL_OPERATIONS.length);
     await assert.rejects(() => dispose(), /probe disposer exploded/);
     assert.equal(routes.size, 0, 'every route was disposed despite the one failure');
     await assert.rejects(() => dispose(), /probe disposer exploded/, 'the cached disposal keeps the failure');
+  });
+});
+
+void test('luogu.supplementMetadata commits locally supplied material and refuses a stale head', async () => {
+  await withBench({}, async (bench) => {
+    const key = sfx.problemKeyOf(bench.instance, 'P5001');
+    const sibling = sfx.problemKeyOf(bench.instance, 'P5002');
+    await bench.store.saveLuoguSyncState(
+      {
+        ...emptyLuoguSyncState(bench.account.id, bench.instance.id, AT),
+        missingMetadata: [sibling, key],
+      },
+      null,
+    );
+
+    // A disconnected account: no session, no vault entry and still a successful local recovery.
+    assert.equal(await bench.store.getLuoguConnection(bench.account.id), null);
+    const view = await bench.ok('luogu.supplementMetadata', {
+      accountId: bench.account.id,
+      problemKey: key,
+      title: '本地补全的题目',
+      statement: '用户手写的完整题面。',
+      expectedSnapshotId: null,
+    });
+    assert.equal(view.outcome, 'supplemented');
+    assert.equal(view.accountId, bench.account.id);
+    assert.equal(view.problemKey, key);
+    assert.equal(view.snapshot.changed, true);
+    assert.equal(view.snapshot.version, 1);
+    assert.equal(view.status.metadataBacklog, 1, 'only the selected key left the backlog');
+    assert.equal(view.status.metadataResolved, 1);
+    assert.equal(view.status.connection, null);
+    assert.equal(view.status.running, false);
+    assert.equal(JSON.stringify(view).includes('用户手写的完整题面。'), false, 'the answer never echoes the statement');
+
+    const problem = await bench.store.getProblem(key);
+    assert.ok(problem !== null);
+    assert.equal(problem.title, '本地补全的题目');
+    assert.equal(problem.statement, '用户手写的完整题面。');
+    assert.equal(problem.url, `https://${sfx.OFFICIAL_DOMAIN}/problem/P5001`);
+    assert.deepEqual(problem.rawTags, [], 'no platform tag is invented');
+    assert.deepEqual(problem.ratings, [], 'no platform rating is invented');
+    const snapshot = await bench.store.getSnapshot(view.snapshot.snapshotId);
+    assert.deepEqual(snapshot?.sources, [], 'a local recovery declares no editorial material');
+    assert.deepEqual(snapshot?.solutions, []);
+    const state = await bench.store.getLuoguSyncState(bench.account.id);
+    assert.deepEqual(state?.value.missingMetadata, [sibling]);
+    assert.equal(state?.value.metadataResolved, 1);
+    assert.equal(state?.value.owner, null, 'the durable lease is released');
+
+    // No platform, history, credential or model work happened anywhere in this call.
+    assert.deepEqual(bench.metadata.calls, []);
+    assert.deepEqual(bench.metadata.profileCalls, []);
+    assert.equal(bench.metadata.editorialCalls(), 0);
+    assert.equal(bench.feed.calls.length, 0);
+    assert.equal(bench.vault.writes.length, 0);
+
+    // The head moved with the recovery: a form that still claims "no snapshot" is refused with the
+    // fixed refresh sentence and changes nothing.
+    await bench.store.saveLuoguSyncState({ ...state!.value, missingMetadata: [key, sibling] }, state!.revision);
+    const stale = await bench.refused(
+      'luogu.supplementMetadata',
+      {
+        accountId: bench.account.id,
+        problemKey: key,
+        title: '另一个标题',
+        statement: '另一份题面。',
+        expectedSnapshotId: null,
+      },
+      409,
+    );
+    assert.equal(stale.code, 'conflict');
+    assert.match(stale.message, /刷新/);
+    assert.equal(stale.message.includes('同步设置'), false, 'a stale snapshot is not a settings error');
+    assert.equal((await bench.store.getProblem(key))?.statement, '用户手写的完整题面。');
+    const after = await bench.store.getLuoguSyncState(bench.account.id);
+    assert.deepEqual(after?.value.missingMetadata, [key, sibling], 'a refused recovery leaves the key queued');
+    assert.equal(after?.value.metadataResolved, 1);
+    assert.deepEqual(bench.metadata.calls, []);
+    assert.equal(bench.feed.calls.length, 0);
   });
 });

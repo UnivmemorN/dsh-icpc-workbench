@@ -350,7 +350,14 @@ void test('a provider failure keeps its known usage and stays sanitized in the r
   assert.deepEqual(result.usage, { calls: 1, promptTokens: 40, completionTokens: 0, totalTokens: 40 });
   const audit = resultAudit(eventsOf(state.created[0])[1]);
   assert.equal(audit.outcome, 'failed');
-  assert.equal(String(audit.detail).includes('upstream exploded'), true);
+  // Stage 25c: the upstream message is a diagnostic payload and is never recorded; the detail is
+  // the fixed local projection and the kept finish replay is projected too.
+  assert.equal(String(audit.detail).includes('upstream exploded'), false);
+  assert.equal(audit.detail, 'the upstream provider reported provider_error');
+  assert.deepEqual(audit.chunks, [
+    { type: 'usage', usage: { inputTokens: 40, outputTokens: 0 } },
+    { type: 'finish', reason: { kind: 'error', code: 'provider_error' } },
+  ]);
 });
 
 void test('missing finish, max-tokens and tool-call finishes are invalid output', async () => {
@@ -751,7 +758,9 @@ void test('a failed capability lookup is audited, invents no cap and still dispa
   assert.equal(state.dispatch[0]?.maxTokens, 512);
   const capability = inputAudit(eventsOf(state.created[0])[0]).capability as unknown as Record<string, unknown>;
   assert.equal(capability['resolved'], false);
-  assert.match(String(capability['error']), /capability endpoint unavailable/);
+  // Stage 25c: the lookup exception is projected; its message is never recorded.
+  assert.equal(capability['error'], 'an upstream host exception was projected (mapped code=provider_error)');
+  assert.equal(String(capability['error']).includes('capability endpoint unavailable'), false);
 });
 
 void test('an oversized raw block-end or finish replay is invalid output, never truncated', async () => {
@@ -1003,8 +1012,13 @@ void test('typed provider failures route by code and never echo provider text', 
     assert.equal(result.error.message.includes(entry.code), false, entry.code);
     assert.deepEqual(result.usage, { calls: 1, promptTokens: 5, completionTokens: 1, totalTokens: 6 }, entry.code);
     const audit = resultAudit(eventsOf(state.created[0])[1]);
-    assert.equal(String(audit.detail).includes('provider detail text'), true, entry.code);
-    assert.equal(String(audit.detail).includes(entry.code), true, entry.code);
+    // Stage 25c: neither the provider's message nor its own code text is recorded, in the detail
+    // or in the projected finish replay.
+    assert.equal(String(audit.detail).includes('provider detail text'), false, entry.code);
+    assert.equal(String(audit.detail).includes(entry.code), false, entry.code);
+    assert.equal(audit.detail, `the upstream provider reported ${entry.expected}`, entry.code);
+    const finishReplay = (audit.chunks as unknown as readonly Record<string, unknown>[])[1];
+    assert.deepEqual(finishReplay, { type: 'finish', reason: { kind: 'error', code: entry.expected } }, entry.code);
   }
 
   const thrownState = makeHost(() => ({
@@ -1085,4 +1099,253 @@ void test('installed policy still dispatches Flash at max for every auxiliary ro
  }
  assert.equal(f.dispatch.length,5);
  for(const d of f.dispatch){assert.equal(d.provider,'deepseek-official');assert.equal(d.model,'deepseek-flash');assert.equal(String(d.reasoningEffort),'max');}
+});
+
+// ---------------------------------------------------------------------------------------
+// Stage 25c: upstream diagnostics, and any credentials they carry, never reach the audit log
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Synthetic, deliberately fake secret-shaped canaries — never real credentials. They stand in for
+ * whatever a provider may put into an exception or a failure payload.
+ */
+const CANARY_BEARER = 'CANARY-SECRET-BEARER-9f2c';
+const CANARY_API_KEY = 'sk-canary-0000000000000000';
+const CANARIES = [CANARY_BEARER, CANARY_API_KEY, `Bearer ${CANARY_BEARER}`] as const;
+
+/** Assert that no synthetic canary appears anywhere in one serialized observation. */
+function assertNoCanary(text: string, label: string): void {
+  for (const canary of CANARIES) {
+    assert.equal(text.includes(canary), false, `${label} leaked a synthetic canary secret`);
+  }
+}
+
+/** The recorded events exactly as the host would persist them, with their typed payloads. */
+function recordedAuditJson(session: Session | undefined): string {
+  return JSON.stringify(eventsOf(session).map((event) => ({ type: event.type, data: event.data })));
+}
+
+/** A thrown host exception carrying a canary in name, message, cause and arbitrary fields. */
+function canaryBearingError(message: string, code?: string): Error {
+  const error = new Error(`${message} ${CANARY_BEARER}`);
+  return Object.assign(error, {
+    name: `CanaryError ${CANARY_BEARER}`,
+    code: code ?? 'E_CANARY-UNMAPPED',
+    cause: new Error(`cause ${CANARY_BEARER}`),
+    apiKey: CANARY_API_KEY,
+    authorization: `Bearer ${CANARY_BEARER}`,
+    headers: { authorization: `Bearer ${CANARY_BEARER}` },
+    metadata: { apiKey: CANARY_API_KEY },
+  });
+}
+
+void test('a capability-lookup exception is projected, never serialized into the audit', async () => {
+  const state = makeHost(() => scripted(textChunks('{"ok":true}')));
+  const host: DshAuditedHost = {
+    llm: {
+      stream: (options) => state.host.llm.stream(options),
+      resolveModelInfo: async () => {
+        throw canaryBearingError('capability endpoint unavailable');
+      },
+    },
+    sessions: state.host.sessions,
+  };
+
+  const result = await new DshAuditedModelClient(host).callJson(request(), () => true);
+
+  // A failed advisory lookup never blocks the call; it is only recorded as unavailable.
+  assert.ok(result.ok);
+  const capability = inputAudit(eventsOf(state.created[0])[0]).capability as unknown as Record<string, unknown>;
+  assert.equal(capability['resolved'], false);
+  assert.equal(capability['error'], 'an upstream host exception was projected (mapped code=provider_error)');
+  const recorded = recordedAuditJson(state.created[0]);
+  assertNoCanary(recorded, 'the capability lookup audit');
+  assert.equal(recorded.includes('CanaryError'), false);
+  assert.equal(recorded.includes('apiKey'), false);
+  assert.equal(recorded.includes('authorization'), false);
+  // The successful input/output audit itself stays exactly what the model was given.
+  const audit = resultAudit(eventsOf(state.created[0])[1]);
+  assert.equal(audit.text, '{"ok":true}');
+  assert.deepEqual(audit.usage, KNOWN_USAGE);
+});
+
+void test('a provider failure finish is projected and its nested credentials are dropped', async () => {
+  const failureChunk = {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: {
+        code: 'RATE_LIMIT',
+        message: `upstream exploded ${CANARY_BEARER}`,
+        headers: { authorization: `Bearer ${CANARY_BEARER}` },
+        metadata: { apiKey: CANARY_API_KEY },
+      },
+    },
+    replayState: { apiKey: CANARY_API_KEY, authorization: `Bearer ${CANARY_BEARER}` },
+    apiKey: CANARY_API_KEY,
+  } as unknown as StreamChunk;
+  const state = makeHost(() =>
+    scripted([{ type: 'usage', usage: { inputTokens: 5, outputTokens: 1 } }, failureChunk]),
+  );
+
+  const result = await new DshAuditedModelClient(state.host).callJson(request(), () => true);
+
+  assert.equal(result.ok, false);
+  if (result.ok) {
+    assert.fail('a provider failure finish is never adopted');
+  }
+  // The caller receives the typed, fixed error; upstream text and the provider's own code are not
+  // echoed either.
+  assert.equal(result.error.code, 'rate_limited');
+  assert.equal(result.error.message, 'the model provider rate limit was reached');
+  assert.equal(result.error.retryable, true);
+  assertNoCanary(JSON.stringify(result), 'the returned result');
+  assert.deepEqual(result.usage, { calls: 1, promptTokens: 5, completionTokens: 1, totalTokens: 6 });
+
+  const audit = resultAudit(eventsOf(state.created[0])[1]);
+  assert.equal(audit.outcome, 'failed');
+  assert.equal(audit.detail, 'the upstream provider reported rate_limited');
+  assert.deepEqual(audit.chunks, [
+    { type: 'usage', usage: { inputTokens: 5, outputTokens: 1 } },
+    { type: 'finish', reason: { kind: 'error', code: 'rate_limited' } },
+  ]);
+  const recorded = recordedAuditJson(state.created[0]);
+  assertNoCanary(recorded, 'the failure audit');
+  for (const dropped of ['apiKey', 'authorization', 'metadata', 'replayState', 'upstream exploded']) {
+    assert.equal(recorded.includes(dropped), false, `the failure audit kept ${dropped}`);
+  }
+});
+
+void test('a thrown host exception while streaming is projected, never recorded', async () => {
+  const state = makeHost(() => ({
+    [Symbol.asyncIterator](): AsyncIterator<StreamChunk> {
+      throw Object.assign(new LlmError(`stream exploded ${CANARY_BEARER}`, 'QUOTA'), {
+        apiKey: CANARY_API_KEY,
+        authorization: `Bearer ${CANARY_BEARER}`,
+      });
+    },
+  }));
+
+  const result = await new DshAuditedModelClient(state.host).callJson(request(), () => true);
+
+  assert.equal(result.ok, false);
+  if (result.ok) {
+    assert.fail('a thrown stream failure is never adopted');
+  }
+  assert.equal(result.error.code, 'quota_exhausted');
+  assert.equal(result.error.message, 'the model provider quota is exhausted');
+  assert.equal(result.usage, null);
+  assertNoCanary(JSON.stringify(result), 'the returned result');
+  const audit = resultAudit(eventsOf(state.created[0])[1]);
+  assert.equal(audit.detail, 'an upstream host exception was projected (mapped code=quota_exhausted)');
+  const recorded = recordedAuditJson(state.created[0]);
+  assertNoCanary(recorded, 'the thrown-failure audit');
+  assert.equal(recorded.includes('apiKey'), false);
+});
+
+void test('an uncreatable audit session refuses with a fixed projection, not the host exception', async () => {
+  const state = makeHost(() => scripted(textChunks('{"ok":true}')));
+  const host: DshAuditedHost = {
+    llm: state.host.llm,
+    sessions: {
+      create: () => {
+        throw canaryBearingError('audit session store unavailable');
+      },
+      flush: state.host.sessions.flush,
+    },
+  };
+
+  const result = await new DshAuditedModelClient(host).callJson(request(), () => true);
+
+  assert.equal(result.ok, false);
+  if (result.ok) {
+    assert.fail('a call whose audit session cannot be created must be refused');
+  }
+  assert.equal(result.error.code, 'provider_error');
+  assert.equal(result.error.retryable, false);
+  assert.deepEqual(result.usage, ZERO_USAGE);
+  assert.equal(result.sessionId, null);
+  assert.equal(state.dispatch.length, 0);
+  assert.equal(state.created.length, 0);
+  assertNoCanary(JSON.stringify(result), 'the returned result');
+});
+
+void test('a throwing audit flush is never recorded as text and refuses dispatch', async () => {
+  const state = makeHost(() => scripted(textChunks('{"ok":true}')));
+  const host: DshAuditedHost = {
+    llm: state.host.llm,
+    sessions: {
+      create: (id) => state.host.sessions.create(id),
+      flush: () => {
+        throw canaryBearingError('audit log disk failure');
+      },
+    },
+  };
+
+  const result = await new DshAuditedModelClient(host).callJson(request(), () => true);
+
+  assert.equal(result.ok, false);
+  if (result.ok) {
+    assert.fail('a non-durable input audit must refuse dispatch');
+  }
+  assert.equal(result.error.code, 'provider_error');
+  assert.deepEqual(result.usage, ZERO_USAGE);
+  assert.equal(state.dispatch.length, 0);
+  assertNoCanary(JSON.stringify(result), 'the returned result');
+  assertNoCanary(recordedAuditJson(state.created[0]), 'the input-only audit');
+});
+
+void test('a successful stream stays byte-exact while user material is still audited by design', async () => {
+  const chunks = textChunks('{"tags":["dp"]}');
+  const state = makeHost(() => scripted(chunks));
+  const material = `user material ${CANARY_API_KEY}`;
+
+  const result = await new DshAuditedModelClient(state.host).callJson(
+    request({ system: `system ${CANARY_BEARER}`, userPrompt: material }),
+    (value) => value,
+  );
+
+  assert.ok(result.ok);
+  assert.deepEqual(result.value, { tags: ['dp'] });
+  const events = eventsOf(state.created[0]);
+  const input = inputAudit(events[0]);
+  // The documented boundary: user-provided material is recorded verbatim, so secrets must not be
+  // pasted into a statement or prompt. Only *upstream diagnostics* are projected.
+  assert.equal(input.system, `system ${CANARY_BEARER}`);
+  const auditedMessages = input.messages as unknown as readonly {
+    readonly content: readonly { readonly text: string }[];
+  }[];
+  assert.equal(auditedMessages[0]?.content[0]?.text, material);
+  const audit = resultAudit(events[1]);
+  assert.equal(audit.text, '{"tags":["dp"]}');
+  // Every chunk of a successful stream is replayed exactly as received.
+  assert.deepEqual(audit.chunks, chunks);
+  assert.deepEqual(audit.rawUsage, { inputTokens: 100, outputTokens: 10 });
+  assert.deepEqual(audit.usage, KNOWN_USAGE);
+  assert.equal(state.dispatch.length, 1);
+});
+
+void test('unknown terminal vocabulary and inherited failure codes cannot escape the audit projection', async () => {
+  for (const reason of [
+    { kind: 'aborted', failure: { code: '__proto__', message: CANARY_API_KEY } },
+    { kind: CANARY_API_KEY, replayState: { secret: CANARY_BEARER } },
+  ]) {
+    const state = makeHost(() => scripted([{ type: 'finish', reason } as unknown as StreamChunk]));
+    const result = await new DshAuditedModelClient(state.host).callJson(request(), () => true);
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail('invalid terminal must fail');
+    assert.equal(result.error.code, reason.kind === 'aborted' ? 'provider_error' : 'invalid_output');
+    assertNoCanary(recordedAuditJson(state.created[0]), 'unrecognized terminal audit');
+    assertNoCanary(JSON.stringify(result), 'unrecognized terminal result');
+  }
+});
+
+void test('a recognized truncation keeps its original terminal replay', async () => {
+  const chunk = { type: 'finish', reason: { kind: 'max-tokens' } } as const;
+  const state = makeHost(() => scripted([chunk]));
+  const result = await new DshAuditedModelClient(state.host).callJson(request(), () => true);
+  assert.equal(result.ok, false);
+  const audit = resultAudit(eventsOf(state.created[0])[1]);
+  assert.equal(audit.finish, 'max-tokens');
+  assert.deepEqual(audit.chunks, [chunk]);
 });

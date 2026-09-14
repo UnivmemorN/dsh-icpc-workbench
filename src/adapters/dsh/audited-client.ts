@@ -5,6 +5,14 @@
  * a dedicated audit session and flushed before the provider is called; the raw chunks, assembled
  * text/reasoning, terminal finish and usage are appended and flushed before a value is adopted.
  *
+ * Stage 25c privacy boundary: upstream exceptions and provider failure payloads are diagnostics
+ * that may carry credentials. Their name/message/stack/cause, arbitrary fields, headers, metadata
+ * and replay state are never serialized into audit events; only closed, locally owned reason text,
+ * the allowlisted mapped failure code and the actual usage/call identity are recorded. The one
+ * deliberate exception to byte-exact raw replay is a provider-failure finish chunk (see
+ * {@link auditChunkReplay}). User-provided material is still audited verbatim by design: secrets
+ * pasted into a statement or prompt are neither detected nor removed.
+ *
  * One global deadline — the request timeout — covers the capability lookup, the input flush, the
  * stream and the output flush. Every awaited host dependency is raced against that deadline and
  * against the caller's cancellation token, so a host that ignores both can still delay one call by
@@ -96,8 +104,9 @@ const MAPPED_FAILURE_CODES: Readonly<Record<string, ModelErrorCode>> = {
 /**
  * Fixed caller-facing message of every failure code.
  *
- * A provider's own code/name/message is arbitrary text and is never echoed to the caller; it stays
- * in the audit record's `detail`, which only the host reads.
+ * A provider's own code/name/message is arbitrary text and is never echoed to the caller, nor
+ * copied into the audit record: the audit `detail` is a fixed locally owned projection naming only
+ * an allowlisted mapped failure code.
  */
 const FAILURE_MESSAGES: Readonly<Record<ModelErrorCode, string>> = {
   cancelled: 'model call cancelled',
@@ -163,9 +172,14 @@ export interface IcpcModelCallResultAudit {
   readonly recordedAt: string;
   readonly outcome: 'ok' | 'failed';
   readonly code: ModelErrorCode | null;
-  /** Internal failure detail (never the caller-facing message). */
+  /** Fixed local failure detail; upstream exception/provider text is never copied here. */
   readonly detail: string | null;
   readonly finish: string | null;
+  /**
+   * Raw chunk replay in arrival order, with one diagnostic-only projection: a finish chunk whose
+   * reason is a provider failure is recorded as `{ kind, code }` from the fixed local vocabulary,
+   * because the upstream failure payload may carry credentials. Every other chunk is exact.
+   */
   readonly chunks: AuditedJson;
   /**
    * Raw chunk refused by the lossless/oversize gate, as `{ reason, bytes }`; `null` when every
@@ -527,7 +541,8 @@ export class DshAuditedModelClient {
     try {
       info = await resolveModelInfo.call(this.host.llm, request.provider, request.model, controller.signal);
     } catch (error) {
-      // A failed advisory lookup is recorded, never silently treated as a capability.
+      // A failed advisory lookup is recorded, never silently treated as a capability, and the host
+      // exception is projected to fixed local text instead of being serialized (Stage 25c).
       return { effort, capability: { resolved: false, error: auditErrorDetail(error) }, contextRefusal: null };
     }
     const declaredDefault = safeCount(info?.defaultMaxTokens);
@@ -629,11 +644,15 @@ export class DshAuditedModelClient {
           break;
         }
         rawBytes += serialized.bytes;
-        chunks.push(serialized.value);
+        // The provider's own bytes were measured above; the *kept* replay of an upstream failure
+        // finish is projected instead of copied (see `auditChunkReplay`).
+        chunks.push(auditChunkReplay(chunk, serialized.value));
         try {
           assembler.push(chunk);
-        } catch (error) {
-          failure = localFailure('invalid_output', `the model stream could not be assembled: ${auditErrorDetail(error)}`);
+        } catch {
+          // The assembler's exception is upstream diagnostic material; only the fixed local reason
+          // is recorded, never its name/message/stack/cause or any attached field.
+          failure = localFailure('invalid_output', 'the model stream could not be assembled');
           break;
         }
         if (chunk.type === 'usage') {
@@ -656,7 +675,7 @@ export class DshAuditedModelClient {
     const assembled = readAssembled(assembler);
     const rawUsage = emittedUsage ?? assembler.usage ?? null;
     const usage = toKnownUsage(rawUsage ?? undefined);
-    const finish = finishReason === null ? null : String(finishReason.kind);
+    const finish = finishReason === null ? null : safeFinishKind(finishReason.kind);
     const error =
       failure ??
       (cancelled ? localFailure('cancelled', 'cancellation was observed while streaming') : null) ??
@@ -742,6 +761,33 @@ export class DshAuditedModelClient {
   }
 }
 
+/**
+ * Replay one received chunk into the audit log.
+ *
+ * Every chunk is replayed exactly as it arrived, with one deliberate, diagnostic-only exception: a
+ * finish chunk whose reason is a provider failure carries upstream diagnostic material (failure
+ * message, headers, metadata, replay state, arbitrary fields) that may contain credentials. That
+ * chunk is projected onto the fixed local vocabulary — the closed reason kind and the allowlisted
+ * mapped code — and the provider's own payload is dropped. The provider's original chunk was
+ * already serialized and measured against the lossless/oversize bounds in `observe`, so the stream
+ * byte/chunk accounting still reflects exactly what the provider sent.
+ */
+function auditChunkReplay(chunk: StreamChunk, lossless: AuditedJson): AuditedJson {
+  if (chunk.type !== 'finish') {
+    return lossless;
+  }
+  const reason = chunk.reason;
+  if (safeFinishKind(reason.kind) === 'unknown') return { type: 'finish', reason: { kind: 'unknown' } };
+  if (reason.kind !== 'error' && reason.kind !== 'aborted') {
+    return lossless;
+  }
+  return { type: 'finish', reason: { kind: reason.kind, code: mappedFailureCode(reason.failure.code) } };
+}
+
+function safeFinishKind(kind: string): string {
+  return ['stop', 'max-tokens', 'tool-calls', 'aborted', 'error'].includes(kind) ? kind : 'unknown';
+}
+
 /** Map a terminal finish reason to a failure, or `null` when the stream may still be adopted. */
 function finishFailure(reason: FinishReason | null): CallFailure | null {
   if (reason === null) {
@@ -755,27 +801,45 @@ function finishFailure(reason: FinishReason | null): CallFailure | null {
     case 'tool-calls':
       return localFailure('invalid_output', 'tool calls cannot be parsed as JSON output');
     case 'aborted':
-      return mappedFailure(reason.failure.code, providerDetail(reason.failure));
+      return mappedFailure(reason.failure.code);
     case 'error':
-      return mappedFailure(reason.failure.code, providerDetail(reason.failure));
+      return mappedFailure(reason.failure.code);
     default:
-      return localFailure(
-        'invalid_output',
-        `the stream vocabulary is wider than this client can settle (${String((reason as { kind: string }).kind)})`,
-      );
+      // A reason kind outside the known vocabulary is upstream-controlled text and is not echoed;
+      // the failure still receives the fixed local diagnostic of its code.
+      return localFailure('invalid_output', 'the stream vocabulary is wider than this client can settle');
   }
 }
 
-/** Internal audit detail of one provider failure; never used as a caller-facing message. */
-function providerDetail(failure: { readonly code: string; readonly message: string }): string {
-  return `provider failure ${failure.code}: ${failure.message}`;
+/**
+ * Map one provider-neutral failure code onto the fixed failure of this client.
+ *
+ * The provider's code is a lookup key, never recorded text: an unmapped code stays the closed
+ * `provider_error`, and the audit detail is the fixed projection of {@link providerDetail}.
+ */
+function mappedFailure(code: string | null | undefined): CallFailure {
+  return localFailure(mappedFailureCode(code), providerDetail(code));
 }
 
-/** Map one provider-neutral failure code onto the fixed failure of this client. */
-function mappedFailure(code: string | null | undefined, detail: string): CallFailure {
-  const mapped = code === null || code === undefined ? undefined : MAPPED_FAILURE_CODES[code];
-  const failureCode: ModelErrorCode = mapped ?? 'provider_error';
-  return localFailure(failureCode, detail);
+/**
+ * The allowlisted failure code of one provider-neutral code.
+ *
+ * Only {@link MAPPED_FAILURE_CODES} is known; anything else — including arbitrary text an upstream
+ * failure may carry — stays `provider_error` instead of being guessed or echoed.
+ */
+function mappedFailureCode(code: string | null | undefined): ModelErrorCode {
+  const mapped = code === null || code === undefined || !Object.hasOwn(MAPPED_FAILURE_CODES, code) ? undefined : MAPPED_FAILURE_CODES[code];
+  return mapped ?? 'provider_error';
+}
+
+/**
+ * Fixed internal audit detail of one provider failure.
+ *
+ * A provider's failure message, headers, metadata and other diagnostic payload are upstream text
+ * that may carry credentials, so none of it is copied: the detail names only the allowlisted code.
+ */
+function providerDetail(code: string | null | undefined): string {
+  return `the upstream provider reported ${mappedFailureCode(code)}`;
 }
 
 /** A failure of this client with its fixed message; `retryable` defaults to the code's policy. */
@@ -783,9 +847,12 @@ function localFailure(code: ModelErrorCode, detail: string, retryable: boolean =
   return { code, message: FAILURE_MESSAGES[code], detail, retryable };
 }
 
-/** Map a thrown host failure: structured dsh errors route by their stable code, never by text. */
+/**
+ * Map a thrown host failure: structured dsh errors route by their stable code, never by text, and
+ * the exception's own name/message/stack/cause and attached fields are never recorded.
+ */
 function thrownFailure(error: unknown): CallFailure {
-  return mappedFailure(isHarnessError(error) ? error.code : null, auditErrorDetail(error));
+  return localFailure(mappedFailureCode(isHarnessError(error) ? error.code : null), auditErrorDetail(error));
 }
 
 /** The raced stop that happened before dispatch, or `null` when the call may proceed. */
@@ -1168,12 +1235,17 @@ function validateRequest(request: AuditedJsonCallRequest): string | null {
   return null;
 }
 
-/** Internal detail for the audit log; the caller-facing message stays fixed per failure code. */
+/**
+ * Fixed internal detail of one thrown host exception, for the audit log only.
+ *
+ * The exception's `name`, `message`, `stack`, `cause` and any attached fields are upstream
+ * diagnostic material that may carry credentials. Nothing is read from the value, nothing is
+ * stringified and no text of it is recorded; only the fixed local sentence and the allowlisted
+ * mapped code below reach the audit record.
+ */
 function auditErrorDetail(error: unknown): string {
-  if (error instanceof Error) {
-    return `${error.name}: ${error.message}`;
-  }
-  return `thrown ${typeof error}`;
+  const code = mappedFailureCode(isHarnessError(error) ? error.code : null);
+  return `an upstream host exception was projected (mapped code=${code})`;
 }
 
 /** Convert a locally built value for the audit log; unsupported leaves become `null`. */

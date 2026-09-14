@@ -227,6 +227,90 @@ export interface SupplementMaterialReport {
 }
 
 // ---------------------------------------------------------------------------------------
+// Local problem supplementation (manual recovery of one queued key)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Hard upper bound on a locally supplied problem title, in characters.
+ *
+ * A missing problem's title is real user input, so it is bounded exactly like the statement
+ * ({@link MAX_SUPPLEMENT_STATEMENT_CHARS}) while staying far above any real problem name.
+ */
+export const MAX_SUPPLEMENT_TITLE_CHARS = 500;
+
+/**
+ * Canonical identity and page URL of a problem the store may not know yet.
+ *
+ * The reference and the URL are derived by the caller from the **configured source instance**
+ * (the canonical key of the account's backlog plus that instance's own base URL), never taken
+ * from a request body: the manual-recovery form never sees a platform URL, so it cannot supply
+ * one, and no caller can invent an identity the configured source would not produce.
+ */
+export interface LocalProblemSeed {
+  readonly ref: ProblemRef;
+  /** Exact canonical problem page URL of the configured source instance. */
+  readonly url: string;
+  /** Real title the user supplied; used **only** when the problem row does not exist yet. */
+  readonly title: string;
+}
+
+/**
+ * Record a **locally supplied** statement for one problem, creating the row when it is missing.
+ *
+ * This is the application half of the workbench's manual recovery for a queued key the platform
+ * will not serve (an explicitly incomplete personal statement, a deleted problem, ...). It is
+ * deliberately narrower than {@link SupplementMaterialRequest}: the statement is mandatory
+ * because it is the material being recorded, there is no editorial declaration, and a missing
+ * problem is created from a {@link LocalProblemSeed} whose identity comes from the configured
+ * source rather than from the caller.
+ *
+ * Rules:
+ * - the seed's `ref` must be canonical (`problemKey(ref)` round-trips through
+ *   `parseProblemKey`) and the statement must be non-blank and at most
+ *   {@link MAX_SUPPLEMENT_STATEMENT_CHARS} characters;
+ * - an **existing** problem keeps its stored title, url, ratings and raw tags; the supplied
+ *   title is used only when the row is created, and a created row carries no rating and no raw
+ *   tag at all — unknown stays unknown instead of being invented;
+ * - `expectedSnapshotId` is the snapshot the caller saw (`null` when it saw none) and is
+ *   compared with the stored head **before** the first write, so a recovery built on a
+ *   superseded snapshot is refused rather than merged;
+ * - the problem row and its snapshot are written in **one** transaction, and a created problem
+ *   carries a real snapshot of the supplied statement and **no** editorial source: a manual
+ *   recovery never records an editorial declaration, never marks a tag reviewed and never
+ *   claims the platform was read.
+ */
+export interface SupplementLocalProblemRequest {
+  readonly problem: LocalProblemSeed;
+  /** Complete statement supplied by the user; written as the problem's statement. */
+  readonly statement: string;
+  readonly expectedSnapshotId: string | null;
+  readonly token: CancellationToken;
+  /**
+   * Optional hook awaited **inside** the commit transaction, after the problem row and its
+   * snapshot were written and before the transaction commits (the same contract as
+   * {@link RefreshProblemMetadataRequest.beforeCommit}): a throw rolls the problem, its snapshot
+   * and every mutation the hook performed back together. It is internal plumbing for the Luogu
+   * synchronization service — the lease re-check plus the atomic dequeue of the recovered key —
+   * and is deliberately not part of any business-API DTO.
+   */
+  readonly beforeCommit?: () => Promise<void> | void;
+}
+
+/**
+ * Result of one local supplementation.
+ *
+ * `created` states whether the problem row did not exist and was created from the seed, so a
+ * caller can distinguish "recovered a missing problem" from "completed a stored one" without
+ * reading the problem back.
+ */
+export interface SupplementLocalProblemReport {
+  readonly problemKey: string;
+  readonly snapshot: SnapshotWrite;
+  /** True when the problem row did not exist and was created from the supplied seed. */
+  readonly created: boolean;
+}
+
+// ---------------------------------------------------------------------------------------
 // Paged sync
 // ---------------------------------------------------------------------------------------
 
@@ -393,6 +477,18 @@ export interface RefreshProblemMetadataRequest {
   readonly problemRef: ProblemRef;
   readonly token: CancellationToken;
   readonly limits: PlatformLimits;
+  /**
+   * Optional hook awaited **inside** the metadata commit transaction, after the problem row and its
+   * snapshot were written and before the transaction commits.
+   *
+   * It exists for a durable caller that must keep its own record consistent with the write: the Luogu
+   * sync service uses it to re-check its source-wide lease — so a takeover or a cancellation aborts
+   * the write — and to dequeue the repaired key in the very same transaction, which is what makes
+   * "problem written" and "key dequeued" atomic. The hook runs before anything is committed, so a
+   * hook that throws rolls the whole metadata write back; it must not open a nested transaction
+   * (every store call already joins this one) and must not perform platform or model work.
+   */
+  readonly beforeCommit?: () => Promise<void>;
 }
 
 /**

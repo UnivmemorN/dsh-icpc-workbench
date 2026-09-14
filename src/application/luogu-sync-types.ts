@@ -37,6 +37,7 @@ import {
   problemKey as canonicalProblemKeyOf,
 } from '../domain/index.js';
 import { CREDENTIAL_REFERENCE_PATTERN } from './local-credential-vault.js';
+import { PLATFORM_ERROR_REASONS, type PlatformErrorReason } from './platform-errors.js';
 
 // ---------------------------------------------------------------------------------------
 // Bounds
@@ -65,6 +66,26 @@ export const LUOGU_SYNC_PAGE_SIZE = 50;
 
 /** History pages one pass may commit; the remainder resumes on the next pass. */
 export const LUOGU_SYNC_MAX_PAGES_PER_PASS = 20;
+
+/** Default page size of the `luogu.metadataBacklog` read. */
+export const LUOGU_METADATA_BACKLOG_DEFAULT_PAGE_SIZE = 20;
+
+/**
+ * Maximum accepted `pageSize` of the `luogu.metadataBacklog` read.
+ *
+ * The read is deliberately bounded: a caller can never ask this operation for the whole durable
+ * backlog in one answer, so the endpoint cannot be turned into an unbounded database scan.
+ */
+export const LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE = 50;
+
+/**
+ * Fixed sentence for a queued key with no recorded per-key diagnostic.
+ *
+ * It deliberately says "no per-key failure has been recorded yet" rather than "never attempted":
+ * a state row written before the diagnostics existed carries no per-key record even though the key
+ * may have failed many times, and an honest label must not assert history it cannot prove.
+ */
+export const LUOGU_METADATA_UNKNOWN_ISSUE_LABEL = '尚无逐题失败记录';
 
 /**
  * Problem metadata rows one **ordinary** pass may fetch.
@@ -196,7 +217,51 @@ export interface LuoguSyncFailure {
    * distinction", not `history`.
    */
   readonly stage?: LuoguSyncFailureStage;
+  /**
+   * Canonical key of the **one** item this failure addresses, for an item-scoped failure.
+   *
+   * Optional, like `stage`: a record written before the field existed — or a session-level failure
+   * that belongs to no single key — carries none, and a missing value is never read as "some key".
+   * The field is what lets a later successful repair clear a stored failure only when that failure
+   * explicitly names the key it just addressed.
+   */
+  readonly problemKey?: string;
+  /** Closed, body-free diagnostic reason of the failure, when this build can name one. */
+  readonly reason?: PlatformErrorReason;
 }
+
+/**
+ * Maximum accepted `attempts` of one durable per-key issue.
+ *
+ * A bound keeps a hostile or corrupted row from claiming an absurd counter; the value is a count of
+ * observed failures, so reaching it is not a drop path — later failures keep the ceiling instead of
+ * overflowing.
+ */
+export const LUOGU_METADATA_MAX_ISSUE_ATTEMPTS = 1_000_000;
+
+/**
+ * One durable, body-free diagnostic of the last failed metadata attempt for one backlog key.
+ *
+ * The record answers "why is this key still queued?" without holding any content: `code` is the
+ * durable failure vocabulary, `reason` is the closed {@link PlatformErrorReason} classification (or
+ * `null` when this build cannot name one), `at` is when the failure was observed and `attempts` is
+ * how many failures this key has accumulated. A raw parser message, an exception text, a response
+ * body, a cookie and a credential have no field here and are refused on the way in.
+ *
+ * The issue is **deferrable**: an explicit `missing_statement` (or an anonymous refusal of a private
+ * user-created problem) leaves the key queued and the sync continues with the other keys, while the
+ * diagnostic stays until that key is actually resolved.
+ */
+export interface LuoguMetadataIssue {
+  readonly problemKey: string;
+  readonly code: LuoguSyncFailureCode;
+  readonly reason: PlatformErrorReason | null;
+  readonly at: string;
+  readonly attempts: number;
+}
+
+/** Closed key set of one durable metadata issue. */
+export const LUOGU_METADATA_ISSUE_KEYS = ['problemKey', 'code', 'reason', 'at', 'attempts'] as const;
 
 /**
  * Durable per-account synchronization state.
@@ -234,6 +299,17 @@ export interface LuoguSyncState {
   readonly backlogDropped: number;
   readonly metadataResolved: number;
   readonly metadataFailed: number;
+  /**
+   * Bounded per-key diagnostics of the queued backlog, newest recorded failure per key.
+   *
+   * Optional because rows written before the field existed carry no per-key record: a missing field
+   * means **unknown**, never an inferred failure, and reading one changes nothing on disk. When the
+   * field is written it holds at most one entry per key, only canonical keys that are members of
+   * this state's own `missingMetadata` backlog, and never any raw text. The number of entries is a
+   * count of *known* issues and is deliberately independent of {@link metadataFailed}, which counts
+   * failed attempts over the whole history.
+   */
+  readonly metadataIssues?: readonly LuoguMetadataIssue[];
   /** Cross-instance lease owner of the running pass, or `null` when idle. */
   readonly owner: string | null;
   readonly leaseExpiresAt: string | null;
@@ -269,6 +345,7 @@ export function emptyLuoguSyncState(
     backlogDropped: 0,
     metadataResolved: 0,
     metadataFailed: 0,
+    metadataIssues: [],
     owner: null,
     leaseExpiresAt: null,
     failure: null,
@@ -513,9 +590,18 @@ const FAILURE_KEYS = ['code', 'at', 'retryAt', 'paused'] as const;
  *
  * `stage` was added after the first durable failures existed, so it is accepted but never required:
  * a pre-existing four-field row stays valid and is never rewritten just to gain a stage, while an
- * unknown value (or any other undeclared key) is still a hard refusal.
+ * unknown value (or any other undeclared key) is still a hard refusal. `problemKey` and `reason`
+ * follow the same rule: item-scoped diagnostics a record may name, never fields a reader invents.
  */
-const FAILURE_OPTIONAL_KEYS = ['stage'] as const;
+const FAILURE_OPTIONAL_KEYS = ['stage', 'problemKey', 'reason'] as const;
+/**
+ * Keys of a sync state that are optional.
+ *
+ * `metadataIssues` was added after the first durable states existed: a row written before it must
+ * stay readable and must **not** be rewritten, so the field is optional on the way in and is never
+ * defaulted. A missing field means "no per-key diagnostics recorded", never "no failures happened".
+ */
+const STATE_OPTIONAL_KEYS = ['metadataIssues'] as const;
 const SETTINGS_KEYS = ['accountId', 'automaticEnabled', 'runOnStartup', 'intervalMinutes', 'updatedAt'] as const;
 const CONNECTION_KEYS = [
   'accountId',
@@ -541,7 +627,7 @@ const JOURNAL_ENTRY_KEYS = ['accountId', 'reference', 'recordedAt'] as const;
  */
 export function validateLuoguSyncState(value: unknown): LuoguSyncState {
   const record = requireObject('sync state', value);
-  requireExactKeys('sync state', record, STATE_KEYS);
+  requireExactKeys('sync state', record, STATE_KEYS, STATE_OPTIONAL_KEYS);
   const accountId = requireText('sync state accountId', record['accountId']);
   const sourceInstanceId = requireText('sync state sourceInstanceId', record['sourceInstanceId']);
   const phase = record['phase'];
@@ -603,6 +689,7 @@ export function validateLuoguSyncState(value: unknown): LuoguSyncState {
   );
   const metadataResolved = requireCount('sync state metadataResolved', record['metadataResolved']);
   const metadataFailed = requireCount('sync state metadataFailed', record['metadataFailed']);
+  const metadataIssues = validateMetadataIssues(record['metadataIssues'], sourceInstanceId, seen);
   const owner = requireNullableText('sync state owner', record['owner']);
   const leaseExpiresAt = requireNullableTimestamp('sync state leaseExpiresAt', record['leaseExpiresAt']);
   invariant(
@@ -629,6 +716,9 @@ export function validateLuoguSyncState(value: unknown): LuoguSyncState {
     backlogDropped,
     metadataResolved,
     metadataFailed,
+    // A legacy row without per-key diagnostics is returned without the field, so re-saving it never
+    // invents an empty list where the stored bytes say "unknown".
+    ...(metadataIssues === undefined ? {} : { metadataIssues }),
     owner,
     leaseExpiresAt,
     failure,
@@ -657,6 +747,8 @@ export function validateLuoguSyncFailure(value: unknown): LuoguSyncFailure {
     `unknown sync failure stage ${String(stage)}`,
     { stage },
   );
+  const problemKey = optionalFailureProblemKey(record['problemKey']);
+  const reason = optionalFailureReason(record['reason']);
   invariant(
     !paused || retryAt === null,
     'invalid_input',
@@ -671,10 +763,179 @@ export function validateLuoguSyncFailure(value: unknown): LuoguSyncFailure {
       { at, retryAt },
     );
   }
-  // A legacy four-field record is returned exactly as stored: no stage is invented for it.
-  return stage === undefined
-    ? { code: code as LuoguSyncFailureCode, at, retryAt, paused }
-    : { code: code as LuoguSyncFailureCode, at, retryAt, paused, stage: stage as LuoguSyncFailureStage };
+  // A legacy record is returned exactly as stored: no stage, key or reason is invented for it.
+  return {
+    code: code as LuoguSyncFailureCode,
+    at,
+    retryAt,
+    paused,
+    ...(stage === undefined ? {} : { stage: stage as LuoguSyncFailureStage }),
+    ...(problemKey === undefined ? {} : { problemKey }),
+    ...(reason === undefined ? {} : { reason }),
+  };
+}
+
+/**
+ * Validate one durable per-key metadata issue and return a detached copy.
+ *
+ * The record is closed: exactly {@link LUOGU_METADATA_ISSUE_KEYS} must be present, the key must be
+ * canonical, the code must come from the durable failure vocabulary, the reason must be a declared
+ * {@link PlatformErrorReason} or `null`, the instant must be ISO-8601 and `attempts` a bounded
+ * integer ≥ 1. A raw string detail, a body sample, a cookie or an exception message has no field
+ * here, so none of them can be persisted through this validator.
+ */
+export function validateLuoguMetadataIssue(value: unknown): LuoguMetadataIssue {
+  const record = requireObject('metadata issue', value);
+  requireExactKeys('metadata issue', record, LUOGU_METADATA_ISSUE_KEYS);
+  const problemKey = canonicalIssueKey(requireText('metadata issue problemKey', record['problemKey']));
+  const code = record['code'];
+  invariant(
+    LUOGU_SYNC_FAILURE_CODES.includes(code as LuoguSyncFailureCode),
+    'invalid_input',
+    `metadata issue has unknown code ${String(code)}`,
+    { code },
+  );
+  const reason = record['reason'];
+  invariant(
+    reason === null || (typeof reason === 'string' && PLATFORM_ERROR_REASONS.includes(reason as PlatformErrorReason)),
+    'invalid_input',
+    `metadata issue has unknown reason ${String(reason)}`,
+    { reason },
+  );
+  const attempts = record['attempts'];
+  invariant(
+    typeof attempts === 'number' &&
+      Number.isSafeInteger(attempts) &&
+      attempts >= 1 &&
+      attempts <= LUOGU_METADATA_MAX_ISSUE_ATTEMPTS,
+    'invalid_input',
+    `metadata issue attempts must be an integer within 1..${LUOGU_METADATA_MAX_ISSUE_ATTEMPTS}`,
+    { attempts },
+  );
+  return {
+    problemKey,
+    code: code as LuoguSyncFailureCode,
+    reason: reason === null ? null : (reason as PlatformErrorReason),
+    at: requireTimestamp('metadata issue at', record['at']),
+    attempts,
+  };
+}
+
+/** The recorded issue of one key, or `null` when that key has no known issue. */
+export function metadataIssueFor(
+  issues: readonly LuoguMetadataIssue[] | undefined,
+  problemKey: string,
+): LuoguMetadataIssue | null {
+  if (issues === undefined) {
+    return null;
+  }
+  return issues.find((issue) => issue.problemKey === problemKey) ?? null;
+}
+
+/**
+ * Insert or replace the issue of exactly one key, keeping the oldest-first order of the rest.
+ *
+ * The result holds at most one entry per key, so it can never grow past the backlog bound it
+ * describes. Unrelated issues are carried over unchanged — a failure of one key never erases the
+ * diagnostic another key earned.
+ */
+export function upsertMetadataIssue(
+  issues: readonly LuoguMetadataIssue[] | undefined,
+  issue: LuoguMetadataIssue,
+): readonly LuoguMetadataIssue[] {
+  const validated = validateLuoguMetadataIssue(issue);
+  const kept = (issues ?? []).filter((entry) => entry.problemKey !== validated.problemKey);
+  return [...kept, validated];
+}
+
+/** Remove **only** the issue of `problemKey`; every other diagnostic stays untouched. */
+export function clearMetadataIssue(
+  issues: readonly LuoguMetadataIssue[] | undefined,
+  problemKey: string,
+): readonly LuoguMetadataIssue[] {
+  return (issues ?? []).filter((entry) => entry.problemKey !== problemKey);
+}
+
+/** Canonicalize one issue key without a source check; the state validator proves the source. */
+function canonicalIssueKey(key: string): string {
+  let canonical: string;
+  try {
+    canonical = canonicalProblemKeyOf(parseProblemKey(key));
+  } catch (error) {
+    throw new DomainError('invalid_input', `metadata issue key ${key} is not a canonical problem key`, {
+      reason: 'non_canonical_issue_key',
+      problemKey: key,
+      cause: String(error),
+    });
+  }
+  invariant(canonical === key, 'invalid_input', `metadata issue key ${key} is not a canonical problem key`, {
+    reason: 'non_canonical_issue_key',
+    problemKey: key,
+  });
+  return canonical;
+}
+
+/** Validate the whole optional per-key diagnostics list against its own backlog and source. */
+function validateMetadataIssues(
+  value: unknown,
+  sourceInstanceId: string,
+  backlog: ReadonlySet<string>,
+): readonly LuoguMetadataIssue[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  invariant(Array.isArray(value), 'invalid_input', 'sync state metadataIssues must be an array', {});
+  const raw = value as readonly unknown[];
+  invariant(
+    raw.length <= LUOGU_SYNC_MAX_METADATA_BACKLOG,
+    'invalid_input',
+    `sync state metadataIssues holds at most ${LUOGU_SYNC_MAX_METADATA_BACKLOG} entries`,
+    { length: raw.length, bound: LUOGU_SYNC_MAX_METADATA_BACKLOG },
+  );
+  const issues: LuoguMetadataIssue[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    const issue = validateLuoguMetadataIssue(entry);
+    // Source identity is re-derived from the key itself, exactly like the backlog keys.
+    canonicalKeyOf(sourceInstanceId, issue.problemKey);
+    invariant(
+      !seen.has(issue.problemKey),
+      'invalid_input',
+      `sync state repeats the metadata issue of ${issue.problemKey}`,
+      { problemKey: issue.problemKey },
+    );
+    invariant(
+      backlog.has(issue.problemKey),
+      'invalid_input',
+      `sync state metadata issue ${issue.problemKey} is not a member of the missingMetadata backlog`,
+      { reason: 'issue_not_in_backlog', problemKey: issue.problemKey },
+    );
+    seen.add(issue.problemKey);
+    issues.push(issue);
+  }
+  return issues;
+}
+
+/** Optional canonical key of an item-scoped failure; `undefined` stays `undefined`. */
+function optionalFailureProblemKey(value: unknown): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return canonicalIssueKey(requireText('sync failure problemKey', value));
+}
+
+/** Optional closed diagnostic reason of a failure; an undeclared value is refused. */
+function optionalFailureReason(value: unknown): PlatformErrorReason | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  invariant(
+    typeof value === 'string' && PLATFORM_ERROR_REASONS.includes(value as PlatformErrorReason),
+    'invalid_input',
+    `unknown sync failure reason ${String(value)}`,
+    { reason: value },
+  );
+  return value as PlatformErrorReason;
 }
 
 /** Validate sync settings of one account, enforcing the documented interval bounds. */

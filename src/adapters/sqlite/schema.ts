@@ -10,7 +10,7 @@
  * - **v0** means "no store tables yet": an empty file is initialized transactionally, a file
  *   with our marker table but no data tables is migrated after a consistent backup, and any
  *   other v0 layout is rejected instead of being migrated.
- * - **v1** … **v7** (the previous versions of this build) are recognized exactly — marker
+ * - **v1** … **v8** (the previous versions of this build) are recognized exactly — marker
  *   plus their own table set — copied consistently and then migrated to the current version in one
  *   transaction that only adds tables. Existing rows are retained.
  * - A failure while initializing or migrating rolls back, so the original file stays readable.
@@ -19,7 +19,9 @@
  * {@link SCHEMA_DDL_V2}/{@link applySchemaV2} and {@link SCHEMA_DDL_V3}/{@link applySchemaV3} keep
  * creating exactly their own version's tables **and write exactly their own literal
  * `user_version`**, so a fixture built with them is a real older database and the migration under
- * test is the real one. The current version adds {@link SCHEMA_DDL_V8} on top.
+ * test is the real one. The current version, v9, adds **no table**: it uses exactly the v8 table set
+ * and exists as a version marker because the stored JSON contract of `luogu_sync_states.body`
+ * changed (durable per-key metadata diagnostics), so a v8 writer must not open a v9 database.
  *
  * All metadata the adapter writes are immutable JSON bodies plus indexed identity columns.
  */
@@ -30,7 +32,8 @@ import { StorageError } from './errors.js';
 export const STORE_MARKER = 'dsh-icpc-workbench/training-store';
 
 /** Schema version this build reads and writes. */
-export const STORE_SCHEMA_VERSION = 8;
+export const STORE_SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION_V8 = 8;
 export const SCHEMA_VERSION_V7 = 7;
 export const SCHEMA_VERSION_V6 = 6;
 export const SCHEMA_VERSION_V5 = 5;
@@ -446,6 +449,17 @@ export const STORE_TABLES_V8: readonly string[] = [
   'ability_evaluation_attempts',
   'virtual_performance_ledgers',
 ];
+
+/**
+ * Tables a schema-v9 database must have: exactly the v8 set.
+ *
+ * v9 adds no table and rewrites no row; it recognizes the same tables while the JSON contract stored
+ * inside `luogu_sync_states.body` carries the durable per-key metadata diagnostics. The separate
+ * version is what keeps a v8 writer from opening (and later saving over) a body shape it does not
+ * know, so both directions of the compatibility rule stay honest: v9 is refused by a v8 build as
+ * `schema_too_new`, and a genuine v8 file is still migrated here.
+ */
+export const STORE_TABLES_V9: readonly string[] = [...STORE_TABLES_V8];
 export const SCHEMA_DDL_V8: readonly string[] = [
   `CREATE TABLE virtual_performance_ledgers (
      account_id TEXT PRIMARY KEY NOT NULL REFERENCES accounts(id),
@@ -473,6 +487,7 @@ export type SchemaState =
   | 'v5'
   | 'v6'
   | 'v7'
+  | 'v8'
   | 'current';
 
 function pragmaRow(db: DatabaseSync, sql: string): Record<string, unknown> | undefined {
@@ -531,8 +546,13 @@ export function detectSchemaState(db: DatabaseSync): SchemaState {
   const tables = tableNames(db);
   if (version === STORE_SCHEMA_VERSION) {
     requireStoreMarker(db, version);
-    requireTables(tables, STORE_TABLES_V8, version);
+    requireTables(tables, STORE_TABLES_V9, version);
     return 'current';
+  }
+  if (version === SCHEMA_VERSION_V8) {
+    requireStoreMarker(db, version);
+    requireTables(tables, STORE_TABLES_V8, version);
+    return 'v8';
   }
   if (version === SCHEMA_VERSION_V7) {
     requireStoreMarker(db, version);
@@ -831,11 +851,13 @@ export function migrateToSchemaV7(db: DatabaseSync, from: number): void {
 }
 
 /**
- * Add exactly the missing versions and end at the current schema, in one transaction.
+ * Add exactly the missing versions and end at the literal **v8**, whatever this build's current
+ * version is.
  *
- * The caller has already taken (and verified) the pre-migration backup. Every historical DDL helper
- * keeps writing **its own** literal version, so a v7 fixture stays a genuine v7 database; only this
- * function moves a file to the version this build writes.
+ * Frozen historical helper: every recognized schema through v7 is byte-for-byte unchanged, a real
+ * v8 file went through exactly this step, and the v9 migration below calls it for a file older than
+ * v8 — so it must keep writing the literal `user_version = 8`. Note that the v8 DDL is applied
+ * unconditionally here: this helper only ever runs on a database that has not reached v8.
  */
 export function migrateToSchemaV8(db: DatabaseSync, from: number): void {
   inTransaction(db, () => {
@@ -847,8 +869,31 @@ export function migrateToSchemaV8(db: DatabaseSync, from: number): void {
     if (from < 6) for (const statement of SCHEMA_DDL_V6) db.exec(statement);
     if (from < 7) for (const statement of SCHEMA_DDL_V7) db.exec(statement);
     for (const statement of SCHEMA_DDL_V8) db.exec(statement);
-    db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+    db.exec('PRAGMA user_version = 8');
   }, 'schema v8 migration');
+}
+
+/**
+ * Add exactly the missing versions and end at the current schema (v9), in one transaction.
+ *
+ * The caller has already taken (and verified) the pre-migration backup. Every historical DDL helper
+ * keeps writing **its own** literal version, so a v8 fixture stays a genuine v8 database; only this
+ * function moves a file to the version this build writes. v9 introduces **no table and no rewritten
+ * row**: a genuine v8 database only has its version marker advanced, while a file older than v8 has
+ * the same DDL applied as before (gated on `from`, so an existing v8 table set is never re-created).
+ */
+export function migrateToSchemaV9(db: DatabaseSync, from: number): void {
+  inTransaction(db, () => {
+    if (from < 1) applySchemaV1(db);
+    if (from < 2) applySchemaV2(db);
+    if (from < 3) applySchemaV3(db);
+    if (from < 4) applySchemaV4(db);
+    if (from < 5) for (const statement of SCHEMA_DDL_V5) db.exec(statement);
+    if (from < 6) for (const statement of SCHEMA_DDL_V6) db.exec(statement);
+    if (from < 7) for (const statement of SCHEMA_DDL_V7) db.exec(statement);
+    if (from < 8) for (const statement of SCHEMA_DDL_V8) db.exec(statement);
+    db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+  }, 'schema v9 migration');
 }
 
 function inTransaction(db: DatabaseSync, work: () => void, label: string): void {

@@ -8,7 +8,7 @@
  * `changed_response` instead of a plausible-looking empty problem, and a `data.errorCode`
  * answers with its typed platform error rather than being mistaken for data.
  */
-import { PlatformError, type PlatformOperation } from '../../application/platform-errors.js';
+import { PlatformError, type PlatformErrorReason, type PlatformOperation } from '../../application/platform-errors.js';
 import { LUOGU_UID_PATTERN } from './account.js';
 
 /** Official Luogu problem ids: `P1000`, `CF20C`, `AT_abc123_a`, `SP1234`, ... */
@@ -66,9 +66,28 @@ export function isJsonRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Build a sanitized `changed_response` for a payload the adapter no longer understands. */
-export function payloadError(operation: PlatformOperation, detail: string, sample?: string | null): PlatformError {
-  return new PlatformError({ code: 'changed_response', operation, retryable: false, detail, sample: sample ?? null });
+/**
+ * Build a sanitized `changed_response` for a payload the adapter no longer understands.
+ *
+ * `reason` is the optional, closed diagnostic classification of the failure. It is passed
+ * explicitly by each call site — never derived from `detail` by string matching — so the durable
+ * per-key diagnostics of a sync can tell a legitimately incomplete statement apart from a payload
+ * this build cannot read.
+ */
+export function payloadError(
+  operation: PlatformOperation,
+  detail: string,
+  sample?: string | null,
+  reason?: PlatformErrorReason | null,
+): PlatformError {
+  return new PlatformError({
+    code: 'changed_response',
+    operation,
+    retryable: false,
+    detail,
+    sample: sample ?? null,
+    ...(reason === undefined ? {} : { reason }),
+  });
 }
 
 function requireRecord(value: unknown, label: string, operation: PlatformOperation): Record<string, unknown> {
@@ -295,9 +314,15 @@ export function parseProblemDetail(
   // format alone is never promoted to a full statement. `background`, both formats and `hint`
   // stay legitimately optional (`null`), and every present section is kept verbatim.
   if (sections.description === null || sections.description.trim().length === 0) {
+    // Marked as `missing_statement`, not as an unreadable payload: the payload is valid JSON of the
+    // documented shape, and the official manual states a personal problem's fields may legitimately
+    // be incomplete. The item is refused (a complete statement requires a description) but the
+    // diagnosis is item-scoped and deferrable instead of stopping a whole source.
     throw payloadError(
       operation,
       'data.problem.content.description is missing or blank; refusing an input/output-only statement',
+      null,
+      'missing_statement',
     );
   }
   const samples = parseSamples(problem.samples, operation);

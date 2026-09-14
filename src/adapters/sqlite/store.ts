@@ -217,6 +217,7 @@ import {
   SCHEMA_VERSION_V5,
   SCHEMA_VERSION_V6,
   SCHEMA_VERSION_V7,
+  SCHEMA_VERSION_V8,
   SCHEMA_VERSION_V1,
   SCHEMA_VERSION_V2,
   SCHEMA_VERSION_V3,
@@ -225,7 +226,7 @@ import {
   backupFileName,
   configureConnection,
   detectSchemaState,
-  migrateToSchemaV8,
+  migrateToSchemaV9,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -434,7 +435,7 @@ export class SqliteTrainingStore
       transactional: true,
       notes: [
         `node:sqlite DatabaseSync; schema marker ${STORE_MARKER}; one serialized connection`,
-        'Databases from a newer schema are rejected before any write; v0 through v7 databases are migrated after a verified consistent backup',
+        'Databases from a newer schema are rejected before any write; v0 through v8 databases are migrated after a verified consistent backup',
         'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
         'Batches are revision-guarded with monotonic counters; model-call attempts move reserved -> uncertain|settled and settled rows are immutable',
         'Workbench settings are a singleton row saved under revision CAS',
@@ -3436,11 +3437,11 @@ export class SqliteTrainingStore
    *
    * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
    *    switched into another journal mode or otherwise touched.
-   * 2. A supported older database (v0 through v6) is backed up **before** `configureConnection`,
+   * 2. A supported older database (v0 through v8) is backed up **before** `configureConnection`,
    *    so the backup is the database as it was found and switching the journal mode is not part
    *    of the pre-migration state. The copy is verified before migration starts, at the literal
    *    version the file was found in.
-   * 3. `migrateToSchemaV8` applies only the missing versions in one transaction and ends at the
+   * 3. `migrateToSchemaV9` applies only the missing versions in one transaction and ends at the
    *    current version; every existing row is retained, and exactly one pre-migration backup was
    *    already taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
@@ -3457,7 +3458,8 @@ export class SqliteTrainingStore
       state === 'v4' ||
       state === 'v5' ||
       state === 'v6' ||
-      state === 'v7'
+      state === 'v7' ||
+      state === 'v8'
     ) {
       // Keep a consistent copy of the database as found before any migration writes to it.
       const from =
@@ -3475,14 +3477,16 @@ export class SqliteTrainingStore
                     ? SCHEMA_VERSION_V5
                     : state === 'v6'
                       ? SCHEMA_VERSION_V6
-                      : SCHEMA_VERSION_V7;
+                      : state === 'v7'
+                        ? SCHEMA_VERSION_V7
+                        : SCHEMA_VERSION_V8;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
       this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        migrateToSchemaV8(this.connection, readUserVersion(this.connection));
+        migrateToSchemaV9(this.connection, readUserVersion(this.connection));
       } catch (error) {
         if (error instanceof StorageError) {
           throw error;

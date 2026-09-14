@@ -80,9 +80,16 @@ import {
   type SourceInstance,
 } from '../domain/index.js';
 import type { ImportService } from './import-service.js';
-import type { SyncMode, SyncPageReport, SyncPageSource } from './import-types.js';
+import {
+  MAX_SUPPLEMENT_STATEMENT_CHARS,
+  MAX_SUPPLEMENT_TITLE_CHARS,
+  type SnapshotWrite,
+  type SyncMode,
+  type SyncPageReport,
+  type SyncPageSource,
+} from './import-types.js';
 import { LuoguConnectionError, type LuoguConnectionManager } from './luogu-connection.js';
-import { PlatformError, isPlatformError, type PlatformErrorCode } from './platform-errors.js';
+import { PlatformError, isPlatformError, type PlatformErrorCode, type PlatformErrorReason } from './platform-errors.js';
 import type { LuoguSourceGate } from './luogu-source-gate.js';
 import {
   LUOGU_SYNC_MAX_BACKOFF_MS,
@@ -93,14 +100,21 @@ import {
   LUOGU_SYNC_OVERLAP_MS,
   LUOGU_SYNC_PAGE_SIZE,
   LUOGU_SYNC_DEFAULT_LEASE_MS,
+  LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE,
+  LUOGU_METADATA_MAX_ISSUE_ATTEMPTS,
+  LUOGU_METADATA_UNKNOWN_ISSUE_LABEL,
+  clearMetadataIssue,
   connectionIsUsable,
   defaultLuoguSyncSettings,
   emptyLuoguSyncState,
   luoguLeaseHeldByAnother,
   luoguLeaseLive,
   luoguSyncFailurePauses,
+  metadataIssueFor,
+  upsertMetadataIssue,
   validateLuoguSyncSettings,
   type LuoguConnectionState,
+  type LuoguMetadataIssue,
   type LuoguSyncFailure,
   type LuoguSyncFailureCode,
   type LuoguSyncFailureStage,
@@ -322,7 +336,7 @@ interface Claim {
 }
 
 interface ClaimRequest {
-  readonly purpose: 'sync' | 'metadata' | 'connect' | 'probe' | 'profile';
+  readonly purpose: 'sync' | 'metadata' | 'connect' | 'probe' | 'profile' | 'repair';
   readonly mode: LuoguSyncStartMode;
 }
 
@@ -491,6 +505,29 @@ const PRIVATE_USER_PROBLEM_KEY = /^[UT]\d+$/u;
  */
 function isPrivateProblemRefusal(ref: ProblemRef, code: LuoguSyncFailureCode): boolean {
   return (code === 'auth_required' || code === 'forbidden') && PRIVATE_USER_PROBLEM_KEY.test(ref.externalKey);
+}
+
+/**
+ * A successful one-key retry clears a stored failure only when it is this build's **metadata**
+ * failure naming exactly that key.
+ *
+ * A history failure, a legacy stage-less record and a failure naming another key are evidence of
+ * work this retry did not perform, so each survives verbatim; only the item the retry addressed can
+ * have its own record cleared.
+ */
+function clearRetriedItemFailure(failure: LuoguSyncFailure | null, problemKeyValue: string): LuoguSyncFailure | null {
+  return failure !== null && failure.stage === 'metadata' && failure.problemKey === problemKeyValue ? null : failure;
+}
+
+/**
+ * The stored failure after a failed one-key retry.
+ *
+ * The retry's own item-scoped failure is recorded — with its backoff derived from the previous
+ * record — but a preexisting history (or legacy stage-less) failure belongs to the other half of the
+ * pass and is not erased by a retry of one metadata key.
+ */
+function retryFailure(previous: LuoguSyncFailure | null, next: LuoguSyncFailure): LuoguSyncFailure {
+  return previous !== null && previous.stage !== 'metadata' ? previous : next;
 }
 
 /** True for the store's stale-revision refusal, the one expected compare-and-set loss. */
@@ -807,6 +844,357 @@ export class LuoguSyncService {
         await this.releaseLease(account.id, false);
       }
     });
+  }
+
+  /**
+   * Read one bounded, deterministic page of the durable missing-metadata backlog.
+   *
+   * The answer is a **projection of stored rows**, not a platform read: it makes no request, moves no
+   * watermark and never writes. It is bounded (at most `pageSize` items are assembled, `pageSize` is
+   * validated by the typed API and by this method), deterministic (keys with a recorded per-key
+   * diagnostic first, then the remaining keys in durable queue order) and honest about unknowns: a
+   * key with no stored diagnostic answers `issue: null` plus the fixed
+   * {@link LUOGU_METADATA_UNKNOWN_ISSUE_LABEL} sentence, which claims only that no per-key failure
+   * has been recorded — never that the key was never attempted.
+   *
+   * `knownIssues` counts the items of this page that carry a diagnostic; `historicalFailedAttempts`
+   * is the state's lifetime counter and is deliberately a different number.
+   */
+  async metadataBacklog(
+    accountId: string,
+    page: number,
+    pageSize: number,
+  ): Promise<{
+    readonly accountId: string;
+    readonly total: number;
+    readonly page: number;
+    readonly pageSize: number;
+    readonly knownIssues: number;
+    readonly historicalFailedAttempts: number;
+    readonly unknownIssueLabel: string;
+    readonly items: readonly {
+      readonly problemKey: string;
+      readonly externalKey: string;
+      readonly url: string;
+      readonly title: string | null;
+      readonly issue: LuoguMetadataIssue | null;
+      readonly expectedSnapshotId: string | null;
+    }[];
+  }> {
+    const account = await this.requireAccount(accountId);
+    invariant(
+      Number.isSafeInteger(page) && page >= 1,
+      'invalid_input',
+      'metadata backlog page must be an integer >= 1',
+      { page },
+    );
+    invariant(
+      Number.isSafeInteger(pageSize) && pageSize >= 1 && pageSize <= LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE,
+      'invalid_input',
+      `metadata backlog pageSize must be an integer within 1..${LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE}`,
+      { pageSize },
+    );
+    const record = await this.store.getLuoguSyncState(account.id);
+    const state = record === null ? null : record.value;
+    const known = new Map<string, LuoguMetadataIssue>();
+    for (const issue of state?.metadataIssues ?? []) {
+      known.set(issue.problemKey, issue);
+    }
+    const backlog = state === null ? [] : [...state.missingMetadata];
+    // Known issues first, then queue order: the presentation is stable and explainable, and it never
+    // depends on the order a store happens to return rows in.
+    const ordered = [...backlog.filter((key) => known.has(key)), ...backlog.filter((key) => !known.has(key))];
+    const start = (page - 1) * pageSize;
+    const items: {
+      readonly problemKey: string;
+      readonly externalKey: string;
+      readonly url: string;
+      readonly title: string | null;
+      readonly issue: LuoguMetadataIssue | null;
+      readonly expectedSnapshotId: string | null;
+    }[] = [];
+    for (const key of ordered.slice(start, start + pageSize)) {
+      const ref = parseProblemKey(key);
+      const stored = await this.store.getProblem(key);
+      const head = await this.store.getCurrentSnapshotHead(ref);
+      items.push({
+        problemKey: key,
+        externalKey: ref.externalKey,
+        // Derived from the configured source base url; this operation performs no request.
+        url: `${this.sourceInstance.baseUrl.replace(/\/+$/u, '')}/problem/${encodeURIComponent(ref.externalKey)}`,
+        title: stored === null ? null : stored.title,
+        issue: known.get(key) ?? null,
+        expectedSnapshotId: head === null ? null : head.snapshotId,
+      });
+    }
+    return {
+      accountId: account.id,
+      total: ordered.length,
+      page,
+      pageSize,
+      knownIssues: items.filter((item) => item.issue !== null).length,
+      historicalFailedAttempts: state === null ? 0 : state.metadataFailed,
+      unknownIssueLabel: LUOGU_METADATA_UNKNOWN_ISSUE_LABEL,
+      items,
+    };
+  }
+
+  /**
+   * Retry **exactly one** currently queued metadata key through the ordinary repair path.
+   *
+   * The operation is item-scoped but source-scoped in its discipline: it takes the same durable
+   * source-wide lease as a pass (`claim`), renews it inside the shared gate immediately before the
+   * request, refuses a key that left the backlog while the operation waited, and re-checks the lease
+   * and the queued membership *inside* the metadata import transaction (a success commits the
+   * problem row, its snapshot, the dequeue and the diagnostic in that one transaction; a failure is
+   * persisted by its own guarded transaction). It releases the lease in a `finally`. It never reads
+   * a history page, never moves or resets a checkpoint or watermark, never drops or reorders another
+   * key, and never invokes a model — only `refreshProblemMetadata` runs.
+   *
+   * The outcome is typed rather than thrown: `resolved` means the key left the backlog and its
+   * per-key diagnostic was cleared, `deferred` means the platform refused this one item for this
+   * reader (an incomplete personal statement, or an anonymous refusal of a private user-created
+   * problem) and the key stays queued with its diagnostic, and `failed` means any other refusal.
+   * A refusal of the whole source — a live lease held elsewhere, a lost lease, an account or key that
+   * is not queued — is still a typed `LuoguSyncError`, because it is not an outcome of this item.
+   */
+  async retryMetadata(
+    accountId: string,
+    problemKeyValue: string,
+    token: CancellationToken,
+  ): Promise<{
+    readonly accountId: string;
+    readonly problemKey: string;
+    readonly outcome: 'resolved' | 'deferred' | 'failed';
+    readonly failureCode: LuoguSyncFailureCode | null;
+    readonly reason: PlatformErrorReason | null;
+  }> {
+    this.assertUsable(token);
+    const account = await this.requireAccount(accountId);
+    invariant(
+      typeof problemKeyValue === 'string' && problemKeyValue.trim().length > 0,
+      'invalid_input',
+      'problemKey must be a non-empty string',
+    );
+    const key = problemKeyValue;
+    // Exactly one currently queued key: a key that is not in this account's backlog is refused
+    // before any lease, gate or platform work.
+    const before = await this.store.getLuoguSyncState(account.id);
+    if (before === null || !before.value.missingMetadata.includes(key)) {
+      throw new LuoguSyncError('invalid_input', `problem ${key} is not queued in the metadata backlog`, {
+        accountId: account.id,
+        problemKey: key,
+      });
+    }
+    return this.runConnectionOp(account.id, token, async (opToken) => {
+      await this.claim(account, { purpose: 'repair', mode: 'resume' }, opToken);
+      try {
+        const problemRef = parseProblemKey(key);
+        const report = await this.gate.run(opToken, async () => {
+          throwIfCancelled(opToken);
+          await this.renewLease(account.id, 'before a metadata retry');
+          throwIfCancelled(opToken);
+          // The key may have left the backlog while this operation waited for the source floor or for
+          // the lease: re-read the durable row and refuse without one platform request.
+          await this.requireLiveQueuedMetadataKey(account.id, key, opToken, 'before a metadata retry');
+          throwIfCancelled(opToken);
+          return this.imports.refreshProblemMetadata(this.metadataSource, {
+            problemRef,
+            token: opToken,
+            limits: this.limits,
+            // Runs INSIDE the import transaction, before anything else is read back: a lease taken
+            // over or expired during the request — or a cancellation — makes this throw and rolls
+            // the problem row and its snapshot back, so a stale claim commits neither. The success
+            // mutation opens no transaction of its own (the import owns one) and re-checks the lease
+            // and the queued membership again at the write boundary.
+            beforeCommit: async () => {
+              await this.applyMetadataRetry(account.id, key, { status: 'fetched', error: null }, opToken);
+            },
+          });
+        });
+        if (report.status === 'fetched') {
+          return { accountId: account.id, problemKey: key, outcome: 'resolved' as const, failureCode: null, reason: null };
+        }
+        const outcome = await this.commitMetadataRetry(account.id, key, { status: 'failed', error: report.error }, opToken);
+        return { accountId: account.id, problemKey: key, ...outcome };
+      } finally {
+        // The lease is always released, and an unrelated history/metadata failure is preserved by
+        // `releaseLease(…, false)`; only a stored failure that explicitly names this key is cleared.
+        await this.releaseLease(account.id, false);
+      }
+    });
+  }
+
+  /**
+   * Record one **locally supplied** problem body for a currently queued key, with no platform
+   * request at all.
+   *
+   * This is the workbench's manual recovery for a queued problem the platform will not serve (an
+   * explicitly incomplete personal statement, a deleted problem, ...): the user pastes the real
+   * title and statement, and the row is created from the configured source's own canonical
+   * identity — `parseProblemKey` plus this instance's base URL. Nothing here is a platform read:
+   * the created problem carries no rating, no raw tag and no editorial source, so the stored
+   * material never claims to be platform-verified, and no model is invoked.
+   *
+   * The operation is item-scoped but source-scoped in its discipline: it takes the same durable
+   * source-wide lease as a pass through `runConnectionOp` + `claim` and therefore refuses a live
+   * lease held by another owner (on this account or any other account of the instance), yet it
+   * needs no stored connection, no cookie and no source-gate wait — a disconnected account can
+   * still complete the items it already knows about. The lease is released in a `finally`.
+   *
+   * Exactly one store transaction commits the problem row, its immutable snapshot, the dequeue of
+   * this one key, the clearing of this one key's diagnostic and one `metadataResolved` increment.
+   * The `beforeCommit` hook re-checks the lease (with a clock reading taken inside the transaction)
+   * and the queued membership immediately before that single write, so a cancellation, an expired
+   * lease, a takeover or a stale snapshot rolls everything back and leaves the key queued. Every
+   * other backlog key and its diagnostic, the history watermarks, the checkpoint, the submissions
+   * and any stored failure that does not explicitly name this key are preserved verbatim.
+   */
+  async supplementMetadata(
+    request: {
+      readonly accountId: string;
+      readonly problemKey: string;
+      /** Real title the user supplied; used only when the problem row does not exist yet. */
+      readonly title: string;
+      /** Complete statement the user supplied; always written as the problem's statement. */
+      readonly statement: string;
+      readonly expectedSnapshotId: string | null;
+    },
+    token: CancellationToken,
+  ): Promise<{
+    readonly accountId: string;
+    readonly problemKey: string;
+    readonly snapshot: SnapshotWrite;
+    readonly outcome: 'supplemented';
+  }> {
+    this.assertUsable(token);
+    invariant(
+      request !== null && typeof request === 'object' && !Array.isArray(request),
+      'invalid_input',
+      'supplement request must be an object',
+    );
+    const account = await this.requireAccount(request.accountId);
+    invariant(
+      typeof request.problemKey === 'string' && request.problemKey.trim().length > 0,
+      'invalid_input',
+      'problemKey must be a non-empty string',
+    );
+    const key = request.problemKey;
+    // The key itself carries the source instance, so a key of another platform is refused here,
+    // before any lease, store write or request.
+    const ref = parseProblemKey(key);
+    if (ref.sourceInstanceId !== this.sourceInstance.id) {
+      throw new LuoguSyncError('account_foreign', `problem ${key} does not belong to this Luogu instance`, {
+        problemKey: key,
+      });
+    }
+    invariant(
+      typeof request.title === 'string' && request.title.trim().length > 0,
+      'invalid_input',
+      'a recovered problem requires a non-blank title',
+    );
+    invariant(
+      request.title.length <= MAX_SUPPLEMENT_TITLE_CHARS,
+      'invalid_input',
+      `a recovered problem title exceeds ${MAX_SUPPLEMENT_TITLE_CHARS} characters`,
+      { length: request.title.length },
+    );
+    invariant(
+      typeof request.statement === 'string' && request.statement.trim().length > 0,
+      'invalid_input',
+      'a recovered problem requires a non-blank statement',
+    );
+    invariant(
+      request.statement.length <= MAX_SUPPLEMENT_STATEMENT_CHARS,
+      'invalid_input',
+      `a recovered statement exceeds ${MAX_SUPPLEMENT_STATEMENT_CHARS} characters`,
+      { length: request.statement.length },
+    );
+    const expectedSnapshotId = request.expectedSnapshotId;
+    invariant(
+      expectedSnapshotId === null || (typeof expectedSnapshotId === 'string' && expectedSnapshotId.length > 0),
+      'invalid_input',
+      'expectedSnapshotId must be a snapshot id or null',
+      { problemKey: key },
+    );
+    // Exactly one currently queued key of this account: a key that is not in its backlog is refused
+    // before any lease is taken or any store write is attempted.
+    const before = await this.store.getLuoguSyncState(account.id);
+    if (before === null || !before.value.missingMetadata.includes(key)) {
+      throw new LuoguSyncError('invalid_input', `problem ${key} is not queued in the metadata backlog`, {
+        accountId: account.id,
+        problemKey: key,
+      });
+    }
+    return this.runConnectionOp(account.id, token, async (opToken) => {
+      await this.claim(account, { purpose: 'repair', mode: 'resume' }, opToken);
+      try {
+        const report = await this.imports.supplementLocalProblem({
+          problem: {
+            ref,
+            // Derived from the configured instance, never from a request body.
+            url: this.problemUrlOf(ref.externalKey),
+            title: request.title,
+          },
+          statement: request.statement,
+          expectedSnapshotId,
+          token: opToken,
+          // Runs INSIDE the import transaction: the lease, the source identity and the queued
+          // membership are re-checked at the write boundary, so a takeover, an expiry or a
+          // cancellation rolls the problem and its snapshot back together with the dequeue.
+          beforeCommit: () => this.commitSupplementedItem(account.id, key, opToken),
+        });
+        return {
+          accountId: account.id,
+          problemKey: key,
+          snapshot: report.snapshot,
+          outcome: 'supplemented' as const,
+        };
+      } finally {
+        await this.releaseLease(account.id, false);
+      }
+    });
+  }
+
+  /**
+   * The commit hook of one manual recovery, run inside the metadata import transaction.
+   *
+   * The problem row, its snapshot, the dequeue of exactly this key, the clearing of exactly this
+   * key's diagnostic and one `metadataResolved` increment commit together or not at all. The clock
+   * is read after the state read (inside {@link requireLiveQueuedMetadataKey}), the caller's token
+   * is checked on both sides of every awaited operation, and the lease, the source identity and
+   * the queued membership are re-checked immediately before the only write. Only a stored failure
+   * that explicitly names this key is cleared: a manual recovery is not a retry of the platform
+   * read, so a history (or legacy stage-less) failure survives verbatim.
+   */
+  private async commitSupplementedItem(
+    accountId: string,
+    problemKeyValue: string,
+    token: CancellationToken,
+  ): Promise<void> {
+    const { record, current, at } = await this.requireLiveQueuedMetadataKey(
+      accountId,
+      problemKeyValue,
+      token,
+      'before the manual recovery commit',
+    );
+    const next: LuoguSyncState = {
+      ...current,
+      missingMetadata: current.missingMetadata.filter((key) => key !== problemKeyValue),
+      metadataIssues: [...clearMetadataIssue(current.metadataIssues, problemKeyValue)],
+      metadataResolved: current.metadataResolved + 1,
+      failure: clearRetriedItemFailure(current.failure, problemKeyValue),
+      leaseExpiresAt: new Date(Date.parse(at) + this.leaseMs).toISOString(),
+      updatedAt: at,
+    };
+    throwIfCancelled(token);
+    await this.store.saveLuoguSyncState(next, record.revision);
+    throwIfCancelled(token);
+  }
+
+  /** Canonical problem URL of this configured instance; a recovery never accepts a caller URL. */
+  private problemUrlOf(externalKey: string): string {
+    return `${this.sourceInstance.baseUrl.replace(/\/+$/u, '')}/problem/${encodeURIComponent(externalKey)}`;
   }
 
   /**
@@ -1562,13 +1950,17 @@ export class LuoguSyncService {
    *
    * ## Per-item commitment and the lease
    *
-   * The lease is re-taken before every platform request and progress is persisted after every key,
-   * inside a transaction that re-validates that lease. A long metadata-only drain therefore shows a
-   * backlog that decreases while it runs, cannot outlive its lease, and stops — without one further
-   * request — the moment another owner takes the source over. The re-validation runs *inside* the
-   * gate's work callback, immediately before the request: the gate may park this operation for a
-   * while, and a lease that expired (or was taken over) during that wait must refuse the request
-   * rather than dispatch it on a stale claim.
+   * The lease is re-taken before every platform request, and progress is persisted per item under a
+   * transaction that re-validates it. A **successful** item commits the problem row, its snapshot,
+   * the dequeue of that key, the clearing of its diagnostic and its single counter increment inside
+   * the metadata import's own transaction (`beforeCommit`), so a lease taken over, an expired lease
+   * or a cancellation during the request rolls the metadata back instead of committing it on a stale
+   * claim. A **failed** item is persisted by its own lease-guarded transaction. A long metadata-only
+   * drain therefore shows a backlog that decreases while it runs, cannot outlive its lease, and stops
+   * — without one further request — the moment another owner takes the source over. The
+   * re-validation runs *inside* the gate's work callback, immediately before the request: the gate
+   * may park this operation for a while, and a lease that expired (or was taken over) during that
+   * wait must refuse the request rather than dispatch it on a stale claim.
    *
    * The returned `priorFailure` is the state's failure at entry, which the caller needs to tell a
    * metadata failure this pass can repair from a history failure it never touched. The returned
@@ -1588,10 +1980,13 @@ export class LuoguSyncService {
     const priorFailure = record.value.failure;
     const attempted = new Set<string>();
     const backlog = [...record.value.missingMetadata];
-    // Counters since the last durable save: each item is committed with its own delta, so a
-    // cumulative counter is never written twice.
-    let resolved = 0;
+    // Every item commits its own exact counter delta: a success inside the import transaction and a
+    // failure in its own guarded transaction, so a cumulative counter is never written twice.
     let failed = 0;
+    // Per-key diagnostics, carried forward across every item of this phase. A legacy row without the
+    // field starts empty — unknown, never an inferred failure — and gains entries only for keys this
+    // phase actually observed failing.
+    let issues: readonly LuoguMetadataIssue[] = record.value.metadataIssues ?? [];
     // Three distinct facts, kept apart on purpose: the loop must stop only for `stop`, while the
     // durable failure it reports prefers `stop`, then the deferred item refusal, then the transient
     // one. A deferred private-key refusal therefore survives every later success of this phase but
@@ -1623,39 +2018,73 @@ export class LuoguSyncService {
           problemRef,
           token,
           limits: this.limits,
+          // Runs INSIDE the metadata import transaction: the key is dequeued, its diagnostic is
+          // cleared and its single counter increment is committed in the same commit as the problem
+          // row and its snapshot. A lease taken over or expired during the request — or a
+          // cancellation — makes the hook throw and rolls the whole metadata write back instead of
+          // committing problem data on a stale claim.
+          beforeCommit: () => this.commitMetadataBatchItem(account.id, key, token),
         });
       });
-      backlog.shift();
       if (report.status === 'fetched') {
-        resolved += 1;
+        // The durable success was already committed by the hook above, in the import's own
+        // transaction; only this loop's local queue and diagnostics need to follow it.
+        backlog.shift();
+        issues = clearMetadataIssue(issues, key);
       } else {
         failed += 1;
         // Rotation is the durable fairness cursor: the failed key moves to the end of the backlog.
+        backlog.shift();
         backlog.push(key);
         const at = this.nowIso();
         const code: LuoguSyncFailureCode = report.error === null ? 'internal' : failureCodeOf(report.error.code);
+        const reason = report.error === null ? null : (report.error.reason ?? null);
+        // The durable diagnostic of this key: the closed code plus the closed, body-free reason and a
+        // bounded attempt count. No parser message, body sample or exception text is representable.
+        issues = upsertMetadataIssue(issues, {
+          problemKey: key,
+          code,
+          reason,
+          at,
+          attempts: this.nextIssueAttempts(issues, key),
+        });
         const itemFailure = this.buildFailure(
           code,
           at,
           report.error === null ? null : report.error.retryAfterMs,
           stop ?? deferred ?? transient,
           'metadata',
+          { problemKey: key, reason },
         );
-        if (isPrivateProblemRefusal(problemRef, code)) deferred = itemFailure;
+        // An item-scoped refusal — an anonymous refusal of a private user-created problem, or an
+        // explicitly incomplete statement — is deferrable: the key keeps its queued place and its
+        // diagnostic and the phase continues with the other keys. A challenge, an HTML answer, a
+        // rate limit or any other unreadable payload still stops the source, so a blank personal
+        // statement can no longer halt the whole queue.
+        if (this.isDeferrableItemFailure(problemRef, code, reason)) deferred = itemFailure;
         else if (itemFailure.paused || code === 'rate_limited') stop = itemFailure;
         else transient = itemFailure;
+        // The failed attempt is persisted by its own lease-guarded transaction: a takeover or a
+        // cancellation that landed during the request writes nothing, and the caller stops the phase
+        // instead of reporting a backlog this pass no longer owns.
+        const failure = stop ?? deferred ?? transient;
+        const saved = await this.saveMetadataProgress(account.id, {
+          backlog,
+          issues,
+          resolved: 0,
+          failed,
+          failure,
+        }, token);
+        failed = 0;
+        if (!saved) {
+          // The durable row belongs to another owner now: stop immediately, leave their row intact and
+          // let the keys still queued here be handled by whoever owns the source next.
+          throw new LuoguSyncError('lease_lost', 'another owner replaced the metadata pass lease', {
+            accountId: account.id,
+          });
+        }
+        if (stop !== null) break;
       }
-      const failure = stop ?? deferred ?? transient;
-      if (!(await this.saveMetadataProgress(account.id, { backlog, resolved, failed, failure }))) {
-        // The durable row belongs to another owner now: stop immediately, leave their row intact and
-        // let the keys still queued here be handled by whoever owns the source next.
-        throw new LuoguSyncError('lease_lost', 'another owner replaced the metadata pass lease', {
-          accountId: account.id,
-        });
-      }
-      resolved = 0;
-      failed = 0;
-      if (stop !== null) break;
     }
     return { failure: stop ?? deferred ?? transient, priorFailure };
   }
@@ -1692,6 +2121,227 @@ export class LuoguSyncService {
   }
 
   /**
+   * The commit hook of one successful ordinary repair item, run inside the metadata import
+   * transaction.
+   *
+   * The problem row, its snapshot, the dequeue of exactly this key, the clearing of exactly this
+   * key's diagnostic and one `metadataResolved` increment commit together or not at all. The clock
+   * is read after the state read, the caller's token is checked on both sides of every awaited
+   * operation, and the lease, the source identity and the queued membership are re-checked
+   * immediately before the write: a takeover, an expired lease, a cancellation or a concurrently
+   * dequeued key refuses the write, which rolls the metadata back with it. Every other backlog key,
+   * diagnostic, counter, history field and the stored failure are carried over unchanged.
+   */
+  private async commitMetadataBatchItem(
+    accountId: string,
+    problemKeyValue: string,
+    token: CancellationToken,
+  ): Promise<void> {
+    const { record, current, at } = await this.requireLiveQueuedMetadataKey(
+      accountId,
+      problemKeyValue,
+      token,
+      'before the metadata commit',
+    );
+    const next: LuoguSyncState = {
+      ...current,
+      missingMetadata: current.missingMetadata.filter((key) => key !== problemKeyValue),
+      metadataIssues: [...clearMetadataIssue(current.metadataIssues, problemKeyValue)],
+      metadataResolved: current.metadataResolved + 1,
+      leaseExpiresAt: new Date(Date.parse(at) + this.leaseMs).toISOString(),
+      updatedAt: at,
+    };
+    throwIfCancelled(token);
+    await this.store.saveLuoguSyncState(next, record.revision);
+    throwIfCancelled(token);
+  }
+
+  /**
+   * Re-read the durable state and require one live lease of this source with the key still queued.
+   *
+   * Used both immediately before a retry request and again at the write boundary, inside whatever
+   * transaction the caller already owns. The clock is read **after** the awaited state read, so a
+   * store that queued this call behind another operation cannot validate a lease against a reading
+   * taken before the wait. The account, the source identity, the owner, the lease deadline and the
+   * queued membership are all re-derived from the row just read; an expired or replaced lease, a
+   * state that moved to another source, or a key that left the backlog is a `lease_lost` refusal.
+   */
+  private async requireLiveQueuedMetadataKey(
+    accountId: string,
+    problemKeyValue: string,
+    token: CancellationToken,
+    phase: string,
+  ): Promise<{ readonly record: LuoguSyncStateRecord; readonly current: LuoguSyncState; readonly at: string }> {
+    throwIfCancelled(token);
+    const record = await this.store.getLuoguSyncState(accountId);
+    throwIfCancelled(token);
+    const current = record === null ? null : record.value;
+    const at = this.nowIso();
+    if (
+      record === null ||
+      current === null ||
+      current.accountId !== accountId ||
+      current.sourceInstanceId !== this.sourceInstance.id ||
+      current.owner !== this.ownerId ||
+      !luoguLeaseLive(current, this.ownerId, at)
+    ) {
+      throw new LuoguSyncError('lease_lost', `another owner replaced the metadata lease ${phase}`, {
+        accountId,
+        problemKey: problemKeyValue,
+      });
+    }
+    if (!current.missingMetadata.includes(problemKeyValue)) {
+      throw new LuoguSyncError('lease_lost', `problem ${problemKeyValue} is no longer queued ${phase}`, {
+        accountId,
+        problemKey: problemKeyValue,
+      });
+    }
+    return { record, current, at };
+  }
+
+  /**
+   * Persist the outcome of exactly one item-scoped metadata attempt in its own transaction.
+   *
+   * This is the **outer** wrapper for the failure path of {@link retryMetadata}: it opens exactly
+   * one transaction and delegates the mutation to {@link applyMetadataRetry}. The success path must
+   * never come through here — it runs inside the metadata import's transaction, where a nested
+   * `store.transaction` would be rejected, and calls the mutation helper directly.
+   */
+  private async commitMetadataRetry(
+    accountId: string,
+    problemKeyValue: string,
+    outcome: { readonly status: 'fetched' | 'failed'; readonly error: PlatformError | null },
+    token: CancellationToken,
+  ): Promise<{
+    readonly outcome: 'resolved' | 'deferred' | 'failed';
+    readonly failureCode: LuoguSyncFailureCode | null;
+    readonly reason: PlatformErrorReason | null;
+  }> {
+    return this.store.transaction(() => this.applyMetadataRetry(accountId, problemKeyValue, outcome, token));
+  }
+
+  /**
+   * Mutate the durable state of exactly one item-scoped retry attempt.
+   *
+   * The caller already owns the transaction: this method performs only store reads and writes on
+   * that transaction (a nested {@link TrainingStore.transaction} is rejected by the adapter), which
+   * is what lets the success path commit the problem row, its snapshot, the dequeue of this one key
+   * and the clearing of this one diagnostic together or not at all.
+   *
+   * The lease, the source identity and the queued membership of the key are re-checked at the write
+   * boundary, immediately before the only write; the caller's token is checked on both sides of
+   * every awaited operation. A cancellation or a lease that was taken over or expired while the
+   * request ran therefore commits neither the metadata nor this state update.
+   *
+   * Only the addressed key is touched: `missingMetadata` keeps its order, every other per-key
+   * diagnostic survives, and every history field, counter and checkpoint is carried over unchanged.
+   * A success clears a stored failure only when that failure is this build's **metadata** failure
+   * naming exactly this key; a history, a legacy stage-less failure or a failure naming another key
+   * is evidence of work the retry did not do and survives verbatim. A failure records the new
+   * item-scoped diagnostic without erasing such a preexisting failure either.
+   */
+  private async applyMetadataRetry(
+    accountId: string,
+    problemKeyValue: string,
+    outcome: { readonly status: 'fetched' | 'failed'; readonly error: PlatformError | null },
+    token: CancellationToken,
+  ): Promise<{
+    readonly outcome: 'resolved' | 'deferred' | 'failed';
+    readonly failureCode: LuoguSyncFailureCode | null;
+    readonly reason: PlatformErrorReason | null;
+  }> {
+    const { record, current, at } = await this.requireLiveQueuedMetadataKey(
+      accountId,
+      problemKeyValue,
+      token,
+      'before the retry commit',
+    );
+    const fetched = outcome.status === 'fetched';
+    const error = outcome.error;
+    const code: LuoguSyncFailureCode = error === null ? 'internal' : failureCodeOf(error.code);
+    const reason = error === null ? null : (error.reason ?? null);
+    const ref = parseProblemKey(problemKeyValue);
+    const itemOutcome: 'resolved' | 'deferred' | 'failed' = fetched
+      ? 'resolved'
+      : this.isDeferrableItemFailure(ref, code, reason)
+        ? 'deferred'
+        : 'failed';
+    const missingMetadata = fetched
+      ? current.missingMetadata.filter((key) => key !== problemKeyValue)
+      : [...current.missingMetadata];
+    const metadataIssues = fetched
+      ? clearMetadataIssue(current.metadataIssues, problemKeyValue)
+      : upsertMetadataIssue(current.metadataIssues, {
+          problemKey: problemKeyValue,
+          code,
+          reason,
+          at,
+          attempts: this.nextIssueAttempts(current.metadataIssues, problemKeyValue),
+        });
+    const failure = fetched
+      ? clearRetriedItemFailure(current.failure, problemKeyValue)
+      : retryFailure(current.failure, this.buildFailure(code, at, error === null ? null : error.retryAfterMs, current.failure, 'metadata', {
+          problemKey: problemKeyValue,
+          reason,
+        }));
+    throwIfCancelled(token);
+    await this.store.saveLuoguSyncState(
+      {
+        ...current,
+        missingMetadata,
+        metadataIssues: [...metadataIssues],
+        metadataResolved: current.metadataResolved + (fetched ? 1 : 0),
+        metadataFailed: current.metadataFailed + (fetched ? 0 : 1),
+        failure,
+        leaseExpiresAt: new Date(Date.parse(at) + this.leaseMs).toISOString(),
+        updatedAt: at,
+      },
+      record.revision,
+    );
+    // A cancellation that landed while the write ran must not commit it: throwing here rolls the
+    // caller's transaction back, exactly like a lost lease.
+    throwIfCancelled(token);
+    return {
+      outcome: itemOutcome,
+      failureCode: fetched ? null : code,
+      reason: fetched ? null : reason,
+    };
+  }
+
+  /**
+   * True when a metadata refusal addresses **this item** instead of the whole source.
+   *
+   * Two refusals are item-scoped and therefore deferrable: an anonymous refusal of a private
+   * user-created problem ({@link isPrivateProblemRefusal}) and an explicitly diagnosed incomplete
+   * statement (`missing_statement`), which the official manual allows for personal problems and
+   * which no retry of the same request can repair. Every other refusal — a challenge, an HTML page,
+   * malformed JSON, a rate limit — belongs to the source and keeps its pause/backoff behavior.
+   */
+  private isDeferrableItemFailure(
+    problemRef: ProblemRef,
+    code: LuoguSyncFailureCode,
+    reason: PlatformErrorReason | null,
+  ): boolean {
+    // `missing_statement` is only meaningful as the reason of a `changed_response` payload refusal:
+    // that is the exact pair the metadata reader records for a valid personal problem whose
+    // description is empty. A nonsense pairing — an auth, forbidden or rate-limit answer that
+    // happens to carry the reason — must not reclassify a source-level refusal as a deferred item.
+    return (reason === 'missing_statement' && code === 'changed_response') || isPrivateProblemRefusal(problemRef, code);
+  }
+
+  /**
+   * The next bounded attempt count of one key's durable diagnostic.
+   *
+   * The declared ceiling saturates instead of throwing: once a key has failed
+   * {@link LUOGU_METADATA_MAX_ISSUE_ATTEMPTS} times, later failures keep the ceiling so the state
+   * this build writes stays valid, rather than making the validator refuse the whole save.
+   */
+  private nextIssueAttempts(issues: readonly LuoguMetadataIssue[] | undefined, problemKeyValue: string): number {
+    const previous = metadataIssueFor(issues, problemKeyValue)?.attempts ?? 0;
+    return Math.min(LUOGU_METADATA_MAX_ISSUE_ATTEMPTS, previous + 1);
+  }
+
+  /**
    * Persist backlog/rotation/counters under the pass's renewed lease.
    *
    * Returns `true` when the write committed, `false` when the durable row is owned by someone else
@@ -1703,15 +2353,20 @@ export class LuoguSyncService {
     accountId: string,
     progress: {
       readonly backlog: readonly string[];
+      /** Per-key diagnostics carried by this update; one entry per known issue, never raw text. */
+      readonly issues: readonly LuoguMetadataIssue[];
       readonly resolved: number;
       readonly failed: number;
       readonly failure: LuoguSyncFailure | null;
     },
+    token: CancellationToken,
   ): Promise<boolean> {
-    const at = this.nowIso();
     try {
       return await this.store.transaction(async () => {
+        throwIfCancelled(token);
         const record = await this.store.getLuoguSyncState(accountId);
+        throwIfCancelled(token);
+        const at = this.nowIso();
         if (
           record === null ||
           record.value.owner !== this.ownerId ||
@@ -1723,6 +2378,7 @@ export class LuoguSyncService {
           {
             ...record.value,
             missingMetadata: progress.backlog,
+            metadataIssues: progress.issues,
             metadataResolved: record.value.metadataResolved + progress.resolved,
             metadataFailed: record.value.metadataFailed + progress.failed,
             failure: progress.failure ?? record.value.failure,
@@ -1731,6 +2387,7 @@ export class LuoguSyncService {
           },
           record.revision,
         );
+        throwIfCancelled(token);
         return true;
       });
     } catch (error) {
@@ -1810,15 +2467,20 @@ export class LuoguSyncService {
     retryAfterMs: number | null,
     previous: LuoguSyncFailure | null,
     stage: LuoguSyncFailureStage,
+    item?: { readonly problemKey: string; readonly reason: PlatformErrorReason | null },
   ): LuoguSyncFailure {
+    const named =
+      item === undefined
+        ? {}
+        : { problemKey: item.problemKey, ...(item.reason === null ? {} : { reason: item.reason }) };
     if (luoguSyncFailurePauses(code)) {
-      return { code, at, retryAt: null, paused: true, stage };
+      return { code, at, retryAt: null, paused: true, stage, ...named };
     }
     const delay =
       retryAfterMs !== null && Number.isFinite(retryAfterMs) && retryAfterMs > 0
         ? Math.round(retryAfterMs)
         : exponentialBackoff(previous);
-    return { code, at, retryAt: new Date(Date.parse(at) + delay).toISOString(), paused: false, stage };
+    return { code, at, retryAt: new Date(Date.parse(at) + delay).toISOString(), paused: false, stage, ...named };
   }
 
   /**

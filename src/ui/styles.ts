@@ -256,4 +256,18 @@ ${katexCss}
 .icpc-markdown .icpc-code-line-active{background:var(--icpc-soft);box-shadow:inset 2px 0 0 var(--icpc-accent)}
 .icpc-markdown .icpc-markdown-video-link{display:inline-block;padding:4px 10px;border:1px solid var(--icpc-line);border-radius:6px;background:var(--icpc-soft);color:var(--icpc-accent);text-decoration:none;font-size:13px}
 @media(prefers-color-scheme:dark){.icpc-root .icpc-markdown .icpc-code-line-active{background:#2a3444}}
+/* Sprint 25b: the Luogu metadata backlog and its one manual-supplement form. The list is a normal
+   bordered list of one-li-per-key rows (never hundreds of textareas), and the pager reuses the
+   existing .icpc-pager rules; only the row, form and select sizing are new. */
+.icpc-luogu-backlog{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px;min-width:0}
+.icpc-luogu-backlog>li{padding:10px 12px;border:1px solid var(--icpc-line);border-radius:8px;background:var(--icpc-card);min-width:0;display:flex;flex-direction:column;gap:6px}
+.icpc-luogu-backlog-title{font-weight:650;overflow-wrap:anywhere}
+.icpc-luogu-backlog-meta{font-size:12px;color:var(--icpc-muted);overflow-wrap:anywhere}
+.icpc-luogu-backlog-issue{margin:0;font-size:12px;overflow-wrap:anywhere}
+.icpc-luogu-backlog-row-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.icpc-luogu-backlog-pager{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-width:0}
+.icpc-luogu-backlog-pager select{width:auto;min-width:84px}
+.icpc-luogu-supplement{margin-top:6px;padding:10px 12px;border:1px solid var(--icpc-line);border-radius:8px;background:var(--icpc-soft);display:flex;flex-direction:column;gap:8px;min-width:0}
+.icpc-luogu-supplement form{display:flex;flex-direction:column;gap:8px;min-width:0}
+@media(max-width:640px){.icpc-luogu-backlog>li{padding:8px 10px}.icpc-luogu-backlog-pager span.icpc-muted{margin-left:0}}
 `;

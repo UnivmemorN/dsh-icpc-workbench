@@ -34,17 +34,21 @@ import {
   inspectLuoguSessionCookie,
   normalizeLuoguSessionCookie,
   parseAccountId,
+  parseProblemKey,
   type Account,
   type CancellationToken,
   type LuoguCookieProblem,
   type SourceInstance,
 } from '../domain/index.js';
+import { MAX_SUPPLEMENT_STATEMENT_CHARS, MAX_SUPPLEMENT_TITLE_CHARS } from '../application/import-types.js';
 import { MAX_CREDENTIAL_SECRET_BYTES } from '../application/local-credential-vault.js';
 import { LuoguConnectionError } from '../application/luogu-connection.js';
 import { LuoguSyncError, LuoguSyncService, combineTokens } from '../application/luogu-sync-service.js';
 import {
   LUOGU_SYNC_INTERVAL_MAX_MINUTES,
   LUOGU_SYNC_INTERVAL_MIN_MINUTES,
+  LUOGU_METADATA_BACKLOG_DEFAULT_PAGE_SIZE,
+  LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE,
   luoguLeaseLive,
   type LuoguSyncStore,
 } from '../application/luogu-sync-types.js';
@@ -56,10 +60,16 @@ import {
   type ApiLuoguAccountRequest,
   type ApiLuoguConfigureRequest,
   type ApiLuoguConnectRequest,
+  type ApiLuoguMetadataBacklogRequest,
+  type ApiLuoguMetadataBacklogView,
   type ApiLuoguProfileResult,
+  type ApiLuoguRetryMetadataRequest,
+  type ApiLuoguRetryMetadataResult,
   type ApiLuoguStartRequest,
   type ApiLuoguStartResult,
   type ApiLuoguStatusView,
+  type ApiLuoguSupplementMetadataRequest,
+  type ApiLuoguSupplementMetadataResult,
   type WorkbenchApiInput,
   type WorkbenchApiMap,
   type WorkbenchApiOutput,
@@ -193,6 +203,15 @@ function toTransportFailure(error: unknown): never {
   if (error instanceof DomainError) {
     if (error.code === 'cancelled') {
       throw new ApiTransportError('cancelled', LUOGU_MESSAGES.cancelled);
+    }
+    // A stale snapshot is a *refresh* condition, not a settings condition: the caller must re-read
+    // the problem (refresh the page or reopen the recovery form) and resubmit. It is recognised by
+    // the application-owned reason tag, never by the exception text.
+    if (error.details['reason'] === 'stale_snapshot') {
+      throw new ApiTransportError(
+        'conflict',
+        '该题目的已存快照已在别处更新，请刷新页面后重新打开补充表单再提交。',
+      );
     }
     if (error.code === 'invalid_input' || error.code === 'invalid_id_part' || error.code === 'invalid_timestamp') {
       throw new ApiTransportError('invalid_input', LUOGU_MESSAGES.invalid_input);
@@ -331,6 +350,138 @@ function validateStartRequest(instance: SourceInstance) {
       refuse('mode 必须是 resume、full 或 metadata。');
     }
     return { accountId: requireAccountId(instance, record['accountId']), mode };
+  };
+}
+
+/**
+ * Validate one `luogu.metadataBacklog` request **without IO**.
+ *
+ * Both bounds are optional and defaulted here, so the caller cannot ask for an unbounded page: the
+ * page size is clamped to a positive integer within 1..{@link LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE}
+ * and the page number to an integer ≥ 1.
+ */
+function validateMetadataBacklogRequest(instance: SourceInstance) {
+  return (value: unknown): ApiLuoguMetadataBacklogRequest => {
+    const record = requireObject('luogu.metadataBacklog', value, ['accountId', 'page', 'pageSize']);
+    const accountId = requireAccountId(instance, record['accountId']);
+    const page = record['page'];
+    if (page !== undefined && !(typeof page === 'number' && Number.isSafeInteger(page) && page >= 1)) {
+      refuse('page 必须是 ≥ 1 的整数。');
+    }
+    const pageSize = record['pageSize'];
+    if (
+      pageSize !== undefined &&
+      !(
+        typeof pageSize === 'number' &&
+        Number.isSafeInteger(pageSize) &&
+        pageSize >= 1 &&
+        pageSize <= LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE
+      )
+    ) {
+      refuse(`pageSize 必须是 1..${LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE} 的整数。`);
+    }
+    return {
+      accountId,
+      ...(page === undefined ? {} : { page }),
+      ...(pageSize === undefined ? {} : { pageSize }),
+    };
+  };
+}
+
+/**
+ * Validate one `luogu.retryMetadata` request **without IO**.
+ *
+ * The key is only checked for shape here — a bounded, control-character-free string. Whether it is a
+ * canonical key of this account's backlog is decided by the service against durable state, so this
+ * boundary never reads the store.
+ */
+function validateRetryMetadataRequest(instance: SourceInstance) {
+  return (value: unknown): ApiLuoguRetryMetadataRequest => {
+    const record = requireObject('luogu.retryMetadata', value, ['accountId', 'problemKey']);
+    const accountId = requireAccountId(instance, record['accountId']);
+    const problemKey = record['problemKey'];
+    if (
+      typeof problemKey !== 'string' ||
+      problemKey.trim().length === 0 ||
+      problemKey.length > MAX_LUOGU_ACCOUNT_ID_CHARS ||
+      UNSAFE_TEXT.test(problemKey)
+    ) {
+      refuse('problemKey 无效。');
+    }
+    return { accountId, problemKey };
+  };
+}
+
+/** Longest accepted snapshot id; the canonical `<problemKey>@<hash>:v<version>` form is shorter. */
+export const MAX_LUOGU_SNAPSHOT_ID_CHARS = 512;
+
+/**
+ * Validate one `luogu.supplementMetadata` request **without IO**.
+ *
+ * The body is a closed contract of exactly five fields: a smuggled-in URL, raw tag, rating,
+ * submission or model field is refused rather than dropped. The title and the statement are real
+ * user input and are bounded here — before the handler reads the store — by the same constants the
+ * application enforces, and the problem key must already be a canonical key of this configured
+ * instance. Whether that key is currently queued is decided by the service against durable state,
+ * so this boundary never reads the store.
+ */
+function validateSupplementMetadataRequest(instance: SourceInstance) {
+  return (value: unknown): ApiLuoguSupplementMetadataRequest => {
+    const record = requireObject('luogu.supplementMetadata', value, [
+      'accountId',
+      'problemKey',
+      'title',
+      'statement',
+      'expectedSnapshotId',
+    ]);
+    const accountId = requireAccountId(instance, record['accountId']);
+    const problemKey = record['problemKey'];
+    if (
+      typeof problemKey !== 'string' ||
+      problemKey.trim().length === 0 ||
+      problemKey.length > MAX_LUOGU_ACCOUNT_ID_CHARS ||
+      UNSAFE_TEXT.test(problemKey)
+    ) {
+      refuse('problemKey 无效。');
+    }
+    let sourceInstanceId: string;
+    try {
+      sourceInstanceId = parseProblemKey(problemKey).sourceInstanceId;
+    } catch {
+      refuse('problemKey 不是规范的题目标识。');
+    }
+    if (sourceInstanceId !== instance.id) {
+      refuse('该题目不属于已配置的洛谷来源。');
+    }
+    const title = record['title'];
+    if (typeof title !== 'string' || title.trim().length === 0) {
+      refuse('title 必须是用户提供的非空题目名称。');
+    }
+    if (title.length > MAX_SUPPLEMENT_TITLE_CHARS) {
+      refuse(`title 超过 ${MAX_SUPPLEMENT_TITLE_CHARS} 字符上限。`);
+    }
+    const statement = record['statement'];
+    if (typeof statement !== 'string' || statement.trim().length === 0) {
+      refuse('statement 必须是用户提供的非空题面。');
+    }
+    if (statement.length > MAX_SUPPLEMENT_STATEMENT_CHARS) {
+      refuse(`statement 超过 ${MAX_SUPPLEMENT_STATEMENT_CHARS} 字符上限。`);
+    }
+    const expectedSnapshotId = record['expectedSnapshotId'];
+    let expected: string | null;
+    if (expectedSnapshotId === null) {
+      expected = null;
+    } else if (
+      typeof expectedSnapshotId === 'string' &&
+      expectedSnapshotId.length > 0 &&
+      expectedSnapshotId.length <= MAX_LUOGU_SNAPSHOT_ID_CHARS &&
+      !UNSAFE_TEXT.test(expectedSnapshotId)
+    ) {
+      expected = expectedSnapshotId;
+    } else {
+      refuse('expectedSnapshotId 必须是 null 或快照标识。');
+    }
+    return { accountId, problemKey, title, statement, expectedSnapshotId: expected };
   };
 }
 
@@ -721,6 +872,62 @@ export async function registerLuoguApi(options: RegisterLuoguApiOptions): Promis
         const updated = await context.service.refreshProfile(account.id, token);
         context.assertOpen();
         return { account: projectAccount(updated) };
+      },
+    );
+    add(
+      LUOGU_API_OPERATIONS.metadataBacklog,
+      validateMetadataBacklogRequest(options.sourceInstance),
+      async (input): Promise<ApiLuoguMetadataBacklogView> => {
+        const account = await requireStoredAccount(context, input.accountId);
+        return context.service.metadataBacklog(
+          account.id,
+          input.page ?? 1,
+          input.pageSize ?? LUOGU_METADATA_BACKLOG_DEFAULT_PAGE_SIZE,
+        );
+      },
+    );
+    add(
+      LUOGU_API_OPERATIONS.retryMetadata,
+      validateRetryMetadataRequest(options.sourceInstance),
+      async (input, token): Promise<ApiLuoguRetryMetadataResult> => {
+        const account = await requireStoredAccount(context, input.accountId);
+        const outcome = await context.service.retryMetadata(account.id, input.problemKey, token);
+        return {
+          accountId: outcome.accountId,
+          problemKey: outcome.problemKey,
+          outcome: outcome.outcome,
+          failureCode: outcome.failureCode,
+          reason: outcome.reason,
+          status: await projectStatus(context, account),
+        };
+      },
+      202,
+    );
+    add(
+      LUOGU_API_OPERATIONS.supplementMetadata,
+      validateSupplementMetadataRequest(options.sourceInstance),
+      async (input, token): Promise<ApiLuoguSupplementMetadataResult> => {
+        const account = await requireStoredAccount(context, input.accountId);
+        // No `requireConnectionBackend`: a manual recovery is local user material and must work while
+        // the account is disconnected. The service performs no request, so no gate and no cookie is
+        // needed — only the durable source slot is taken, so a live foreign lease still refuses.
+        const result = await context.service.supplementMetadata(
+          {
+            accountId: account.id,
+            problemKey: input.problemKey,
+            title: input.title,
+            statement: input.statement,
+            expectedSnapshotId: input.expectedSnapshotId,
+          },
+          token,
+        );
+        return {
+          accountId: result.accountId,
+          problemKey: result.problemKey,
+          snapshot: result.snapshot,
+          status: await projectStatus(context, account),
+          outcome: result.outcome,
+        };
       },
     );
     return disposeLifetime;

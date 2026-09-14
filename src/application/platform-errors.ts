@@ -43,6 +43,25 @@ export type PlatformOperation =
   | 'rating'
   | 'profile';
 
+/**
+ * Closed, body-free diagnostic reason of a platform failure.
+ *
+ * The vocabulary exists so the layers above can tell *apart* the failure modes that share
+ * `changed_response` — an HTML/CAPTCHA page, malformed JSON, a JSON payload that is not the
+ * documented shape, and a valid payload whose statement is legitimately incomplete — without
+ * matching on a parser message, an exception text or a response body. Every value names a
+ * diagnosis, never content: no reason can carry a body, a sample, a cookie or a credential, so a
+ * reason is safe to persist in durable per-key diagnostics.
+ */
+export type PlatformErrorReason = 'missing_statement' | 'html_response' | 'invalid_json' | 'invalid_payload';
+
+export const PLATFORM_ERROR_REASONS: readonly PlatformErrorReason[] = [
+  'missing_statement',
+  'html_response',
+  'invalid_json',
+  'invalid_payload',
+];
+
 export interface PlatformErrorInput {
   readonly code: PlatformErrorCode;
   readonly operation: PlatformOperation;
@@ -56,6 +75,13 @@ export interface PlatformErrorInput {
   readonly attempts?: number;
   /** Short response snippet for `changed_response`; never a full body. */
   readonly sample?: string | null;
+  /**
+   * Optional closed diagnostic reason; an unknown value is dropped instead of being stored.
+   *
+   * Deliberately optional: a failure whose mode this build cannot name carries no reason at all,
+   * which is honest ("unknown") rather than a guessed classification.
+   */
+  readonly reason?: PlatformErrorReason | null;
 }
 
 const MAX_DETAIL_CHARS = 300;
@@ -90,6 +116,8 @@ export class PlatformError extends Error {
   readonly retryAfterMs: number | null;
   readonly attempts: number;
   readonly sample: string | null;
+  /** Closed diagnostic reason of this failure, or `null` when this build cannot name one. */
+  readonly reason: PlatformErrorReason | null;
 
   constructor(input: PlatformErrorInput) {
     const detail = sanitize(typeof input.detail === 'string' ? input.detail : '', MAX_DETAIL_CHARS);
@@ -104,7 +132,18 @@ export class PlatformError extends Error {
       typeof input.attempts === 'number' && Number.isInteger(input.attempts) && input.attempts >= 0 ? input.attempts : 1;
     this.sample =
       typeof input.sample === 'string' && input.sample.trim().length > 0 ? sanitize(input.sample, MAX_SAMPLE_CHARS) : null;
+    this.reason = normalizeReason(input.reason);
   }
+}
+
+/**
+ * Accept only a declared reason; anything else — including `undefined` — becomes `null`.
+ *
+ * The check is by allowlist membership, so a caller cannot smuggle free text through the field and
+ * a future reason added to the vocabulary is still a one-line change here.
+ */
+function normalizeReason(value: PlatformErrorReason | null | undefined): PlatformErrorReason | null {
+  return typeof value === 'string' && PLATFORM_ERROR_REASONS.includes(value) ? value : null;
 }
 
 /** Build a sanitized {@link PlatformError}. */

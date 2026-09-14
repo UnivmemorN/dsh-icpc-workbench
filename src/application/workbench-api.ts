@@ -32,6 +32,7 @@ import type {
 } from '../domain/index.js';
 import type {
   LuoguConnectionStatus,
+  LuoguMetadataIssue,
   LuoguSyncFailure,
   LuoguSyncFailureCode,
   LuoguSyncPhase,
@@ -232,6 +233,9 @@ export const LUOGU_API_OPERATIONS = {
   start: 'luogu.start',
   cancel: 'luogu.cancel',
   profile: 'luogu.profile',
+  metadataBacklog: 'luogu.metadataBacklog',
+  retryMetadata: 'luogu.retryMetadata',
+  supplementMetadata: 'luogu.supplementMetadata',
 } as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
 
 // ---------------------------------------------------------------------------------------
@@ -700,6 +704,116 @@ export interface ApiLuoguStatusView {
   readonly closing: boolean;
 }
 
+/**
+ * Request of `luogu.metadataBacklog`: one page of the durable missing-metadata backlog.
+ *
+ * `page` is 1-based (default 1) and `pageSize` is bounded to 1..{@link LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE}
+ * (default 20). The read is bounded — it never scans further than the requested page — and
+ * deterministic: keys that carry a recorded per-key issue come first, then the remaining keys in
+ * durable queue order.
+ */
+export interface ApiLuoguMetadataBacklogRequest {
+  readonly accountId: string;
+  readonly page?: number;
+  readonly pageSize?: number;
+}
+
+/** One queued key of the metadata backlog, with what is known about it and its current head. */
+export interface ApiLuoguMetadataBacklogItem {
+  readonly problemKey: string;
+  /** Platform-facing key of the reference (for example `P900000001`). */
+  readonly externalKey: string;
+  /** Canonical problem page URL; this operation itself performs no request. */
+  readonly url: string;
+  /** Stored title, or `null` when the problem row does not exist yet. */
+  readonly title: string | null;
+  /** Last recorded per-key diagnostic, or `null` when this key has no known issue. */
+  readonly issue: LuoguMetadataIssue | null;
+  /** Current snapshot head, or `null` when the problem has no snapshot yet. */
+  readonly expectedSnapshotId: string | null;
+}
+
+/**
+ * One page of the durable metadata backlog.
+ *
+ * `knownIssues` counts the keys of **this page** whose diagnostic is known and is deliberately
+ * independent of `historicalFailedAttempts`, which is the lifetime counter of failed attempts of
+ * the whole account. `unknownIssueLabel` is the fixed sentence shown for an item whose `issue` is
+ * `null`: it says that no per-key failure has been recorded yet, never that the key was never tried.
+ */
+export interface ApiLuoguMetadataBacklogView {
+  readonly accountId: string;
+  readonly total: number;
+  readonly page: number;
+  readonly pageSize: number;
+  readonly knownIssues: number;
+  readonly historicalFailedAttempts: number;
+  readonly unknownIssueLabel: string;
+  readonly items: readonly ApiLuoguMetadataBacklogItem[];
+}
+
+/** Request of `luogu.retryMetadata`: retry exactly one currently queued key. */
+export interface ApiLuoguRetryMetadataRequest {
+  readonly accountId: string;
+  readonly problemKey: string;
+}
+
+/**
+ * Result of one item-scoped metadata retry.
+ *
+ * `outcome` is `resolved` when the key left the backlog, `deferred` when the platform refused this
+ * one item for this reader (for example an incomplete personal statement) while the key stays
+ * queued, and `failed` for any other refusal. The code and reason are the same sanitized vocabulary
+ * the durable diagnostics use: no exception text, response body or sample is representable here.
+ */
+export interface ApiLuoguRetryMetadataResult {
+  readonly accountId: string;
+  readonly problemKey: string;
+  readonly outcome: 'resolved' | 'deferred' | 'failed';
+  readonly failureCode: LuoguSyncFailureCode | null;
+  readonly reason: LuoguMetadataIssue['reason'];
+  readonly status: ApiLuoguStatusView;
+}
+
+/**
+ * Request of `luogu.supplementMetadata`: one queued key plus the **local** material a user typed.
+ *
+ * This is the manual-recovery path for a queued problem the platform will not serve (for example an
+ * explicitly incomplete personal statement). The body is a closed contract: there is deliberately
+ * no URL, raw tag, rating, submission, model or editorial field, because the canonical problem URL
+ * is derived by the server from the configured Luogu instance and every stored metadata this
+ * request does not name is preserved. `title` is used only when the problem row does not exist yet;
+ * an existing title is never overwritten (the form shows it read-only). `expectedSnapshotId` is the
+ * head the caller saw (`null` when it saw none) and a mismatch is refused before anything is
+ * written.
+ */
+export interface ApiLuoguSupplementMetadataRequest {
+  readonly accountId: string;
+  readonly problemKey: string;
+  /** Real title the user supplied for a problem that is not stored yet. */
+  readonly title: string;
+  /** Complete statement the user supplied; bounded by the application's own statement limit. */
+  readonly statement: string;
+  readonly expectedSnapshotId: string | null;
+}
+
+/**
+ * Result of `luogu.supplementMetadata`.
+ *
+ * `outcome: 'supplemented'` means the **user-supplied** title/statement were committed to the
+ * problem row and a new immutable snapshot, and exactly that key left the metadata backlog. It
+ * never means a platform fetch succeeded: this operation performs no request, stores no
+ * platform-derived tag or rating and declares no editorial material. `status` is the same safe
+ * projection every other Luogu operation returns, so the caller sees the updated backlog.
+ */
+export interface ApiLuoguSupplementMetadataResult {
+  readonly accountId: string;
+  readonly problemKey: string;
+  readonly snapshot: ApiSnapshotWriteView;
+  readonly status: ApiLuoguStatusView;
+  readonly outcome: 'supplemented';
+}
+
 /** Result of `luogu.start`; the durable plan itself is visible in `status`. */
 export interface ApiLuoguStartResult {
   readonly accountId: string;
@@ -869,6 +983,9 @@ export interface WorkbenchApiMap {
   'luogu.start': ApiEndpoint<ApiLuoguStartRequest, ApiLuoguStartResult>;
   'luogu.cancel': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguStatusView>;
   'luogu.profile': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguProfileResult>;
+  'luogu.metadataBacklog': ApiEndpoint<ApiLuoguMetadataBacklogRequest, ApiLuoguMetadataBacklogView>;
+  'luogu.retryMetadata': ApiEndpoint<ApiLuoguRetryMetadataRequest, ApiLuoguRetryMetadataResult>;
+  'luogu.supplementMetadata': ApiEndpoint<ApiLuoguSupplementMetadataRequest, ApiLuoguSupplementMetadataResult>;
   'assessment.config': ApiEndpoint<Record<string,never>,AssessmentConfigView>;
   'assessment.prepare': ApiEndpoint<AssessmentPrepareRequest,ApiAssessmentView>;
   'assessment.run': ApiEndpoint<AssessmentRunRequest,{readonly started:boolean;readonly attempt:ApiAssessmentView}>;

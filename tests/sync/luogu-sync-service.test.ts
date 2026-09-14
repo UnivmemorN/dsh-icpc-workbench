@@ -2475,3 +2475,89 @@ void test('a backlog of only private U keys attempts every key at most once per 
     await world.dispose();
   }
 });
+
+// Stage25 recovery regressions use the real SQLite transaction boundary and only synthetic data.
+void test('metadata recovery defers an empty statement, imports the next item, and persists honest paged diagnostics', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('recovery-batch');
+    await seedBacklog(world, world.alice.id, ['U900000001', 'P900000001']);
+    await service.connect(world.alice.id, cookieFor('100001'), world.token);
+    const historyReads = world.feed.calls.length;
+    world.metadata.fail.set('U900000001', new PlatformError({code:'changed_response',operation:'problem',reason:'missing_statement',detail:'synthetic incomplete problem'}));
+    await service.start(world.alice.id, 'metadata'); await service.settle();
+    assert.deepEqual(world.metadata.calls, ['U900000001','P900000001']);
+    const state=(await world.store.getLuoguSyncState(world.alice.id))!.value;
+    assert.deepEqual(state.missingMetadata,[problemKeyOf(world.instance,'U900000001')]);
+    assert.equal(state.metadataResolved,1); assert.equal(state.metadataFailed,1);
+    assert.equal(state.metadataIssues?.[0]?.reason,'missing_statement');
+    assert.ok(await world.store.getProblem(problemKeyOf(world.instance,'P900000001')));
+    const reopened=new SqliteTrainingStore({path:world.paths.path});
+    try {assert.deepEqual((await reopened.getLuoguSyncState(world.alice.id))!.value.metadataIssues,state.metadataIssues);} finally {await reopened.close();}
+    const list=await service.metadataBacklog(world.alice.id,1,1);
+    assert.equal(list.total,1); assert.equal(list.items[0]?.issue?.reason,'missing_statement');
+    assert.equal(list.historicalFailedAttempts,1); assert.equal(list.knownIssues,1);
+    assert.equal(world.feed.calls.length,historyReads);
+  } finally {await world.dispose();}
+});
+
+void test('metadata recovery keeps HTML responses source-pausing and leaves later items unattempted',async()=>{
+ const w=await createWorld();try{const s=w.makeService('recovery-html');
+ await seedBacklog(w,w.alice.id,['P900000001','P900000002']);await s.connect(w.alice.id,cookieFor('100001'),w.token);w.metadata.fail.set('P900000001',new PlatformError({code:'changed_response',operation:'problem',reason:'html_response',detail:'synthetic challenge'}));
+ await s.start(w.alice.id,'metadata');await s.settle();assert.deepEqual(w.metadata.calls,['P900000001']);const status=await s.status(w.alice.id);assert.equal(status.paused,true);
+ const list=await s.metadataBacklog(w.alice.id,1,1);assert.equal(list.items[0]?.externalKey,'P900000001');assert.equal(list.items[0]?.issue?.reason,'html_response');
+ const second=await s.metadataBacklog(w.alice.id,2,1);assert.equal(second.items[0]?.externalKey,'P900000002');assert.equal(second.items[0]?.issue,null);assert.equal(second.unknownIssueLabel,'尚无逐题失败记录');
+ }finally{await w.dispose();}
+});
+
+void test('successful exact-one retry commits its snapshot without a nested transaction and preserves history plus siblings',async()=>{
+ const w=await createWorld();try{const s=w.makeService('recovery-one');const keys=buildProblemKeys(w.instance,['P900000001','P900000002']);
+ const historyFailure:LuoguSyncFailure={code:'timeout',at:fx.AT,retryAt:fx.LATER,paused:false,stage:'history'};
+ await seedBacklog(w,w.alice.id,['P900000001','P900000002'],{historyComplete:true,historyCompletedAt:fx.AT,phase:'incremental',lastSuccessAt:fx.AT,lastScanStartedAt:fx.AT,scanStartedAt:fx.AT,totalPages:3,submissionsSeen:42,failure:historyFailure,metadataIssues:[{problemKey:keys[0]!,code:'changed_response',reason:'missing_statement',at:fx.AT,attempts:2},{problemKey:keys[1]!,code:'forbidden',reason:null,at:fx.AT,attempts:1}]});
+ const before=(await w.store.getLuoguSyncState(w.alice.id))!.value,checkpoint=await checkpointOf(w,w.alice.id);
+ const r=await s.retryMetadata(w.alice.id,keys[0]!,w.token);assert.equal(r.outcome,'resolved');assert.deepEqual(w.metadata.calls,['P900000001']);
+ const after=(await w.store.getLuoguSyncState(w.alice.id))!.value;assert.deepEqual(after.missingMetadata,[keys[1]]);assert.deepEqual(after.metadataIssues,[before.metadataIssues![1]]);assert.equal(after.metadataResolved,1);assert.deepEqual(after.failure,historyFailure);
+ for(const k of ['historyComplete','historyCompletedAt','phase','lastSuccessAt','lastScanStartedAt','scanStartedAt','totalPages','submissionsSeen'] as const)assert.deepEqual(after[k],before[k],k);
+ assert.deepEqual(await checkpointOf(w,w.alice.id),checkpoint);assert.equal(await countSubmissions(w.store,w.alice.id),0);assert.equal(w.metadata.editorialCalls(),0);
+ const p=await w.store.getProblem(keys[0]!);assert.ok(p);assert.ok(await w.store.getCurrentSnapshotHead(p.ref));assert.equal(after.owner,null);
+ }finally{await w.dispose();}
+});
+
+void test('failed exact-one retry preserves history failure and queue order while saturating its issue attempts',async()=>{
+ const w=await createWorld();try{const s=w.makeService('recovery-failed');const keys=buildProblemKeys(w.instance,['U900000001','P900000002']);
+ const failure:LuoguSyncFailure={code:'auth_required',stage:'history',at:fx.AT,retryAt:null,paused:true};
+ await seedBacklog(w,w.alice.id,['U900000001','P900000002'],{failure,metadataIssues:[{problemKey:keys[0]!,code:'changed_response',reason:'missing_statement',at:fx.AT,attempts:1000000}]});
+ w.metadata.fail.set('U900000001',new PlatformError({code:'changed_response',operation:'problem',reason:'missing_statement',detail:'synthetic'}));
+ const r=await s.retryMetadata(w.alice.id,keys[0]!,w.token);assert.equal(r.outcome,'deferred');const after=(await w.store.getLuoguSyncState(w.alice.id))!.value;
+ assert.deepEqual(after.missingMetadata,keys);assert.deepEqual(after.failure,failure);assert.equal(after.metadataIssues?.[0]?.attempts,1000000);assert.equal(after.metadataFailed,1);assert.equal(await w.store.getProblem(keys[0]!),null);
+ }finally{await w.dispose();}
+});
+
+for(const race of ['cancel','takeover','expiry'] as const)void test(`retry ${race} after HTTP commits no problem, snapshot, or dequeue`,async()=>{
+ const w=await createWorld();try{const s=w.makeService('recovery-race');const key=problemKeyOf(w.instance,'P900000001');await seedBacklog(w,w.alice.id,['P900000001']);
+ const cancellation=createCancellationSource();const original=w.metadata.adapter.fetchProblem.bind(w.metadata.adapter);
+ w.metadata.adapter.fetchProblem=async request=>{const answer=await original(request);if(race==='cancel')cancellation.cancel();else if(race==='expiry')w.clock.advance(150000);else{const row=(await w.store.getLuoguSyncState(w.alice.id))!;await w.store.saveLuoguSyncState({...row.value,owner:'foreign-recovery-owner'},row.revision);}return answer;};
+ await assert.rejects(s.retryMetadata(w.alice.id,key,cancellation.token));assert.equal(await w.store.getProblem(key),null);assert.equal(await w.store.getCurrentSnapshotHead({sourceInstanceId:w.instance.id,domain:null,externalKey:'P900000001'}),null);
+ const state=(await w.store.getLuoguSyncState(w.alice.id))!.value;assert.deepEqual(state.missingMetadata,[key]);assert.equal(state.metadataResolved,0);assert.equal(state.metadataFailed,0);if(race==='takeover')assert.equal(state.owner,'foreign-recovery-owner');
+ }finally{await w.dispose();}
+});
+
+void test('retry refuses same and other account live leases before dispatch',async()=>{
+ for(const other of [false,true]){const w=await createWorld();try{const s=w.makeService('recovery-busy');const key=problemKeyOf(w.instance,'P900000001');await seedBacklog(w,w.alice.id,['P900000001'],other?{}:{owner:'other-owner',leaseExpiresAt:new Date(w.clock.nowMs()+120000).toISOString()});if(other)await seedBacklog(w,w.bob.id,[],{owner:'other-owner',leaseExpiresAt:new Date(w.clock.nowMs()+120000).toISOString()});
+ await assert.rejects(s.retryMetadata(w.alice.id,key,w.token),e=>e instanceof LuoguSyncError&&e.code==='busy');assert.deepEqual(w.metadata.calls,[]);
+ }finally{await w.dispose();}}
+});
+
+void test('retry rechecks queued membership after the source gate wait',async()=>{
+ const w=await createWorld();try{const s=w.makeService('recovery-queued');const key=problemKeyOf(w.instance,'P900000001');await seedBacklog(w,w.alice.id,['P900000001']);const parked=parkGate(w);const pending=s.retryMetadata(w.alice.id,key,w.token);await until(()=>parked.parked()===1,'retry to wait');const row=(await w.store.getLuoguSyncState(w.alice.id))!;await w.store.saveLuoguSyncState({...row.value,missingMetadata:[]},row.revision);parked.release();await assert.rejects(pending);assert.deepEqual(w.metadata.calls,[]);assert.equal(await w.store.getProblem(key),null);
+ }finally{await w.dispose();}
+});
+
+void test('a batch failure whose lease expires while its state read waits does not commit diagnostics or rotate the queue',async()=>{
+ const w=await createWorld();try{const s=w.makeService('recovery-failed-commit-clock');const keys=buildProblemKeys(w.instance,['U900000001','P900000002']);await seedBacklog(w,w.alice.id,['U900000001','P900000002']);await s.connect(w.alice.id,cookieFor('100001'),w.token);
+ w.metadata.fail.set('U900000001',new PlatformError({code:'changed_response',operation:'problem',reason:'missing_statement',detail:'synthetic'}));
+ let answered=false,expired=false;const fetch=w.metadata.adapter.fetchProblem.bind(w.metadata.adapter);w.metadata.adapter.fetchProblem=async request=>{try{return await fetch(request);}finally{answered=true;}};
+ const get=w.store.getLuoguSyncState.bind(w.store);w.store.getLuoguSyncState=async id=>{const row=await get(id);if(answered&&!expired&&row?.value.owner==='recovery-failed-commit-clock'){expired=true;w.clock.advance(150000);}return row;};
+ await s.start(w.alice.id,'metadata');await s.settle();assert.equal(expired,true);const state=(await get(w.alice.id))!.value;assert.equal(state.metadataFailed,0);assert.deepEqual(state.metadataIssues??[],[]);assert.deepEqual(state.missingMetadata,keys);assert.deepEqual(w.metadata.calls,['U900000001']);
+ }finally{await w.dispose();}
+});
