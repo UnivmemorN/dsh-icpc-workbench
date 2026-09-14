@@ -4,7 +4,7 @@
 
 
 1. 选择当前账号，进入「题库 → 分平台题库」。可先筛选「已通过」，将每页数量调到 100。
-2. 单题点击该行的「修改」；批量勾选题目，或用「选择本页」「选择本页未标注」，再点「批量修改完成方式」。选择可以跨页保留，每批最多 100 题。
+2. 单题点击该行的「修改」；批量勾选题目，或用表头复选框 /「全选本页」「选择本页未标注」，再点「批量修改完成方式」。选择可以跨页保留，每批最多 100 题。
 3. 选择「独立完成」「使用提示完成」或「参考题解完成」，点击「预览修改」，核对逐题变化后保存。
 
 默认保留已有备注、已确认知识点及参考题解引用。改成「独立完成」时，会在预览中明确列出将清除的参考题解引用数量。完成方式不会改变平台 AC 记录。
@@ -39,11 +39,12 @@ is the full per-problem record form. The pure display/intent rules live in
 - The bank reads completion modes for **the current page only**, with **one** batched
   `retro.list` call (`problemKeys` = the keys of the confirmed `problem.browse` page). There is never
   one detail request per row. Without a selected account, or without rows, no request is sent.
-- `选择本页` / `选择本页未标注` union that page into the existing selection. The union is bounded at
-  **100 keys** (the same bound `retro.list` / `retro.editPreview` / `retro.editApply` accept). If the
-  bound is already full, the UI adds nothing further and states exactly how many visible rows did not
-  fit — nothing is dropped silently. `选择本页未标注` only offers rows whose latest record is `null`,
-  read from the same confirmed batch (never from platform data or an AC verdict).
+- `全选本页` (and the table header checkbox) / `选择本页未标注` union that page into the existing
+  selection; `取消本页` removes only the current page's keys. The union is bounded at **100 keys** (the
+  same bound `retro.list` / `retro.editPreview` / `retro.editApply` accept). If the bound is already
+  full, the UI adds nothing further and states exactly how many visible rows did not fit — nothing is
+  dropped silently, and other pages keep their keys. `选择本页未标注` only offers rows whose latest
+  record is `null`, read from the same confirmed batch (never from platform data or an AC verdict).
 - The editor captures its account and keys when it opens (`key` on the component). An account switch
   remounts the page and therefore closes it; a change of the selection closes an editor that was
   opened from that selection. Either way the in-flight HTTP request is aborted and the preview is
@@ -51,6 +52,27 @@ is the full per-problem record form. The pure display/intent rules live in
   pages the UI has not read.
 - A bulk edit never writes to another account, another source instance, or a mirrored counterpart in
   the merged bank. The merged bank shows a notice pointing back to the single-platform bank.
+
+## Page-selection contract (Sprint 29b)
+
+- `pageSelectionSession(selected, page)` is the one tri-state (`all` / `some` / `unchecked`, and the
+  `ariaChecked` value `true` / `mixed` / `false`) behind the header checkbox, the row checkboxes and
+  both counter lines; `pageSelectAllLabel` names what one click does. `togglePageSelection` unchecks a
+  fully selected page (removing only that page's keys) and otherwise unions the page under the 100
+  bound; `removePageSelection` backs `取消本页`.
+- `pageSelectionGates(pageReady, modesReady, session, selectedTotal, unrecordedCount)` is the one
+  source of the disabled state: `page` gates the header checkbox, the row checkboxes and
+  `全选本页` / `取消本页`; `unrecorded` additionally requires a confirmed completion list with at least
+  one missing record; `selection` gates the actions over the whole cross-page selection.
+  `pageSelectionBlockers` words the reasons. `useRequest` returns the previous same-key answer while a
+  refresh is in flight, so the gates test `pending` (through `pageReady` / `modesReady`) and not only
+  `data !== null`: while `problem.browse` is pending or failed no page action runs and no row checkbox
+  is enabled, and while `retro.list` is pending or failed `选择本页未标注` stays disabled.
+- One `selectionBar(where)` renderer draws both placements: sticky above the table inside the ICPC
+  scroll root, and below the table/pager. Counts, notice and disabled gates are shared, so the two
+  copies cannot diverge. The completion editor sits between the bar and the table; its anchor uses
+  `scroll-margin-top` so the sticky bar never covers the editor title, and `.icpc-bank-table` uses the
+  same margin when the bottom pager scrolls the results back into view.
 
 ## Preview before apply
 
@@ -61,6 +83,13 @@ is the full per-problem record form. The pure display/intent rules live in
   points this edit would add, and how many consulted-solution references an `independent` edit would
   clear;
 - changed / unchanged counts, and the apply button label `修改 N 题` (or `无变化`, disabled).
+
+The current-record table and the per-problem preview table are native `details`/`summary`
+disclosures (Sprint 29c presentation only): a bulk scope (2..100 keys) renders one collapsed summary
+line with its counts, while a one-problem scope opens its single row. The mode select and the
+preview/apply/close buttons therefore stay reachable, and the preview totals, cleared-reference count
+and knowledge warnings stay visible above the collapsed detail. Nothing about the draft, the preview
+intent/hash or any request changes.
 
 Changing the mode or the checked knowledge list changes the intent key, so the preview is shown as
 invalid and cannot be applied; `retro.editApply` is only ever sent with the hash **and the intent

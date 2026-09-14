@@ -4,7 +4,13 @@ import { CompletionEditor } from './CompletionEditor.js';
 import {
   MAX_COMPLETION_EDIT_KEYS,
   completionModeText,
+  pageSelectAllLabel,
+  pageSelectionBlockers,
+  pageSelectionGates,
   pageSelectionNotice,
+  pageSelectionSession,
+  removePageSelection,
+  togglePageSelection,
   unrecordedProblemKeys,
   unionPageSelection,
 } from './completion-view.js';
@@ -175,7 +181,25 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
   const latestModes = new Map(
     (modes.data?.items ?? []).map((entry) => [entry.problemKey, entry.mode] as const),
   );
-  const unrecordedOnPage = modes.data === null ? 0 : unrecordedProblemKeys(modes.data.items).length;
+  /** Keys of the confirmed page whose latest record is missing; empty without a confirmed list. */
+  const unrecordedKeys = modes.data === null ? [] : unrecordedProblemKeys(modes.data.items);
+  // The one tri-state every selection surface reads: row checkboxes, the header checkbox and both
+  // counter lines. `all`/`some`/counts all describe the same confirmed page and the same selection.
+  const pageSession = pageSelectionSession(selectedKeys, pageKeys);
+  // Page-derived actions need a confirmed, settled browse answer; `选择本页未标注` additionally needs
+  // a confirmed, settled completion list, so a refresh or a page switch never acts on old data.
+  const pageReady = !read.pending && read.error === null && data !== null;
+  const modesReady = !modes.pending && modes.error === null && modes.data !== null;
+  // The one disabled state shared by the header checkbox, the row checkboxes and both bars: a pending
+  // or failed read turns every page-derived action off. `useRequest` returns the previous same-key
+  // answer while refreshing, so the gate tests `pending` as well as the confirmed data.
+  const selectionGates = pageSelectionGates(
+    pageReady,
+    modesReady,
+    pageSession,
+    selectedKeys.length,
+    unrecordedKeys.length,
+  );
   /** The scope one open editor owns; captured so a later page or account change cannot reach it. */
   const [editor, setEditor] = useState<{
     accountId: string;
@@ -187,9 +211,14 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
   /** Bumped after a successful completion edit so the open problem detail re-reads its record. */
   const [detailVersion, setDetailVersion] = useState(0);
   const editorAnchor = useRef<HTMLDivElement | null>(null);
+  const selectionBarAnchor = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (editor !== null) {
-      editorAnchor.current?.scrollIntoView({ block: 'start' });
+      if (editorAnchor.current !== null) {
+        // The toolbar wraps at narrow widths; use its actual height when revealing the editor.
+        editorAnchor.current.style.scrollMarginTop = ((selectionBarAnchor.current?.getBoundingClientRect().height ?? 0) + 12) + 'px';
+        editorAnchor.current.scrollIntoView({ block: 'start' });
+      }
     }
   }, [editor]);
 
@@ -253,7 +282,9 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
 
   function toggle(key: string): void {
     setSelectedKeys(
-      selectedKeys.includes(key) ? selectedKeys.filter((entry) => entry !== key) : [...selectedKeys, key],
+      selectedKeys.includes(key)
+        ? [...removePageSelection(selectedKeys, [key])]
+        : [...unionPageSelection(selectedKeys, [key]).keys],
     );
     setSelectionNotice(null);
   }
@@ -272,20 +303,38 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
    * The union is bounded at 100 and reports how many visible rows did not fit, so a full selection
    * never drops rows silently. The `未标注` set comes only from the confirmed batched list read.
    */
-  function selectPage(unrecordedOnly: boolean): void {
-    const page = unrecordedOnly
-      ? unrecordedProblemKeys(modes.data?.items ?? [])
-      : (data?.items ?? []).map((problem) => problem.problemKey);
-    if (page.length === 0) {
-      setSelectionNotice(unrecordedOnly ? '本页没有“未标注”完成方式的题目。' : '当前页没有可选择的题目。');
+  function selectPage(keys: readonly string[], what: string): void {
+    if (keys.length === 0) {
+      setSelectionNotice(`本页没有${what}。`);
       return;
     }
-    const outcome = unionPageSelection(selectedKeys, page);
+    const outcome = unionPageSelection(selectedKeys, keys);
     setSelectedKeys([...outcome.keys]);
     setSelectionNotice(
       pageSelectionNotice(outcome) ??
-        (outcome.added === 0 ? '本页题目都已在选择中。' : `已加入 ${outcome.added} 题（来自本页）。`),
+        (outcome.added === 0 ? `${what}都已在选择中。` : `已加入 ${outcome.added} 题（来自本页）。`),
     );
+  }
+
+  /**
+   * The header checkbox: fully selected removes only this page's keys (other pages keep theirs),
+   * every other state unions the page under the bound and states the rows that did not fit.
+   */
+  function toggleWholePage(): void {
+    const outcome = togglePageSelection(selectedKeys, pageKeys);
+    setSelectedKeys([...outcome.keys]);
+    setSelectionNotice(
+      outcome.removed
+        ? `已从选择中移除本页 ${pageSession.totalCount} 题，其他页已选 ${outcome.keys.length} 题保持不变。`
+        : (pageSelectionNotice(outcome) ??
+            (outcome.added === 0 ? '本页题目都已在选择中。' : `已加入 ${outcome.added} 题（来自本页）。`)),
+    );
+  }
+
+  function removeCurrentPage(): void {
+    const keys = [...removePageSelection(selectedKeys, pageKeys)];
+    setSelectedKeys(keys);
+    setSelectionNotice(`已取消本页选择，其他页已选 ${keys.length} 题保持不变。`);
   }
 
   function clearSelection(): void {
@@ -303,6 +352,95 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
     }
     goTo(target, from);
     setJump('');
+  }
+
+  /**
+   * The one selection action bar, rendered above the table (sticky) and again below it.
+   *
+   * Both placements share this renderer, so the action set, the counts, the notices and the disabled
+   * gates are single-sourced: nothing can diverge between the top and bottom copies. Every gate comes
+   * from the confirmed page and the confirmed completion list; while a browse read is pending or
+   * failed, no page-derived action runs and no row can be added. The notice appears in both
+   * placements, so feedback from a bottom click stays where the user is looking while the top copy
+   * remains reachable under the sticky bar.
+   */
+  function selectionBar(where: 'top' | 'bottom') {
+    const blockers = [...pageSelectionBlockers(pageReady, pageSession.totalCount, accountId === null || modesReady)];
+    if (accountId === null) blockers.push('选择账号后可批量标注完成方式。');
+    const top = where === 'top';
+    return (
+      <div
+        className={top ? 'icpc-selection-bar' : 'icpc-selection-bar icpc-selection-bar-bottom'}
+        id={top ? 'icpc-bank-selection' : undefined}
+        ref={top ? selectionBarAnchor : undefined}
+        role="group"
+        aria-label={top ? '题库批量操作（顶部）' : '题库批量操作（底部）'}
+      >
+        <span className="icpc-muted icpc-selection-count">
+          {pageReady ? '本页已选 ' + pageSession.selectedCount + ' / ' + pageSession.totalCount + ' 题' : '本页尚未读取'} · 已选择 {selectedKeys.length} /{' '}
+          {MAX_COMPLETION_EDIT_KEYS} 题（跨页保留）
+        </span>
+        <span className="icpc-muted icpc-selection-scope">
+          “本页”只指当前列表页，不会自动选中其他筛选页；批量修改完成方式只写入当前账号与所选题目。
+        </span>
+        <span className="icpc-selection-actions">
+          <button
+            type="button"
+            disabled={!selectionGates.page}
+            aria-pressed={pageSession.all}
+            onClick={toggleWholePage}
+          >
+            {pageSession.all ? '取消全选本页' : '全选本页'}
+          </button>
+          <button
+            type="button"
+            disabled={!selectionGates.page || pageSession.selectedCount === 0}
+            onClick={removeCurrentPage}
+          >
+            取消本页
+          </button>
+          <button
+            type="button"
+            disabled={!selectionGates.unrecorded}
+            title={modesReady ? undefined : blockers.join(' ')}
+            onClick={() => selectPage(unrecordedKeys, '最新记录为“未标注”的题目')}
+          >
+            选择本页未标注
+          </button>
+          <button type="button" disabled={!selectionGates.selection} onClick={clearSelection}>
+            清空选择
+          </button>
+          <button
+            type="button"
+            className="icpc-primary"
+            disabled={!accountId || !selectionGates.selection}
+            onClick={() => openEditor(selectedKeys, true)}
+          >
+            批量修改完成方式
+          </button>
+          <button type="button" disabled={!selectionGates.selection} onClick={() => navigate('review')}>
+            准备标签分析
+          </button>
+          <button
+            type="button"
+            disabled={!accountId || !selectionGates.selection}
+            onClick={() => navigate('plans')}
+          >
+            作为计划候选题
+          </button>
+        </span>
+        {selectionNotice !== null && (
+          <span className="icpc-muted icpc-selection-notice" role={top ? 'status' : undefined}>
+            {selectionNotice}
+          </span>
+        )}
+        {top && blockers.length > 0 && (
+          <span className="icpc-muted icpc-selection-blockers" id="icpc-bank-selection-blockers" role="status">
+            {blockers.join(' ')}
+          </span>
+        )}
+      </div>
+    );
   }
 
   /** One pager; top and bottom share it but carry distinct accessible labels. */
@@ -588,6 +726,24 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
       >
         <ErrorNotice error={read.error} />
         {read.error === null && pager('top')}
+        {selectionBar('top')}
+        {editor !== null && (
+          <div className="icpc-completion-editor-anchor" ref={editorAnchor}>
+            <CompletionEditor
+              key={editor.accountId + '|' + editor.keys.join('\u0000')}
+              accountId={editor.accountId}
+              problemKeys={editor.keys}
+              onClose={() => setEditor(null)}
+              onApplied={() => {
+                // Refresh the page's own completion column and the open detail; bootstrap carries no
+                // completion record, so it is not re-read.
+                read.refresh();
+                modes.refresh();
+                setDetailVersion((value) => value + 1);
+              }}
+            />
+          </div>
+        )}
         {read.pending && data !== null && (
           <p className="icpc-muted" role="status">
             正在刷新…
@@ -606,7 +762,22 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
           <table>
             <thead>
               <tr>
-                <th>选择</th>
+                <th>
+                  <input
+                    type="checkbox"
+                    aria-label={pageSelectAllLabel(pageSession)}
+                    aria-checked={pageSession.ariaChecked}
+                    checked={pageSession.all}
+                    ref={(node) => {
+                      // The native third state, kept in step with `aria-checked` on the same input.
+                      if (node !== null) {
+                        node.indeterminate = pageSession.some;
+                      }
+                    }}
+                    disabled={!selectionGates.page}
+                    onChange={toggleWholePage}
+                  />
+                </th>
                 <th>题目</th>
                 <th>平台难度</th>
                 <th>完成方式</th>
@@ -621,7 +792,11 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
                       type="checkbox"
                       aria-label={'选择 ' + problem.externalKey}
                       checked={selectedKeys.includes(problem.problemKey)}
-                      disabled={!selectedKeys.includes(problem.problemKey) && selectedKeys.length >= 100}
+                      disabled={
+                        !selectionGates.page ||
+                        (!selectedKeys.includes(problem.problemKey) &&
+                          selectedKeys.length >= MAX_COMPLETION_EDIT_KEYS)
+                      }
                       onChange={() => toggle(problem.problemKey)}
                     />
                   </td>
@@ -677,76 +852,8 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
           </div>
         )}
         {read.error === null && pager('bottom')}
-        <div className="icpc-actions">
-          <span className="icpc-muted">
-            已选择 {selectedKeys.length} / {MAX_COMPLETION_EDIT_KEYS} 题
-          </span>
-          <button
-            type="button"
-            disabled={read.pending || (data?.items.length ?? 0) === 0}
-            onClick={() => selectPage(false)}
-          >
-            选择本页
-          </button>
-          <button
-            type="button"
-            disabled={accountId === null || modes.data === null || unrecordedOnPage === 0}
-            onClick={() => selectPage(true)}
-          >
-            选择本页未标注
-          </button>
-          <button type="button" disabled={!selectedKeys.length} onClick={clearSelection}>
-            清空
-          </button>
-          <button
-            type="button"
-            disabled={accountId === null || selectedKeys.length === 0}
-            onClick={() => openEditor(selectedKeys, true)}
-          >
-            批量修改完成方式
-          </button>
-          <button
-            type="button"
-            className="icpc-primary"
-            disabled={!selectedKeys.length}
-            onClick={() => navigate('review')}
-          >
-            准备标签分析
-          </button>
-          <button
-            type="button"
-            disabled={!accountId || !selectedKeys.length}
-            onClick={() => navigate('plans')}
-          >
-            作为计划候选题
-          </button>
-        </div>
-        <p className="icpc-muted">
-          “本页”只指当前列表页；选择会跨页保留（最多 {MAX_COMPLETION_EDIT_KEYS} 题）。批量修改完成方式只写入当前账号与所选题目。
-        </p>
-        {selectionNotice !== null && (
-          <p className="icpc-muted" role="status">
-            {selectionNotice}
-          </p>
-        )}
+        {selectionBar('bottom')}
       </Panel>
-      {editor !== null && (
-        <div className="icpc-completion-editor-anchor" ref={editorAnchor}>
-          <CompletionEditor
-            key={editor.accountId + '|' + editor.keys.join('\u0000')}
-            accountId={editor.accountId}
-            problemKeys={editor.keys}
-            onClose={() => setEditor(null)}
-            onApplied={() => {
-              // Refresh the page's own completion column and the open detail; bootstrap carries no
-              // completion record, so it is not re-read.
-              read.refresh();
-              modes.refresh();
-              setDetailVersion((value) => value + 1);
-            }}
-          />
-        </div>
-      )}
       {problemKey ? (
         <ProblemView
           key={problemKey + '|' + accountId + '|' + detailVersion}

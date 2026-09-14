@@ -270,4 +270,25 @@ ${katexCss}
 .icpc-luogu-supplement{margin-top:6px;padding:10px 12px;border:1px solid var(--icpc-line);border-radius:8px;background:var(--icpc-soft);display:flex;flex-direction:column;gap:8px;min-width:0}
 .icpc-luogu-supplement form{display:flex;flex-direction:column;gap:8px;min-width:0}
 @media(max-width:640px){.icpc-luogu-backlog>li{padding:8px 10px}.icpc-luogu-backlog-pager span.icpc-muted{margin-left:0}}
+/* Sprint 29b: one shared selection bar above (sticky) and below the table. Only the bank selection
+   classes are touched; the sticky copy lives inside the ICPC scroll root, keeps an opaque background
+   so rows pass underneath it, and the editor/results scroll-margins keep content below it. */
+.icpc-selection-bar{position:sticky;top:0;z-index:6;display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin:0 0 8px;padding:8px 0;background:var(--icpc-card);border-bottom:1px solid var(--icpc-line)}
+.icpc-selection-bar-bottom{position:static;margin:8px 0 0;padding-bottom:0;border-bottom:0;border-top:1px solid var(--icpc-line)}
+.icpc-selection-count{font-variant-numeric:tabular-nums;white-space:nowrap}
+.icpc-selection-scope,.icpc-selection-notice,.icpc-selection-blockers{flex:1 1 260px;min-width:0;font-size:12px;overflow-wrap:anywhere}
+.icpc-selection-actions{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+.icpc-completion-editor-anchor{scroll-margin-top:88px}
+.icpc-bank-table{scroll-margin-top:88px}
+@media(max-width:900px){.icpc-selection-actions{width:100%}.icpc-selection-count{white-space:normal}}
+@media(max-width:640px){.icpc-completion-editor-anchor,.icpc-bank-table{scroll-margin-top:150px}}
+/* Sprint 29c: the completion editor keeps its controls reachable. The current-record table and the
+   per-problem preview table are native disclosures: a bulk scope (up to 100 keys) shows one summary
+   line with counts instead of 100 rows, so the mode select and the preview/apply/close buttons stay
+   near the top; a one-problem scope opens its single row. Presentation only — no state or request
+   rule is involved. Only the two new classes are selected, so other tables are untouched. */
+.icpc-completion-records,.icpc-completion-preview-rows{min-width:0}
+.icpc-completion-records>summary,.icpc-completion-preview-rows>summary{cursor:pointer;font-weight:600;font-size:13px;color:var(--icpc-ink);padding:4px 0;overflow-wrap:anywhere}
+.icpc-completion-records[open]>summary,.icpc-completion-preview-rows[open]>summary{margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--icpc-line)}
+.icpc-completion-records .icpc-table-wrap,.icpc-completion-preview-rows .icpc-table-wrap{margin-top:8px}
 `;

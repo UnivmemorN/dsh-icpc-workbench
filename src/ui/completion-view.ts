@@ -2,8 +2,9 @@
  * Pure view rules for per-problem and bulk completion editing (Sprint Contract 23b).
  *
  * Every decision the completion UI renders or sends lives here: mode labels, the honest `未标注`
- * reading of a missing record, the bounded page-selection union, draft validation, the explicit
- * knowledge intent, preview freshness and the redaction-safe retrospective form state. The module
+ * reading of a missing record, the bounded page-selection union and its whole-page tri-state toggle,
+ * the readiness of page-derived actions, draft validation, the explicit knowledge intent, preview
+ * freshness and the redaction-safe retrospective form state. The module
  * imports no React and performs no IO, so the rules are exercised directly by focused tests.
  *
  * It never promotes a platform label, raw tag or AI suggestion: the only knowledge source is the
@@ -106,6 +107,145 @@ export function pageSelectionNotice(
     return null;
   }
   return `已达 ${bound} 题上限：本页另有 ${outcome.skipped} 题未加入选择，请先取消部分已选题目再重试。`;
+}
+
+/**
+ * One derivable fact about one explicit list of row keys (the confirmed current page).
+ *
+ * `ariaChecked` is the exact attribute value a native checkbox must carry: `true`/`false` plus the
+ * `'mixed'` third state, which {@link pageSelectAllCheckbox} derives from the same tri-state.
+ */
+export interface PageSelectionSession {
+  readonly all: boolean;
+  readonly some: boolean;
+  readonly ariaChecked: 'true' | 'false' | 'mixed';
+  readonly unchecked: boolean;
+  readonly selectedCount: number;
+  readonly totalCount: number;
+}
+
+/** The tri-state of one explicit key list; the one source of truth for row, header and counters. */
+export function pageSelectionSession(
+  selected: readonly string[],
+  page: readonly string[],
+): PageSelectionSession {
+  const chosen = new Set(selected);
+  const selectedCount = page.filter((key) => chosen.has(key)).length;
+  const totalCount = page.length;
+  const all = totalCount > 0 && selectedCount === totalCount;
+  const some = selectedCount > 0 && !all;
+  return {
+    all,
+    some,
+    ariaChecked: all ? 'true' : some ? 'mixed' : 'false',
+    unchecked: selectedCount === 0,
+    selectedCount,
+    totalCount,
+  };
+}
+
+/** Honest accessible name of the header checkbox: it says what one click will actually do. */
+export function pageSelectAllLabel(session: PageSelectionSession): string {
+  if (session.totalCount === 0) {
+    return '全选本页题目（当前页没有题目）';
+  }
+  if (session.all) {
+    return `取消选择本页 ${session.totalCount} 题（不影响其他页已选）`;
+  }
+  return `全选本页题目（本页已选 ${session.selectedCount} / ${session.totalCount}）`;
+}
+
+/** The current page minus the selected keys, in page order; other pages are never in the answer. */
+export function removePageSelection(
+  selected: readonly string[],
+  page: readonly string[],
+  bound: number = MAX_COMPLETION_EDIT_KEYS,
+): readonly string[] {
+  const dropped = new Set(page);
+  return selected.filter((key) => !dropped.has(key)).slice(0, bound);
+}
+
+/** The next selection after clicking 全选本页题目: remove the part of the page that is selected. */
+export interface PageToggleOutcome {
+  readonly keys: readonly string[];
+  /** True when the click unchecked the fully selected page instead of adding to the selection. */
+  readonly removed: boolean;
+  readonly added: number;
+  readonly skipped: number;
+}
+
+/**
+ * Toggle one whole page: a fully selected page is removed from the selection on its own, while any
+ * other state unions the page under the bound and reports the rows that did not fit.
+ */
+export function togglePageSelection(
+  selected: readonly string[],
+  page: readonly string[],
+  bound: number = MAX_COMPLETION_EDIT_KEYS,
+): PageToggleOutcome {
+  const session = pageSelectionSession(selected, page);
+  if (session.all) {
+    return { keys: removePageSelection(selected, page, bound), removed: true, added: 0, skipped: 0 };
+  }
+  const outcome = unionPageSelection(selected, page, bound);
+  return { keys: outcome.keys, removed: false, added: outcome.added, skipped: outcome.skipped };
+}
+
+/**
+ * Every honest reason a page-derived selection action cannot run right now.
+ *
+ * An empty answer means "ready": a confirmed, non-pending, error-free browse answer backed by a
+ * confirmed completion list. Nothing here falls back to old page or mode data during a refresh or a
+ * page switch, and a failed completion read never lets `选择本页未标注` guess.
+ */
+export function pageSelectionBlockers(
+  pageReady: boolean,
+  pageCount: number,
+  modesReady: boolean,
+): readonly string[] {
+  const blockers: string[] = [];
+  if (pageReady && pageCount === 0) {
+    blockers.push('当前页没有可选择的题目。');
+  }
+  if (!pageReady) {
+    blockers.push('当前页题目尚未就绪，暂不能更改本页选择。');
+  }
+  if (pageReady && pageCount > 0 && !modesReady) {
+    blockers.push('完成方式读取中或读取失败：暂不能选择“未标注”题目，可先重试读取完成方式。');
+  }
+  return blockers;
+}
+
+/**
+ * The disabled state of every page-selection surface, derived from the confirmed reads.
+ *
+ * `page` covers the header checkbox, the row checkboxes and `全选本页`/`取消本页`: all of them act on
+ * the current page and need a confirmed, settled `problem.browse` answer. `unrecorded` additionally
+ * needs a confirmed, settled completion list with at least one missing record. `selection` covers the
+ * actions over the whole cross-page selection and does not depend on the current page.
+ *
+ * `useRequest` keeps the previous same-key answer while a refresh is in flight, so `pageReady` and
+ * `modesReady` (which test `pending`) must be passed in rather than derived from `data !== null`.
+ */
+export interface PageSelectionGates {
+  readonly page: boolean;
+  readonly unrecorded: boolean;
+  readonly selection: boolean;
+}
+
+/** The one source of truth for the disabled state of the selection controls. */
+export function pageSelectionGates(
+  pageReady: boolean,
+  modesReady: boolean,
+  session: PageSelectionSession,
+  selectedTotal: number,
+  unrecordedCount: number,
+): PageSelectionGates {
+  return {
+    page: pageReady && session.totalCount > 0,
+    unrecorded: pageReady && modesReady && unrecordedCount > 0,
+    selection: selectedTotal > 0,
+  };
 }
 
 /** Problem keys of the current page whose latest record is missing (`mode === null`). */

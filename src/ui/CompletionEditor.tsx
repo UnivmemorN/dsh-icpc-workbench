@@ -11,6 +11,11 @@
  * of that exact preview. Editing the draft changes the intent key, which invalidates the preview, so
  * an old hash can never be sent with a new draft. Applying uses the intent captured at preview time.
  * No platform request, no model call and no AC mutation happens anywhere in this file.
+ *
+ * Presentation only (Sprint 29c): the current-record table and the preview's per-problem table are
+ * native `details`/`summary` disclosures. A bulk scope (up to 100 keys) starts collapsed so the mode
+ * select and the preview/apply/close buttons stay reachable; a one-problem scope opens its single
+ * row. Collapsing changes no state, no request and no preview hash.
  */
 import { useEffect, useRef, useState } from 'react';
 import type {
@@ -205,6 +210,12 @@ export function CompletionEditor({
 
   const accountLabel = accountLabelOf(scope.accountId, boot.accounts, boot.sources);
   const listPending = read.pending && read.data === null;
+  /**
+   * Presentation only (Sprint 29c): a one-problem scope opens its single-row disclosures, while a
+   * bulk scope keeps them collapsed so 100 rows cannot push the controls out of reach. Nothing here
+   * touches the draft, the preview or the apply hash.
+   */
+  const singleProblem = scope.problemKeys.length === 1;
 
   return (
     <section className="icpc-completion-editor" aria-label="完成方式编辑器">
@@ -226,28 +237,31 @@ export function CompletionEditor({
       ) : read.data === null ? (
         <p className="icpc-muted">未能读取这些题目的完成方式；仍可直接预览，但看不到当前值。</p>
       ) : (
-        <div className="icpc-table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>题目</th>
-                <th>当前完成方式</th>
-                <th>最近记录</th>
-              </tr>
-            </thead>
-            <tbody>
-              {read.data.items.map((entry) => (
-                <tr key={entry.problemKey}>
-                  <td>{entry.title}</td>
-                  <td>{completionModeText(entry.mode)}</td>
-                  <td className="icpc-muted">
-                    {entry.recordedAt === null ? '无记录' : new Date(entry.recordedAt).toLocaleString()}
-                  </td>
+        <details className="icpc-completion-records" open={singleProblem}>
+          <summary>当前完成方式（共 {read.data.items.length} 题）· 可展开逐题核对</summary>
+          <div className="icpc-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>题目</th>
+                  <th>当前完成方式</th>
+                  <th>最近记录</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {read.data.items.map((entry) => (
+                  <tr key={entry.problemKey}>
+                    <td>{entry.title}</td>
+                    <td>{completionModeText(entry.mode)}</td>
+                    <td className="icpc-muted">
+                      {entry.recordedAt === null ? '无记录' : new Date(entry.recordedAt).toLocaleString()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
       )}
 
       <label>
@@ -346,7 +360,7 @@ export function CompletionEditor({
           {totals.addedSkillCount > 0 && (
             <p>
               共同选择的知识点逐题补齐；已存在的不重复添加。本次补充涉及 {totals.addedSkillCount} 个知识点、共{' '}
-              {totals.addedSkillTotal} 处（逐题见下表）：
+              {totals.addedSkillTotal} 处（逐题明细见下）：
               {knowledgeNames(
                 [...new Set(preview.result.items.flatMap((item) => item.addedTaxonomyIds))],
                 nodes,
@@ -355,37 +369,42 @@ export function CompletionEditor({
             </p>
           )}
           {totals.clearedSolutionTotal > 0 && (
-            <p>选择“独立完成”会清除 {totals.clearedSolutionTotal} 条已咨询题解引用（下面逐题列出）。</p>
+            <p>选择“独立完成”会清除 {totals.clearedSolutionTotal} 条已咨询题解引用（逐题明细见下）。</p>
           )}
-          <div className="icpc-table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>题目</th>
-                  <th>原完成方式</th>
-                  <th>新完成方式</th>
-                  <th>已有知识点</th>
-                  <th>本次补充</th>
-                  <th>清除题解引用</th>
-                </tr>
-              </thead>
-              <tbody>
-                {preview.result.items.map((item) => (
-                  <tr key={item.problemKey}>
-                    <td>
-                      {item.title}
-                      {!item.changed && <span className="icpc-tag">无变化</span>}
-                    </td>
-                    <td>{completionModeText(item.previousMode)}</td>
-                    <td>{completionModeText(item.nextMode)}</td>
-                    <td>{item.existingTaxonomyCount}</td>
-                    <td>{knowledgeNames(item.addedTaxonomyIds, nodes).join('、') || '—'}</td>
-                    <td>{item.clearedSolutionCount}</td>
+          <details className="icpc-completion-preview-rows" open={singleProblem}>
+            <summary>
+              逐题明细（共 {preview.result.items.length} 题：{totals.changedCount} 题会改变、{totals.unchangedCount} 题无变化）
+            </summary>
+            <div className="icpc-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>题目</th>
+                    <th>原完成方式</th>
+                    <th>新完成方式</th>
+                    <th>已有知识点</th>
+                    <th>本次补充</th>
+                    <th>清除题解引用</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {preview.result.items.map((item) => (
+                    <tr key={item.problemKey}>
+                      <td>
+                        {item.title}
+                        {!item.changed && <span className="icpc-tag">无变化</span>}
+                      </td>
+                      <td>{completionModeText(item.previousMode)}</td>
+                      <td>{completionModeText(item.nextMode)}</td>
+                      <td>{item.existingTaxonomyCount}</td>
+                      <td>{knowledgeNames(item.addedTaxonomyIds, nodes).join('、') || '—'}</td>
+                      <td>{item.clearedSolutionCount}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
           <p className="icpc-muted">{COMPLETION_AC_NOTE}</p>
         </div>
       )}

@@ -2,10 +2,10 @@
  * Completion-editing view rules (Sprint Contract 23b).
  *
  * These are the pure decisions the per-problem and bulk completion editor renders or sends: the
- * honest `未标注` reading, the bounded page-selection union, draft/intent validation, preview
- * invalidation, the conflict guard, the redaction-safe retrospective prefill and the knowledge
- * picker. No DOM and no API client is involved, so the UI contract is exercised directly instead of
- * through a rendered snapshot.
+ * honest `未标注` reading, the bounded page-selection union with its header tri-state and readiness
+ * gates, draft/intent validation, preview invalidation, the conflict guard, the redaction-safe
+ * retrospective prefill and the knowledge picker. No DOM and no API client is involved, so the UI
+ * contract is exercised directly instead of through a rendered snapshot.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -29,10 +29,16 @@ import {
   knowledgeApplySummary,
   knowledgeNames,
   knowledgeOptions,
+  pageSelectAllLabel,
+  pageSelectionBlockers,
+  pageSelectionGates,
   pageSelectionNotice,
+  pageSelectionSession,
   parseCompletionMode,
+  removePageSelection,
   retrospectiveFormKey,
   retrospectiveFormState,
+  togglePageSelection,
   unrecordedProblemKeys,
   unionPageSelection,
   type CompletionDraft,
@@ -121,6 +127,105 @@ test('page selection unions under 100 and reports skipped rows instead of droppi
   assert.equal(overlap.added, 1);
   assert.equal(overlap.skipped, 0);
   assert.equal(pageSelectionNotice(overlap), null);
+});
+
+test('the header tri-state is unchecked for an empty page, mixed for a partial page and checked when full', () => {
+  const empty = pageSelectionSession([], []);
+  assert.deepEqual(
+    { all: empty.all, some: empty.some, unchecked: empty.unchecked, ariaChecked: empty.ariaChecked },
+    { all: false, some: false, unchecked: true, ariaChecked: 'false' },
+  );
+  assert.equal(empty.selectedCount, 0);
+  assert.equal(empty.totalCount, 0);
+  assert.match(pageSelectAllLabel(empty), /当前页没有题目/);
+
+  const partial = pageSelectionSession(['p1'], ['p1', 'p2', 'p3']);
+  assert.equal(partial.all, false);
+  assert.equal(partial.some, true);
+  assert.equal(partial.unchecked, false);
+  assert.equal(partial.ariaChecked, 'mixed');
+  assert.equal(partial.selectedCount, 1);
+  assert.equal(partial.totalCount, 3);
+  assert.match(pageSelectAllLabel(partial), /本页已选 1 \/ 3/);
+
+  const full = pageSelectionSession(['p3', 'p1', 'p2'], ['p1', 'p2', 'p3']);
+  assert.equal(full.all, true);
+  assert.equal(full.some, false);
+  assert.equal(full.ariaChecked, 'true');
+  assert.equal(full.unchecked, false);
+  assert.match(pageSelectAllLabel(full), /取消选择本页 3 题（不影响其他页已选）/);
+});
+
+test('clicking a fully selected page deselects only that page and keeps other pages', () => {
+  const outcome = togglePageSelection(['a', 'p1', 'p2', 'b'], ['p1', 'p2']);
+  assert.equal(outcome.removed, true);
+  assert.equal(outcome.added, 0);
+  assert.equal(outcome.skipped, 0);
+  assert.deepEqual(outcome.keys, ['a', 'b']);
+  assert.deepEqual(removePageSelection(['a', 'p1', 'b', 'p2'], ['p1', 'p2']), ['a', 'b']);
+});
+
+test('a partially selected page is unioned after the existing cross-page selection', () => {
+  const outcome = togglePageSelection(['other'], ['p1', 'p2']);
+  assert.equal(outcome.removed, false);
+  assert.equal(outcome.added, 2);
+  assert.equal(outcome.skipped, 0);
+  assert.deepEqual(outcome.keys, ['other', 'p1', 'p2']);
+  // A page key already selected counts as neither added nor skipped, and never repeats.
+  const overlap = togglePageSelection(['p2', 'other'], ['p1', 'p2']);
+  assert.deepEqual(overlap.keys, ['p2', 'other', 'p1']);
+  assert.equal(overlap.added, 1);
+  assert.equal(overlap.skipped, 0);
+});
+
+test('the 100-key cap keeps other pages whole, never duplicates a key and counts what did not fit', () => {
+  const selected = Array.from({ length: MAX_COMPLETION_EDIT_KEYS }, (_, index) => 's' + index);
+  const full = togglePageSelection(selected, ['p1', 'p2']);
+  assert.equal(full.removed, false);
+  assert.equal(full.added, 0);
+  assert.equal(full.skipped, 2);
+  assert.equal(full.keys.length, MAX_COMPLETION_EDIT_KEYS);
+  assert.deepEqual(full.keys, selected);
+  assert.match(pageSelectionNotice(full) ?? '', /另有 2 题未加入选择/);
+
+  // A duplicate page key at the cap is neither an addition nor a silent drop.
+  const duplicate = togglePageSelection(selected, ['s0', 'p1']);
+  assert.deepEqual(duplicate.keys, selected);
+  assert.equal(duplicate.added, 0);
+  assert.equal(duplicate.skipped, 1);
+  assert.equal(new Set(duplicate.keys).size, duplicate.keys.length);
+});
+
+test('pending or failed reads gate page actions while the cross-page selection stays actionable', () => {
+  const session = pageSelectionSession(['p1'], ['p1', 'p2']);
+  // A refresh keeps the previous same-key answer; `pending` must close the gates anyway.
+  assert.deepEqual(pageSelectionGates(false, false, session, 1, 1), {
+    page: false,
+    unrecorded: false,
+    selection: true,
+  });
+  // A confirmed page with a failed completion read allows page actions but not 未标注.
+  assert.deepEqual(pageSelectionGates(true, false, session, 1, 1), {
+    page: true,
+    unrecorded: false,
+    selection: true,
+  });
+  // An empty page never enables page actions; an empty selection disables the selection actions.
+  assert.equal(pageSelectionGates(true, true, pageSelectionSession([], []), 3, 0).page, false);
+  assert.equal(pageSelectionGates(true, true, session, 0, 1).selection, false);
+  assert.deepEqual(pageSelectionGates(true, true, session, 2, 1), {
+    page: true,
+    unrecorded: true,
+    selection: true,
+  });
+});
+
+test('the blocker copy names the read that is still missing', () => {
+  assert.deepEqual(pageSelectionBlockers(true, 2, true), []);
+  assert.match(pageSelectionBlockers(false, 2, true).join(' '), /当前页题目尚未就绪/);
+  assert.match(pageSelectionBlockers(true, 2, false).join(' '), /完成方式读取中或读取失败/);
+  // A confirmed empty page states that there is nothing to select instead of pretending readiness.
+  assert.match(pageSelectionBlockers(true, 0, false).join(' '), /当前页没有可选择的题目/);
 });
 
 test('only records with a null mode count as 未标注 for the 选择本页未标注 action', () => {
