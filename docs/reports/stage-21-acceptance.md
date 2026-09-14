@@ -18,6 +18,6 @@ DeepSeek Harness Flash / max implemented the UI changes and focused tests. The c
 - Browser acceptance: existing ID-only records display names without reimport; collapsed details retain exact raw IDs and linked dictionary/date; platform statistics show readable names, including 动态规划 DP and 贪心; source-mapping diagnostics retain IDs and their prior relation while adding names. Anonymous problem detail still hides tags until explicit reveal. The original selected account was restored.
 - Training candidate rendering was reviewed with the shared label helper and existing spoiler gate; no paid plan generation or new account-history import was performed for this display change.
 - Coordinator polish: put table provenance on a separate small-text line and shorten the platform-table explanation.
-- Public CI: pending publication.
+- Published implementation: `d4b462c680e9cc3fc00eabc1b54c4c2264a2cc7a`. The [GitHub verification run](https://github.com/UnivmemorN/dsh-icpc-workbench/actions/runs/34809391398) records the Windows/Ubuntu × Node 22/24 results for this implementation; later documentation-only commits do not change the installed distribution.
 
 This report contains aggregate checks and public metadata only; local account records, database backups, credentials and runtime logs are excluded.
