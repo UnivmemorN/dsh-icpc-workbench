@@ -13,6 +13,8 @@ import {
  planningRunNote,planningStatusLabel,planningUsageText,shouldPollPlanning,trackedForAccount,validateAiDraft,validateRuleDraft,
  type CandidateScope,type PlanningDraft,type PlanningMode,type RuleDraft,type TrackedPlanningRequest,
 } from './planning-view.js';
+import {accountRawTagSource,rawTagListView,LUOGU_TAG_DICTIONARY_CAVEAT} from './raw-tag-view.js';
+import {LUOGU_TAG_DICTIONARY_ENTRY_COUNT,LUOGU_TAG_DICTIONARY_RETRIEVED_AT,LUOGU_TAG_DICTIONARY_SOURCE_URL} from './luogu-tag-dictionary.js';
 const kinds={solve:'做题',review:'复习',upskill:'专题提高'} as const;
 function PlanTask({task,plan,onChange}:{task:WorkbenchPlanTaskView;plan:WorkbenchPlanView;onChange:()=>void}){
  const {accountId,boot,navigate}=useWorkbench(),action=useAction(),[editing,setEditing]=useState(false),[day,setDay]=useState(task.day),[minutes,setMinutes]=useState(task.minutes),[kind,setKind]=useState(task.kind);
@@ -42,6 +44,9 @@ function PlanningFailure({error}:{error:unknown}){
  */
 export function Plans(){
  const {accountId,selectedKeys,navigate,boot}=useWorkbench(),action=useAction();
+ // Candidate raw tags belong to the selected account's own source instance (a preparation is always
+ // built from that account), resolved through the boot catalog — never through a parsed problem key.
+ const rawTagSource=accountRawTagSource(accountId,boot.accounts,boot.sources);
  const guidance=useGuidance('plan',accountId);
  const [mode,setMode]=useState<PlanningMode>(DEFAULT_PLANNING_MODE);
  const [reveal,setReveal]=useState(false);
@@ -193,12 +198,12 @@ export function Plans(){
     <summary>实际候选题（{view.candidates.length} 道）</summary>
     {view.candidates.length===0?<Empty>准备中没有可用的真实候选题。</Empty>:<div className="icpc-table-wrap"><table className="icpc-plan-candidates">
      <thead><tr><th>题目</th><th>预计分钟</th><th>原生难度</th>{view.spoilersVisible&&<th>临时标签（未复核）</th>}</tr></thead>
-     <tbody>{view.candidates.map(c=><tr key={c.candidateId}>
+     <tbody>{view.candidates.map(c=>{const rawTags=rawTagListView(c.provisionalRawTags,rawTagSource);return <tr key={c.candidateId}>
       <td><button type="button" onClick={()=>navigate('bank',c.problemKey)}>{c.title}</button><span className="icpc-muted">{c.externalKey}</span><ExternalLink href={c.url}>原题</ExternalLink></td>
       <td>{c.estimatedMinutes}</td>
       <td>{c.ratings.map(r=>`${r.dimension} ${r.raw}`).join('；')||'未提供'}</td>
-      {view.spoilersVisible&&<td>{c.taxonomyIds?.map(id=>tagName(id,boot)).join('、')||'暂无已复核标签'}{c.provisionalRawTags&&c.provisionalRawTags.length>0&&<span className="icpc-tag">临时原始标签：{c.provisionalRawTags.join('、')}</span>}</td>}
-     </tr>)}</tbody>
+      {view.spoilersVisible&&<td>{c.taxonomyIds?.map(id=>tagName(id,boot)).join('、')||'暂无已复核标签'}{rawTags!==null&&rawTags.items.length>0&&<><span className="icpc-tag">临时原始标签（未复核）：{rawTags.items.map(item=>item.label).join('、')}</span><details><summary>查看原始标签编号（{rawTags.raws.length} 条）</summary><p className="icpc-muted">{rawTags.raws.join('、')}</p>{rawTags.luoguSource&&<p className="icpc-muted">名称来自洛谷官方标签字典快照（<ExternalLink href={LUOGU_TAG_DICTIONARY_SOURCE_URL}>官方标签数据</ExternalLink>，核对日期 {LUOGU_TAG_DICTIONARY_RETRIEVED_AT}，共 {LUOGU_TAG_DICTIONARY_ENTRY_COUNT} 条）。{LUOGU_TAG_DICTIONARY_CAVEAT}</p>}</details></>}</td>}
+     </tr>;})}</tbody>
     </table></div>}
     <p className="icpc-muted">{PLANNING_CANDIDATE_SPOILER_NOTE}{view.spoilersVisible?'':'候选的算法标签与平台原始标签默认隐藏：勾选剧透开关后，请重新点击“免费准备”查看标签。'}</p>
    </details>

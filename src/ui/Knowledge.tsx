@@ -8,7 +8,12 @@ import {
   knowledgeResourcesFor,
 } from '../domain/knowledge-resources.js';
 import { Empty, ExternalLink, Notice, Panel, useWorkbench } from './common.js';
-import { TAG_MAPPING_RELATIONS } from '../domain/index.js';
+import { rawTagLabel, rawTagSourceOf } from './raw-tag-view.js';
+import {
+  LUOGU_TAG_DICTIONARY_RETRIEVED_AT,
+  LUOGU_TAG_DICTIONARY_SOURCE_URL,
+} from './luogu-tag-dictionary.js';
+import { TAG_MAPPING_RELATIONS, type SourceTagMappingDiagnostic } from '../domain/index.js';
 import { barWidthPercent } from './histogram.js';
 import {
   KNOWLEDGE_AC_NOTE,
@@ -130,6 +135,12 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
   const mappingRows = selectSourceTagMappings(knowledge.sourceTagMappings, mappingState);
   const mappingPage = tagMappingPage(mappingRows, mappingState.page);
   const mappingSources = tagMappingSourceOptions(knowledge.sourceTagMappings);
+  // Readable display form of one mapping row. A name resolves only through that row's own source
+  // instance, looked up in the boot catalog: an absent/unknown instance or a non-Luogu host keeps the
+  // exact stored raw text, and the mapping result, filters and evidence never change.
+  const mappingRawView = (mapping: SourceTagMappingDiagnostic) =>
+    rawTagLabel(mapping.raw, rawTagSourceOf(mapping.sourceInstanceId, boot.sources));
+  const mappingShowsLuoguIds = mappingPage.items.some((mapping) => mappingRawView(mapping).luoguTagId !== null);
   const relationCountOf = (relation: (typeof TAG_MAPPING_RELATIONS)[number]): number =>
     knowledge.sourceTagMappings.filter((mapping) => mapping.relation === relation).length;
   useEffect(() => {
@@ -636,39 +647,45 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
                   </tr>
                 </thead>
                 <tbody>
-                  {mappingPage.items.map((mapping) => (
-                    <tr key={sourceTagMappingKey(mapping)}>
-                      <td>
-                        <span className="icpc-knowledge-name">{TAG_VOCABULARY_LABELS[mapping.vocabulary]}</span>
-                        <span className="icpc-muted">{mapping.sourceInstanceId}</span>
-                      </td>
-                      <td>{mapping.raw}</td>
-                      <td>{TAG_MAPPING_RELATION_LABELS[mapping.relation]}</td>
-                      <td>
-                        <span>{sourceTagMappingTargetText(mapping, catalog)}</span>
-                        {sourceTagMappingCandidateText(mapping, catalog) !== '' && (
-                          <span className="icpc-muted">{sourceTagMappingCandidateText(mapping, catalog)}</span>
-                        )}
-                      </td>
-                      <td>
-                        <span>
-                          通过 {mapping.solvedDistinct} / 尝试 {mapping.attemptedDistinct}
-                        </span>
-                      </td>
-                      <td>
-                        <span>{mapping.explanation}</span>
-                        {mapping.referenceUrls.length > 0 && (
-                          <span className="icpc-tag-mapping-refs">
-                            {mapping.referenceUrls.map((url) => (
-                              <ExternalLink key={url} href={url}>
-                                {sourceTagMappingReferenceTitle(url)}
-                              </ExternalLink>
-                            ))}
+                  {mappingPage.items.map((mapping) => {
+                    const raw = mappingRawView(mapping);
+                    return (
+                      <tr key={sourceTagMappingKey(mapping)}>
+                        <td>
+                          <span className="icpc-knowledge-name">{TAG_VOCABULARY_LABELS[mapping.vocabulary]}</span>
+                          <span className="icpc-muted">{mapping.sourceInstanceId}</span>
+                        </td>
+                        <td>
+                          <span>{raw.label}</span>
+                          {raw.label !== mapping.raw && <small className="icpc-muted" style={{display:'block'}}>{mapping.raw}</small>}
+                        </td>
+                        <td>{TAG_MAPPING_RELATION_LABELS[mapping.relation]}</td>
+                        <td>
+                          <span>{sourceTagMappingTargetText(mapping, catalog)}</span>
+                          {sourceTagMappingCandidateText(mapping, catalog) !== '' && (
+                            <span className="icpc-muted">{sourceTagMappingCandidateText(mapping, catalog)}</span>
+                          )}
+                        </td>
+                        <td>
+                          <span>
+                            通过 {mapping.solvedDistinct} / 尝试 {mapping.attemptedDistinct}
                           </span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                        <td>
+                          <span>{mapping.explanation}</span>
+                          {mapping.referenceUrls.length > 0 && (
+                            <span className="icpc-tag-mapping-refs">
+                              {mapping.referenceUrls.map((url) => (
+                                <ExternalLink key={url} href={url}>
+                                  {sourceTagMappingReferenceTitle(url)}
+                                </ExternalLink>
+                              ))}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -716,6 +733,13 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
                   下一页 ›
                 </button>
               </nav>
+            )}
+            {mappingShowsLuoguIds && (
+              <p className="icpc-muted">
+                洛谷数字编号的显示名来自官方标签字典快照（
+                <ExternalLink href={LUOGU_TAG_DICTIONARY_SOURCE_URL}>官方标签数据</ExternalLink>
+                ，核对日期 {LUOGU_TAG_DICTIONARY_RETRIEVED_AT}）；字典只提供平台显示名，不改变上方的对照结果与“未匹配”判定。
+              </p>
             )}
             <p className="icpc-muted" aria-live="polite">
               筛选后 {mappingPage.totalItems} 条映射 · 第 {mappingPage.page} / {mappingPage.totalPages}{' '}

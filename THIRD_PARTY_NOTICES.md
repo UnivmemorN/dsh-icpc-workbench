@@ -52,6 +52,10 @@ The Luogu history adapter references the account-history workflow and public end
 
 [Luogu public configuration](https://www.luogu.com.cn/_lfe/config), checked 2026-09-13, supplies the meaning of numeric verdicts; private authenticated responses are not included as fixtures. Windows session storage uses the operating system's [Credential Manager API](https://learn.microsoft.com/en-us/windows/win32/api/wincred/ns-wincred-credentialw) through an independently written wrapper. No platform endorses this plugin.
 
+## Luogu platform tag-name snapshot
+
+Sprint 21a bundles a public id → display-name snapshot read from [Luogu's public tag payload](https://www.luogu.com.cn/_lfe/tags), retrieved 2026-09-14 (HTTP 200, 505 entries). Only public tag identifiers and their platform display names are stored; the snapshot contains no problem statements, editorials, submissions, account records or other user material, and no third-party code is copied. These names are platform metadata for Luogu's own raw tags, not an algorithm taxonomy and not a verification by this plugin: unknown future ids stay explicitly unnamed, the snapshot is versioned with the plugin, and stored records are never migrated, re-imported or rewritten. No third-party license is asserted for this factual metadata here; Luogu does not license or endorse this plugin. See [docs/luogu-tag-names.md](docs/luogu-tag-names.md).
+
 ## Installable training methods
 
 The balanced thinking/templates method implements this project user's design requirements. The optional deliberate-practice companion adapts teaching ideas from [USACO Guide — How to Practice](https://usaco.guide/general/practicing), Competitive Programming Initiative and credited page contributors including Darren Yao, Nathan Wang and Benjamin Qi, checked 2026-09-14. Its teaching text is separately licensed CC BY-NC-SA 4.0; JavaScript registration is MIT. Full attribution, adaptation notes and source license are included in that companion's NOTICE.md and LICENSE.method-text. No source code, problem statements, solutions or page images are copied.

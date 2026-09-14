@@ -1,9 +1,15 @@
 import { useEffect, useState } from 'react';
-import { Panel, Notice, Empty, ErrorNotice, useRequest, useWorkbench, Stats, tagName } from './common.js';
+import { Panel, Notice, Empty, ErrorNotice, ExternalLink, useRequest, useWorkbench, Stats, tagName } from './common.js';
 import { Ability } from './Ability.js';
 import { abilityStatValue } from './ability-view.js';
 import { Knowledge } from './Knowledge.js';
 import { SolvedDistribution, shareText } from './SolvedDistribution.js';
+import { accountRawTagSource, rawTagLabel } from './raw-tag-view.js';
+import {
+  LUOGU_TAG_DICTIONARY_ENTRY_COUNT,
+  LUOGU_TAG_DICTIONARY_RETRIEVED_AT,
+  LUOGU_TAG_DICTIONARY_SOURCE_URL,
+} from './luogu-tag-dictionary.js';
 
 /**
  * Four explicit readings of the same evidence: the local ability heuristic, per technique node,
@@ -23,12 +29,20 @@ type WeaknessView = 'ability' | 'knowledge' | 'platform' | 'verified';
  */
 export function Weakness() {
   const { accountId, boot, navigate } = useWorkbench();
+  // Raw label names are resolved through the selected account's own source instance, so switching
+  // accounts switches which platform dictionary may name these rows.
+  const rawTagSource = accountRawTagSource(accountId, boot.accounts, boot.sources);
   const read = useRequest('weakness', accountId ? { accountId } : null);
   const data = read.data;
   const [picked, setPicked] = useState<WeaknessView | null>(null);
   // A new account starts from its own default view instead of the previous account's selection.
   useEffect(() => setPicked(null), [accountId]);
   const platformTags = data?.platformTagStats.tags ?? [];
+  // Each row keeps its own raw string; only a strict numeric id from the account's official Luogu
+  // source borrows the bundled display name, and the raw id stays visible underneath. Rows, keys and
+  // counts are never merged or rewritten.
+  const platformTagRows = platformTags.map((tag) => ({ tag, raw: rawTagLabel(tag.rawTag, rawTagSource) }));
+  const platformShowsLuoguIds = platformTagRows.some((row) => row.raw.luoguTagId !== null);
   const attempted = data?.report.attemptedDistinctTotal ?? 0;
   const platformTagged = data?.platformTagStats.attemptedTaggedDistinct ?? 0;
   const formalTagged = data?.report.taggedAttemptedDistinct ?? 0;
@@ -176,6 +190,7 @@ export function Weakness() {
                 <Panel title="平台标签参考（未复核）">
                   <Notice>
                     这些标签是平台原始数据，未经复核，也不是已接受的标签。原始标签可能不完整、口径不同或与训练方向不一致，据此判断薄弱项可能失真；它们不会成为正式标签，也不改变“已复核分析”。AI 计划只会在候选题里把它们当作临时参考一并发送，而且需要显式开启剧透才会显示。
+                    洛谷标签显示名称，并保留编号供查看。
                   </Notice>
                   {platformTags.length === 0 ? (
                     <Empty>
@@ -194,9 +209,12 @@ export function Weakness() {
                           </tr>
                         </thead>
                         <tbody>
-                          {platformTags.map((tag) => (
+                          {platformTagRows.map(({ tag, raw }) => (
                             <tr key={tag.rawTag}>
-                              <td>{tag.rawTag}</td>
+                              <td>
+                                <span>{raw.label}</span>
+                                {raw.label !== tag.rawTag && <small className="icpc-muted" style={{display:'block'}}>{tag.rawTag}</small>}
+                              </td>
                               <td>
                                 {tag.solvedDistinct} / {tag.attemptedDistinct}
                               </td>
@@ -216,6 +234,14 @@ export function Weakness() {
                   <p className="icpc-muted">
                     同一道题可以带多个平台标签，因此各标签的尝试数之和会大于尝试题总数；这不是“一道题只属于一个方向”的划分，平台标签也不代表你已掌握该方向。
                   </p>
+                  {platformShowsLuoguIds && (
+                    <p className="icpc-muted">
+                      数字编号的显示名来自洛谷官方标签字典快照（
+                      <ExternalLink href={LUOGU_TAG_DICTIONARY_SOURCE_URL}>官方标签数据</ExternalLink>
+                      ，核对日期 {LUOGU_TAG_DICTIONARY_RETRIEVED_AT}，共 {LUOGU_TAG_DICTIONARY_ENTRY_COUNT}{' '}
+                      条）；快照中没有的编号保持“名称未收录”，字典名称只是平台显示名，不代表本插件已复核。
+                    </p>
+                  )}
                 </Panel>
               ) : (
                 <>
