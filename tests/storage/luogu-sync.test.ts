@@ -486,7 +486,7 @@ void test('a genuine v6 database is copied and migrated to v7 with its rows pres
   fx.removeDirectory(paths.dir);
 });
 
-void test('empty, v0 and every recognized version through v6 migrate to exactly v7 with one backup at its own version', async () => {
+void test('empty, v0 and every recognized version through v6 migrate to exactly the current schema with one backup at its own version', async () => {
   interface Case {
     readonly label: string;
     readonly from: number;
@@ -534,7 +534,7 @@ void test('empty, v0 and every recognized version through v6 migrate to exactly 
 
       const after = new DatabaseSync(path, { readOnly: true });
       try {
-        assert.equal(readUserVersion(after), STORE_SCHEMA_VERSION, `${entry.label} ends at v7`);
+        assert.equal(readUserVersion(after), STORE_SCHEMA_VERSION, `${entry.label} ends at the current schema`);
         for (const table of STORE_TABLES_V7) {
           assert.ok(tableNames(after).includes(table), `${entry.label} is missing ${table}`);
         }
@@ -558,12 +558,12 @@ void test('empty, v0 and every recognized version through v6 migrate to exactly 
   }
 });
 
-void test('a database from a newer schema than v7 is refused before any byte, backup or journal change', () => {
+void test('a database from a newer schema than the current one is refused before any byte, backup or journal change', () => {
   const paths = fx.tempDatabase();
   const db = new DatabaseSync(paths.path);
   try {
     migrateToSchemaV6(db, 0);
-    db.exec('PRAGMA user_version = 8');
+    db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION + 1}`);
   } finally {
     db.close();
   }

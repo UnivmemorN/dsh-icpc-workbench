@@ -1,4 +1,6 @@
 import type { AbilityCalibration, AbilityCalibrationRange } from '../domain/ability-calibration.js';
+import type {AssessmentPrepareRequest,AssessmentRunRequest,AssessmentStatusRequest,AssessmentHistoryRequest,AssessmentConfigView} from './assessment-service.js';
+import type {ApiAssessmentView,ApiAssessmentHistory} from './assessment-api-types.js';
 import type * as Bootstrap from './bootstrap-types.js';
 import type * as Model from './model-operation-types.js';
 /**
@@ -68,6 +70,12 @@ import type {
   WorkbenchWeaknessResult,
 } from './workbench-types.js';
 import type { MergedBankBrowseRequest } from './merged-bank-service.js';
+import type {
+  VirtualPerformanceDeleteRequest,
+  VirtualPerformanceLedgerView,
+  VirtualPerformanceListRequest,
+  VirtualPerformanceSaveRequest,
+} from './virtual-performance-service.js';
 
 // ---------------------------------------------------------------------------------------
 // Endpoint vocabulary
@@ -178,6 +186,20 @@ export const PLANNING_API_OPERATIONS = {
   planAiStatus: 'plan.aiStatus',
   planAiCancel: 'plan.aiCancel',
   planAiHistory: 'plan.aiHistory',
+} as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
+
+/**
+ * Virtual-contest performance ledger routes registered by the owned performance API (Sprint 18c).
+ *
+ * They are registered separately from the free business routes and from every model route: the CRUD
+ * is a free local write over user-entered evidence and never dispatches a paid call. The ledger is
+ * Codeforces-only and user-entered; the request never carries a `source`, which the server always
+ * injects as `user_import`.
+ */
+export const PERFORMANCE_API_OPERATIONS = {
+  performanceList: 'performance.list',
+  performanceSave: 'performance.save',
+  performanceDelete: 'performance.delete',
 } as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
 
 /**
@@ -724,6 +746,22 @@ export type ApiPlanEditResult = WorkbenchPlanView;
 export type ApiPlanCheckoffRequest = ApiRequestOf<WorkbenchCheckOffTaskRequest>;
 export type ApiPlanCheckoffResult = WorkbenchPlanView;
 
+/**
+ * Virtual-contest performance ledger operations (Sprint 18c).
+ *
+ * `performance.list` reads one account's ledger (an explicit empty view when it has none — never a
+ * zero score); `performance.save` adds a row or replaces an existing `evidenceId` under the revision
+ * the caller read; `performance.delete` removes one row and still advances that revision. The
+ * response is the whole stored ledger, so a caller always sees the revision its next write must
+ * name.
+ */
+export type ApiPerformanceListRequest = ApiRequestOf<VirtualPerformanceListRequest>;
+export type ApiPerformanceListResult = VirtualPerformanceLedgerView;
+export type ApiPerformanceSaveRequest = ApiRequestOf<VirtualPerformanceSaveRequest>;
+export type ApiPerformanceSaveResult = VirtualPerformanceLedgerView;
+export type ApiPerformanceDeleteRequest = ApiRequestOf<VirtualPerformanceDeleteRequest>;
+export type ApiPerformanceDeleteResult = VirtualPerformanceLedgerView;
+
 // ---------------------------------------------------------------------------------------
 // The map itself
 // ---------------------------------------------------------------------------------------
@@ -780,11 +818,21 @@ export interface WorkbenchApiMap {
   'luogu.configure': ApiEndpoint<ApiLuoguConfigureRequest, ApiLuoguStatusView>;
   'luogu.start': ApiEndpoint<ApiLuoguStartRequest, ApiLuoguStartResult>;
   'luogu.cancel': ApiEndpoint<ApiLuoguAccountRequest, ApiLuoguStatusView>;
+  'assessment.config': ApiEndpoint<Record<string,never>,AssessmentConfigView>;
+  'assessment.prepare': ApiEndpoint<AssessmentPrepareRequest,ApiAssessmentView>;
+  'assessment.run': ApiEndpoint<AssessmentRunRequest,{readonly started:boolean;readonly attempt:ApiAssessmentView}>;
+  'assessment.status': ApiEndpoint<AssessmentStatusRequest,ApiAssessmentView|null>;
+  'assessment.cancel': ApiEndpoint<AssessmentStatusRequest,ApiAssessmentView>;
+  'assessment.history': ApiEndpoint<AssessmentHistoryRequest,ApiAssessmentHistory>;
+  'guidance.catalog': ApiEndpoint<Record<string, never>, { readonly methods: readonly import('../domain/guidance.js').InstalledGuidanceMethod[] }> ;
   'plan.aiPrepare': ApiEndpoint<Model.ModelPlanPrepareRequest, Model.ModelPlanPrepareResult>;
   'plan.aiRun': ApiEndpoint<Model.ModelPlanRunRequest, Model.ModelPlanRunResult>;
   'plan.aiStatus': ApiEndpoint<Model.ModelPlanStatusRequest, Model.ModelPlanStatusResult>;
   'plan.aiCancel': ApiEndpoint<Model.ModelPlanCancelRequest, Model.ModelPlanCancelResult>;
   'plan.aiHistory': ApiEndpoint<Model.ModelPlanHistoryRequest, Model.ModelPlanHistoryResult>;
+  'performance.list': ApiEndpoint<ApiPerformanceListRequest, ApiPerformanceListResult>;
+  'performance.save': ApiEndpoint<ApiPerformanceSaveRequest, ApiPerformanceSaveResult>;
+  'performance.delete': ApiEndpoint<ApiPerformanceDeleteRequest, ApiPerformanceDeleteResult>;
 }
 
 /**

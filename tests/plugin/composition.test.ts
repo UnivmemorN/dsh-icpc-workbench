@@ -7,6 +7,8 @@ import {activateHost,resolveHarnessHome,type ActivationEnvironment,type PublicHo
 import {ModelCatalog} from '../../src/plugin/model-catalog.js';
 import {SqliteTrainingStore} from '../../src/adapters/sqlite/index.js';
 import {createLuoguAccount,luoguSourceInstance} from '../../src/adapters/luogu/index.js';
+import {GuidanceMethodRegistry} from '../../src/adapters/guidance/index.js';
+import * as balanced from '../../packages/dsh-icpc-method-balanced/index.js';
 import {defaultWorkbenchSettings} from '../../src/application/workbench-settings.js';
 import {createCancellationSource} from '../../src/domain/index.js';
 import * as fx from '../storage/fixtures.js';
@@ -31,7 +33,10 @@ function fixture(luogu?:ActivationEnvironment['luogu']) {
 test('host composition keeps activation free, persists settings/accounts and creates a restorable backup',async()=>{
  const f=fixture();let runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.calls(),0);assert.equal(f.routes.size,49); // 42 business/model/bootstrap + 7 typed Luogu operations.
+  assert.equal(f.calls(),0);assert.equal(f.routes.size,59); // 43 business/model/bootstrap + 7 typed Luogu + 3 virtual-performance + 6 assessment operations.
+  // The six durable ability-assessment routes are part of that count, so a registration regression
+  // cannot hide behind a coincidentally unchanged total somewhere else.
+  for(const operation of ['assessment.config','assessment.prepare','assessment.run','assessment.status','assessment.cancel','assessment.history'])assert.ok(f.routes.has('/api/icpc/v1/'+operation),'assessment route '+operation+' must be registered');
   const boot=await f.call('bootstrap');assert.equal(boot.status,200);assert.equal(boot.body.value.settings.revision,1);assert.equal(boot.body.value.sources.length,2);assert.equal(boot.body.value.hydro.implemented,false);assert.equal(boot.body.value.hostVersion,'0.1.5-rc.2');
   assert.equal(f.calls(),0);
   const account=await f.call('account.create',{platform:'codeforces',handle:'Tourist'});assert.equal(account.status,200);
@@ -160,7 +165,7 @@ test('the luogu host recovers durable state, keeps defaults offline and owns its
  await seed.upsertSourceInstances([instance]);await seed.upsertAccounts([account]);await seed.close();
  const runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.routes.size,49);
+  assert.equal(f.routes.size,59);
   assert.equal(feed.calls.length,0,'default automation must not contact the platform on startup');
   assert.equal(timers.entries.length,1,'exactly one owned periodic timer');
   assert.equal(timers.entries[0]?.intervalMs,1000);
@@ -241,5 +246,28 @@ test('an unsupported credential platform keeps bootstrap and the free business r
   assert.equal(refused.status,409);
   assert.match(refused.body.error.message,/安全凭据存储/);
   assert.equal(f.calls(),0);
+ }finally{await runtime.dispose();f.remove();}
+});
+test('activation shares the installed guidance catalogue with production plan preparation',async()=>{
+ const f=fixture();
+ // The very seam `apply()` uses for the `icpcGuidance` service: a method registered here is what a
+ // companion package installs, and plan preparation must capture it instead of reporting that no
+ // catalogue is composed.
+ const registry=new GuidanceMethodRegistry();registry.register(balanced.balancedMethod);
+ const scope=fx.makeScope('codeforces','codeforces.com','alice','1A');
+ mkdirSync(f.dataDir,{recursive:true});
+ const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>fx.AT});
+ await seed.upsertSourceInstances([scope.instance]);await seed.upsertAccounts([scope.account]);
+ await seed.upsertProblems([scope.problem,fx.makeProblem(fx.makeRef(scope.instance,'2B'))]);
+ await seed.close();
+ const runtime=await activateHost(f.host,{dataDir:f.dataDir},{...f.environment,guidance:registry});
+ try {
+  const prepared=await f.call('plan.aiPrepare',{requestId:'wired-1',accountId:scope.account.id,guidanceMethodIds:[balanced.balancedMethod.methodId]});
+  assert.equal(prepared.status,200);
+  assert.equal(prepared.body.value.outcome,'prepared');
+  // Without the catalogue, this request is the typed `guidance_unavailable` refusal and never 200.
+  assert.deepEqual(prepared.body.value.view.guidanceMethodIds,[balanced.balancedMethod.methodId]);
+  assert.equal(prepared.body.value.view.guidance.methods[0].methodId,balanced.balancedMethod.methodId);
+  assert.equal(f.calls(),0,'preparing reserves a durable attempt without dispatching a paid call');
  }finally{await runtime.dispose();f.remove();}
 });

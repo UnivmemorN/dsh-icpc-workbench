@@ -16,15 +16,21 @@ import { deepFreeze } from './immutable.js';
 import type { AccountWeaknessReport } from './weakness.js';
 import type { TaxonomyIndex } from './taxonomy/types.js';
 import {
+  MAX_PLAN_OBJECTIVE_CHARS,
+  TRAINING_TASK_AXES,
   TRAINING_TASK_KINDS,
   createTrainingTask,
   lowestNumericRating,
+  planDiagnosisProblem,
   recalcUnmetMinutes,
   trainingPlanIdOf,
+  validatePlanDiagnosis,
+  type PlanDiagnosis,
   type TrainingCandidate,
   type TrainingEvidence,
   type TrainingPlan,
   type TrainingTask,
+  type TrainingTaskAxis,
   type TrainingTaskKind,
   type UnmetMinutes,
 } from './training.js';
@@ -384,7 +390,11 @@ export type PlanValidationCode =
   | 'source_url_mismatch'
   | 'invalid_source_url'
   | 'minutes_exceeded'
-  | 'tasks_per_day_exceeded';
+  | 'tasks_per_day_exceeded'
+  | 'invalid_diagnosis'
+  | 'invalid_axis'
+  | 'invalid_objective'
+  | 'unbalanced_axes';
 
 export interface PlanValidationError {
   readonly code: PlanValidationCode;
@@ -401,10 +411,15 @@ interface ModelPlanTaskDraft {
   readonly problemKey: string | null;
   readonly sourceUrl: string | null;
   readonly title: string | null;
+  /** Guided-draft fields; `null` when the model omitted them (or when the plan is unguided). */
+  readonly axis: string | null;
+  readonly objective: string | null;
 }
 
 interface ModelPlanDraft {
   readonly title: string | null;
+  /** Raw dual-axis diagnosis of a guided draft; `null` when absent. */
+  readonly diagnosis: unknown;
   readonly tasks: readonly ModelPlanTaskDraft[];
 }
 
@@ -447,10 +462,16 @@ export function parseModelPlanDraft(raw: unknown): { readonly draft: ModelPlanDr
       problemKey: typeof task.problemKey === 'string' ? task.problemKey : null,
       sourceUrl: typeof task.sourceUrl === 'string' ? task.sourceUrl : null,
       title: typeof task.title === 'string' ? task.title : null,
+      axis: typeof task.axis === 'string' ? task.axis : null,
+      objective: typeof task.objective === 'string' ? task.objective : null,
     });
   });
   return {
-    draft: { title: typeof record.title === 'string' ? record.title : null, tasks },
+    draft: {
+      title: typeof record.title === 'string' ? record.title : null,
+      diagnosis: record.diagnosis ?? null,
+      tasks,
+    },
     errors,
   };
 }
@@ -462,6 +483,15 @@ export interface ValidateModelPlanInput {
   readonly now: string;
   readonly accountId?: string | null;
   readonly planId?: string;
+  /**
+   * `true` when this answer was generated under a selected training method (Sprint 18b).
+   *
+   * The flag is the **binding** between the plan and the reservation it was paid for: it comes from
+   * the stored preparation's guidance capture, never from the model answer, so a guided request that
+   * omitted its diagnosis or task axes is refused here instead of silently degrading into an
+   * unguided plan. Unguided (rule/legacy) answers must not carry guided fields at all.
+   */
+  readonly guided?: boolean;
 }
 
 export interface ModelPlanValidation {
@@ -492,6 +522,25 @@ export function validateModelPlan(input: ValidateModelPlanInput): ModelPlanValid
     errors.push({ code: 'unknown_candidate_id', message: 'no valid candidates were selected', taskIndex: null });
   }
   const byCandidateId = new Map(pool.valid.map((candidate) => [candidate.candidateId, candidate]));
+  const guided = input.guided === true;
+
+  // Guided-ness is decided by the reservation, not by the answer: a guided draft must carry a
+  // diagnosis and an unguided one must not invent guided fields. No agnostic default exists.
+  let diagnosis: PlanDiagnosis | null = null;
+  if (guided) {
+    const problem = planDiagnosisProblem(parsed.draft.diagnosis);
+    if (problem !== null) {
+      errors.push({ code: 'invalid_diagnosis', message: problem, taskIndex: null });
+    } else {
+      diagnosis = validatePlanDiagnosis(parsed.draft.diagnosis);
+    }
+  } else if (parsed.draft.diagnosis !== null) {
+    errors.push({
+      code: 'invalid_shape',
+      message: 'an unguided plan must not carry a diagnosis; it is only defined under a selected training method',
+      taskIndex: null,
+    });
+  }
 
   const perDayMinutes = new Map<number, number>();
   const perDayTasks = new Map<number, number>();
@@ -589,6 +638,36 @@ export function validateModelPlan(input: ValidateModelPlanInput): ModelPlanValid
       });
       continue;
     }
+    let axis: TrainingTaskAxis | null = null;
+    let objective: string | null = null;
+    if (guided) {
+      if (draftTask.axis === null || !TRAINING_TASK_AXES.includes(draftTask.axis as TrainingTaskAxis)) {
+        errors.push({
+          code: 'invalid_axis',
+          message: `a guided task needs an axis of ${TRAINING_TASK_AXES.join('|')} (got ${String(draftTask.axis)})`,
+          taskIndex: index,
+        });
+        continue;
+      }
+      const trimmed = draftTask.objective?.trim() ?? '';
+      if (trimmed.length === 0 || trimmed.length > MAX_PLAN_OBJECTIVE_CHARS) {
+        errors.push({
+          code: 'invalid_objective',
+          message: `a guided task needs an objective of 1..${MAX_PLAN_OBJECTIVE_CHARS} characters`,
+          taskIndex: index,
+        });
+        continue;
+      }
+      axis = draftTask.axis as TrainingTaskAxis;
+      objective = trimmed;
+    } else if (draftTask.axis !== null || draftTask.objective !== null) {
+      errors.push({
+        code: 'invalid_shape',
+        message: 'an unguided plan must not carry task axis or objective fields',
+        taskIndex: index,
+      });
+      continue;
+    }
 
     perDayMinutes.set(draftTask.day, dayMinutes);
     perDayTasks.set(draftTask.day, dayTasks);
@@ -602,8 +681,24 @@ export function validateModelPlan(input: ValidateModelPlanInput): ModelPlanValid
         minutes,
         kind: (draftTask.kind as TrainingTaskKind | null) ?? kindFor(candidate, []),
         rationale: 'Selected by the model from the approved candidate set',
+        ...(axis === null ? {} : { axis }),
+        ...(objective === null ? {} : { objective }),
       }),
     );
+  }
+
+  // Both axes support each other, so a multi-task guided plan must exercise each at least once; a
+  // single-task plan can only carry one axis and is left as it is.
+  if (guided && errors.length === 0 && tasks.length >= 2) {
+    const axes = new Set(tasks.map((task) => task.axis));
+    const missing = TRAINING_TASK_AXES.filter((candidate) => !axes.has(candidate));
+    if (missing.length > 0) {
+      errors.push({
+        code: 'unbalanced_axes',
+        message: `a guided plan of ${tasks.length} tasks must train both axes; missing ${missing.join(', ')}`,
+        taskIndex: null,
+      });
+    }
   }
 
   if (tasks.length === 0) {
@@ -631,6 +726,7 @@ export function validateModelPlan(input: ValidateModelPlanInput): ModelPlanValid
       sufficientTagIds: [],
     },
     unmetMinutes: recalcUnmetMinutes(tasks, horizonDays, minutesPerDay),
+    ...(diagnosis === null ? {} : { diagnosis }),
   });
 
   return { ok: true, errors: deepFreeze([]), plan };

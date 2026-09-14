@@ -1,0 +1,5 @@
+# Text attribution and license
+
+The teaching text in deliberatePracticeDefinition is a short Chinese adaptation and independently organized practice loop referencing [USACO Guide — How to Practice](https://usaco.guide/general/practicing), Competitive Programming Initiative and the page contributors, especially Darren Yao, Nathan Wang and Benjamin Qi. Checked 2026-09-14. Changes: condensed into five practice steps, added evidence recording and assessment instructions; this is not an official USACO curriculum or endorsement.
+
+The adapted method text is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), consistent with the [source repository license](https://github.com/cpinitiative/usaco-guide/blob/master/LICENSE). See LICENSE.method-text for the full terms, including attribution, noncommercial use and share-alike. The JavaScript registration mechanism and package infrastructure remain MIT under LICENSE. The main workbench is a separate MIT package; its license does not replace the method text license.

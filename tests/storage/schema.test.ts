@@ -244,6 +244,7 @@ void test('a fresh path is initialized with the marker, the current schema and i
   assert.equal(state.marker, STORE_MARKER);
   assert.equal(state.integrity, 'ok');
   for (const table of [
+    'ability_evaluation_attempts',
     'accounts',
     'analyses',
     'coaching_attempts',
@@ -266,6 +267,7 @@ void test('a fresh path is initialized with the marker, the current schema and i
     'submissions',
     'sync_checkpoints',
     'tag_decisions',
+    'virtual_performance_ledgers',
     'workbench_settings',
   ]) {
     assert.ok(state.tables.includes(table), `schema is missing ${table}`);
@@ -273,6 +275,16 @@ void test('a fresh path is initialized with the marker, the current schema and i
   assert.equal(rawScalar(nested, 'SELECT count(*) FROM coaching_attempts'), 0, 'the reserved coaching table starts empty');
   assert.equal(rawScalar(nested, 'SELECT count(*) FROM plan_attempts'), 0, 'the planning table starts empty');
   assert.equal(rawScalar(nested, 'SELECT count(*) FROM workbench_settings'), 0, 'settings are written only by a save');
+  assert.equal(
+    rawScalar(nested, 'SELECT count(*) FROM virtual_performance_ledgers'),
+    0,
+    'no account has a virtual-contest ledger before a save',
+  );
+  assert.equal(
+    rawScalar(nested, 'SELECT count(*) FROM ability_evaluation_attempts'),
+    0,
+    'the reserved ability-evaluation table starts empty',
+  );
   fx.removeDirectory(paths.dir);
 });
 
@@ -281,11 +293,11 @@ void test('a database from a newer schema is rejected before anything is written
   rawExec(paths.path, [
     'CREATE TABLE problems (x TEXT)',
     `INSERT INTO problems (x) VALUES ('foreign data')`,
-    // Explicitly verify a v8 database is refused by this build's v7 store before any write.
+    // Explicitly verify a v9 database is refused by this build's v8 store before any write.
     `PRAGMA user_version = ${STORE_SCHEMA_VERSION + 1}`,
   ]);
-  assert.equal(STORE_SCHEMA_VERSION, 7);
-  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 8);
+  assert.equal(STORE_SCHEMA_VERSION, 8);
+  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 9);
   const before = fingerprint(paths.path);
   const beforeBytes = readFileSync(paths.path);
   assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');

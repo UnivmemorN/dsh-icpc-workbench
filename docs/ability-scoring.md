@@ -27,3 +27,13 @@ schema v6 只增加 official_rating_snapshots，按账号追加版本并检查�
 新计划保存无账号标识的 competition 摘要：当前分、最高分、参赛数、时效类别和版本，不发送 handle、比赛名称、逐场名次或时间戳。与原有练习统计、自评分别传递。评分快照改变会使旧准备失效，付费调用前再次验证；旧不可变准备不补写新字段。
 
 当前没有独立校准的“仅凭自由练习预测 CF rating”算法，也没有自动评分的洛谷/牛客换算器。没有 CF 比赛分的选手仍可通过自评与诊断训练建立参考。
+
+## 虚拟参赛表现（用户录入，非官方评分）
+
+CF 官方 API 没有 performance 字段：[RanklistRow](https://codeforces.com/apiHelp/objects#RanklistRow) 描述名次和得分，RatingChange 则记录官方 rating 变化，因此本插件不提供伪造的自动同步 performance，也不使用自创公式。用户可以在能力评估中录入自己的虚拟参赛表现：比赛编号、参赛日期、分数、计算方法、来源链接、独立性与赛前是否见过题，名次与本地备注可选。每行都由服务端标记来源 `user_import`；官方 rating 数值保持原样，虚拟表现的读写不会写入官方评分快照。
+
+performance 的定义取决于具体工具：[Carrot](https://github.com/meooow25/carrot) 把 performance 定义为“使 rating 变化为 0 的那个 rating”，不同工具或公式会给出不同数值，所以 `calculationMethod` 是必填字段，页面与模型都把它当作分数的一部分。来源链接只是引用，插件不会抓取，也不接受带用户名/密码的 URL。
+
+存储：schema v8 新增 `virtual_performance_ledgers`（每账号一行，`revision` 做 CAS，行按 `contestId` 去重，最多 200 行）与 `ability_evaluation_attempts`（独立 AI 能力评估的准备、调用、用量与报告历史）。保存与删除都会递增 revision，删空后仍保留空 body，避免 ABA；旧库依旧先备份、后迁移，原有数据不动。max 200 行之外、重复比赛、过去日期以外的日期、越界分数与非法 URL 都会在写入前被拒绝。
+
+摘要与失效：AI 计划准备保存的虚拟表现摘要不含账号、比赛编号、名次、备注、链接或具体时间戳，只含合成引用、分数、相对时间档、计算方法标签、独立性、赛前曝光与计数；已知辅助或赛前见过题的记录单列，不会自动作为独立实力依据。账本哈希覆盖全部已存字段（包括不下发的字段），因此任何修改或删除都会让旧准备失效；没有该字段的历史准备保持原哈希不变。账本本身不做数值估计；独立 AI 评估可以结合有来源的独立虚拟表现与官方比赛分给出带置信度的推断范围，不改写官方分。详见 [AI 能力评估](ai-ability-assessment.md)。

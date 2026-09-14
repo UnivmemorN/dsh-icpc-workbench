@@ -23,3 +23,10 @@ test('untraceable or optimistic reconciliation is refused',()=>{
  for(const patch of [{conservativeCny:29},{throughRunIds:['unknown']},{throughRunIds:['a','a']},{recordedAt:'bad'},{reportedActualCny:NaN}])assert.throws(()=>totalConservativeCny({runs:[{id:'a',conservativeCny:80}],accountingBaseline:{...baseline,...patch}}));
  assert.throws(()=>totalConservativeCny({runs:[{id:'a',conservativeCny:1},{id:'a',conservativeCny:2}]}));
 });
+test('official balance reconciliation keeps the same conservative and traceability rules',()=>{
+ const runs=[{id:'covered',conservativeCny:20},{id:'later',conservativeCny:2}];
+ const baseline={reportedActualCny:10,conservativeCny:15,throughRunIds:['covered'],source:'official-platform-balance',recordedAt:'2026-09-14T00:00:00Z'};
+ assert.equal(totalConservativeCny({runs,accountingBaseline:baseline}),17);
+ assert.throws(()=>totalConservativeCny({runs,accountingBaseline:{...baseline,source:'unverified-estimate'}}));
+ assert.throws(()=>totalConservativeCny({runs,accountingBaseline:{...baseline,conservativeCny:9}}));
+});

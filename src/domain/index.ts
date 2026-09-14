@@ -356,6 +356,8 @@ export {
 } from './training-stats.js';
 
 export {
+  MAX_PLAN_OBJECTIVE_CHARS,
+  TRAINING_TASK_AXES,
   TRAINING_TASK_KINDS,
   adoptPlan,
   checkOffTask,
@@ -364,10 +366,13 @@ export {
   duplicateCandidateIds,
   editPlanTask,
   lowestNumericRating,
+  planDiagnosisProblem,
   previewPlan,
   recalcUnmetMinutes,
   trainingPlanIdOf,
+  validatePlanDiagnosis,
   type CreateTrainingCandidateInput,
+  type PlanDiagnosis,
   type PlanPreview,
   type PlanTaskPatch,
   type TrainingCandidate,
@@ -377,6 +382,7 @@ export {
   type TrainingPlan,
   type TrainingPlanStatus,
   type TrainingTask,
+  type TrainingTaskAxis,
   type TrainingTaskKind,
   type TrainingTaskStatus,
   type UnmetMinutes,
@@ -415,3 +421,12 @@ export { type KnowledgeDifficultyBand } from './knowledge-difficulty.js';
 
 export * from './ability-calibration.js';
 export * from './official-rating.js';
+// Detachable training-method guidance (Sprint 18b): the public companion seam, its bounded
+// definition validation and the immutable per-plan capture.
+export * from './guidance.js';
+// User-entered virtual-contest performance evidence (Sprint 18c): the revisioned per-account
+// ledger, its strict validator and the identifier-free planning summary with its mutation hash.
+export * from './virtual-performance.js';
+// AI-inferred ability assessment reports (Sprint 18d1): the strictly bounded answer shape, its
+// evidence-reference/anchor rules and the labelled, hash-checked stored record.
+export * from './assessment.js';

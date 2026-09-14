@@ -621,6 +621,21 @@ export interface TrainingStore {
   getAbilityCalibration(accountId: string): Promise<import('../domain/ability-calibration.js').AbilityCalibration | null>;
   /** Append exactly the next revision; expectedRevision 0 means no prior calibration. */
   saveAbilityCalibration(record: import('../domain/ability-calibration.js').AbilityCalibration, expectedRevision: number): Promise<void>;
+  /**
+   * Latest user-entered virtual-contest performance ledger of one account, or `null`.
+   *
+   * The ledger is Codeforces-only evidence with a monotonic per-account revision and rows unique by
+   * contest id. Reading or writing it never touches an official rating snapshot, a calibration or
+   * any platform record.
+   */
+  getVirtualPerformanceLedger(accountId: string): Promise<import('../domain/virtual-performance.js').VirtualPerformanceLedger | null>;
+  /**
+   * Append exactly the next ledger revision; `expectedRevision` 0 means no prior ledger.
+   *
+   * A delete that empties the ledger still stores an explicit empty body with the next revision, so
+   * a stale writer can never resurrect the rows it read.
+   */
+  saveVirtualPerformanceLedger(record: import('../domain/virtual-performance.js').VirtualPerformanceLedger, expectedRevision: number): Promise<void>;
   capabilities(): StoreCapabilities;
 
   // Sources, accounts & incremental sync

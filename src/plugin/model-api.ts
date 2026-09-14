@@ -46,6 +46,7 @@ const planSettings: Check = (v) => {
   if (Object.hasOwn(object, 'maxTasksPerDay')) integer(1, PLANNING_MAX_TASKS_PER_DAY)(object['maxTasksPerDay']);
 };
 /** Explicit candidate selection: `null`/absent is the automatic pool, `[]` an explicit empty pool. */
+const guidanceIds: Check = (v) => { if (!Array.isArray(v) || v.length < 1 || v.length > 4 || new Set(v).size !== v.length) bad(); for (const id of v as unknown[]) { text(id); if ((id as string).length > 80) bad(); } };
 const planCandidates: Check = (v) => {
   if (v === null) return;
   if (!Array.isArray(v) || v.length > MAX_PLANNING_CANDIDATES || new Set(v).size !== v.length) bad();
@@ -126,7 +127,7 @@ export async function registerModelApi({ registry, controller: c, ...options }: 
     add('coaching.status', identity, reveals, (v,t) => c.coachingStatus(v,t));
     add('coaching.history', { accountId: nullable(text), problemKey: key }, { ...reveals, level: nullable(level), limit: integer(1,500), cursor: nullable(text) }, (v,t) => c.coachingHistory(v,t));
     add('coaching.cancel', { ...identity, level }, {}, (v,t) => c.coachingCancel(v,t));
-    add('plan.aiPrepare', { requestId: text, accountId: text }, { settings: planSettings, candidateLimit: nullable(integer(1, MAX_PLANNING_CANDIDATES)), candidateProblemKeys: planCandidates, reveal: bool }, (v,t) => c.planPrepare(v,t));
+    add('plan.aiPrepare', { requestId: text, accountId: text }, { settings: planSettings, candidateLimit: nullable(integer(1, MAX_PLANNING_CANDIDATES)), candidateProblemKeys: planCandidates, guidanceMethodIds: guidanceIds, reveal: bool }, (v,t) => c.planPrepare(v,t));
     add('plan.aiRun', { requestId: text, accountId: text, expectedSettingsRevision: revision }, {}, (v,t) => c.planRun(v,t), 202);
     add('plan.aiStatus', { requestId: text, accountId: text }, { reveal: bool }, (v,t) => c.planStatus(v,t));
     add('plan.aiCancel', { requestId: text, accountId: text }, {}, (v,t) => c.planCancel(v,t));

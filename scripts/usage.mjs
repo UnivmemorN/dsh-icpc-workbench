@@ -19,7 +19,7 @@ export function totalConservativeCny(ledger) {
   }
   const baseline=ledger.accountingBaseline;
   if(baseline===undefined)return ledger.runs.reduce((sum,run)=>sum+run.conservativeCny,0);
-  if(!Number.isFinite(baseline.reportedActualCny)||baseline.reportedActualCny<0||!Number.isFinite(baseline.conservativeCny)||baseline.conservativeCny<baseline.reportedActualCny||!Array.isArray(baseline.throughRunIds)||new Set(baseline.throughRunIds).size!==baseline.throughRunIds.length||baseline.throughRunIds.some(id=>!ids.has(id))||baseline.source!=='user-reported-platform-total'||!Number.isFinite(Date.parse(baseline.recordedAt)))throw Error('Invalid accounting baseline');
+  if(!Number.isFinite(baseline.reportedActualCny)||baseline.reportedActualCny<0||!Number.isFinite(baseline.conservativeCny)||baseline.conservativeCny<baseline.reportedActualCny||!Array.isArray(baseline.throughRunIds)||new Set(baseline.throughRunIds).size!==baseline.throughRunIds.length||baseline.throughRunIds.some(id=>!ids.has(id))||!['user-reported-platform-total','official-platform-balance'].includes(baseline.source)||!Number.isFinite(Date.parse(baseline.recordedAt)))throw Error('Invalid accounting baseline');
   const covered=new Set(baseline.throughRunIds);
   return baseline.conservativeCny+ledger.runs.filter(run=>!covered.has(run.id)).reduce((sum,run)=>sum+run.conservativeCny,0);
 }

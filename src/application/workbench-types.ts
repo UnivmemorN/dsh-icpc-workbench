@@ -553,6 +553,8 @@ export interface WorkbenchPlanTaskPatch {
  * **absent** own properties, exactly like the bank/detail projections.
  */
 export interface WorkbenchPlanTaskView {
+  readonly axis?: import('../domain/training.js').TrainingTaskAxis;
+  readonly objective?: string;
   readonly taskId: string;
   readonly planId: string;
   readonly day: number;
@@ -594,6 +596,9 @@ export interface WorkbenchPlanEvidenceView {
 
 /** One stored plan, projected field by field (no stored plan is ever spread into a response). */
 export interface WorkbenchPlanView {
+  readonly guidanceSnapshot?: import('../domain/guidance.js').GuidanceSnapshot;
+  readonly diagnosis?: import('../domain/training.js').PlanDiagnosis;
+  readonly diagnosisHidden?: boolean;
   readonly planId: string;
   readonly title: string;
   readonly source: 'rule' | 'model';

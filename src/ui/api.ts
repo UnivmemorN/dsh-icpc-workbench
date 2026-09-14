@@ -1,5 +1,66 @@
 import type {ApiRequest,ApiResponse,WorkbenchApiOperation} from '../application/workbench-api.js';
-const OPERATIONS=new Set<WorkbenchApiOperation>(['bootstrap','model.catalog','backup','account.create','ability.calibrate','ability.syncRating','sync.page','import.preview','import.apply','material.refresh','material.supplement','problem.list','problem.browse','problem.mergedBrowse','problem.detail','review.tag','retro.record','weakness','plan.preview','plan.list','plan.detail','plan.adopt','plan.edit','plan.checkoff','plan.aiPrepare','plan.aiRun','plan.aiStatus','plan.aiCancel','plan.aiHistory','batch.prepare','batch.run','batch.resume','batch.pause','batch.cancel','batch.recover','batch.detail','batch.list','coaching.ask','coaching.status','coaching.history','coaching.cancel','settings.save','luogu.status','luogu.connect','luogu.probe','luogu.disconnect','luogu.configure','luogu.start','luogu.cancel']);
+/** Exhaustive shared contract: adding an endpoint requires its browser transport entry. */
+const OPERATIONS={
+ 'bootstrap':true,
+ 'model.catalog':true,
+ 'backup':true,
+ 'account.create':true,
+ 'ability.calibrate':true,
+ 'ability.syncRating':true,
+ 'sync.page':true,
+ 'import.preview':true,
+ 'import.apply':true,
+ 'material.refresh':true,
+ 'material.supplement':true,
+ 'problem.list':true,
+ 'problem.browse':true,
+ 'problem.mergedBrowse':true,
+ 'problem.detail':true,
+ 'review.tag':true,
+ 'retro.record':true,
+ 'weakness':true,
+ 'plan.preview':true,
+ 'plan.list':true,
+ 'plan.detail':true,
+ 'plan.adopt':true,
+ 'plan.edit':true,
+ 'plan.checkoff':true,
+ 'plan.aiPrepare':true,
+ 'plan.aiRun':true,
+ 'plan.aiStatus':true,
+ 'plan.aiCancel':true,
+ 'plan.aiHistory':true,
+ 'batch.prepare':true,
+ 'batch.run':true,
+ 'batch.resume':true,
+ 'batch.pause':true,
+ 'batch.cancel':true,
+ 'batch.recover':true,
+ 'batch.detail':true,
+ 'batch.list':true,
+ 'coaching.ask':true,
+ 'coaching.status':true,
+ 'coaching.history':true,
+ 'coaching.cancel':true,
+ 'settings.save':true,
+ 'luogu.status':true,
+ 'luogu.connect':true,
+ 'luogu.probe':true,
+ 'luogu.disconnect':true,
+ 'luogu.configure':true,
+ 'luogu.start':true,
+ 'luogu.cancel':true,
+ 'assessment.config':true,
+ 'assessment.prepare':true,
+ 'assessment.run':true,
+ 'assessment.status':true,
+ 'assessment.cancel':true,
+ 'assessment.history':true,
+ 'guidance.catalog':true,
+ 'performance.list':true,
+ 'performance.save':true,
+ 'performance.delete':true,
+} as const satisfies Readonly<Record<WorkbenchApiOperation,true>>;
 export class ApiClientError extends Error {
   readonly code:string;readonly status:number;
   constructor(code:string,status:number,message:string){super(message);this.name='ApiClientError';this.code=code;this.status=status;}
@@ -10,7 +71,7 @@ export class ApiClient {
   private readonly send:BrowserFetch;
   constructor(send:BrowserFetch=globalThis.fetch.bind(globalThis)){this.send=send;}
   async request<K extends WorkbenchApiOperation>(operation:K,input:ApiRequest<K>,signal?:AbortSignal):Promise<ApiResponse<K>>{
-    if(!OPERATIONS.has(operation))throw new ApiClientError('invalid_operation',0,'未知操作');
+    if(!Object.hasOwn(OPERATIONS,operation))throw new ApiClientError('invalid_operation',0,'未知操作');
     let response:Response;
     try{response=await this.send('/api/icpc/v1/'+operation,{method:operation==='bootstrap'?'GET':'POST',credentials:'same-origin',headers:operation==='bootstrap'?{}:{'content-type':'application/json'},...(operation==='bootstrap'?{}:{body:JSON.stringify(input)}),signal});}
     catch(error){throw new ApiClientError(signal?.aborted?'cancelled':'network_error',0,signal?.aborted?'已取消请求':'无法连接工作台，请检查 dsh 是否运行。');}

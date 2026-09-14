@@ -14,6 +14,16 @@ import { DomainError, invariant, requireFiniteInt } from './errors.js';
 import { assertHttpUrl, assertIsoTimestamp, assertIdPart, problemKey, type ProblemRef } from './ids.js';
 import { deepFreeze } from './immutable.js';
 import { contentHashOf } from './hash.js';
+import {
+  GUIDANCE_AXES,
+  GUIDANCE_CONFIDENCES,
+  GUIDANCE_DIAGNOSIS_PRIORITIES,
+  MAX_GUIDANCE_SHORT_CHARS,
+  type GuidanceAxis,
+  type GuidanceConfidence,
+  type GuidanceDiagnosisPriority,
+  type GuidanceSnapshot,
+} from './guidance.js';
 import type { PlatformRating } from './problem.js';
 
 export type TrainingTaskKind = 'solve' | 'review' | 'upskill';
@@ -22,6 +32,82 @@ export type TrainingPlanStatus = 'draft' | 'adopted';
 export type TrainingCandidateOrigin = 'weakness' | 'unsolved_pool' | 'manual' | 'beginner';
 
 export const TRAINING_TASK_KINDS: readonly TrainingTaskKind[] = ['solve', 'review', 'upskill'];
+
+/**
+ * The dual axis one guided task trains (Sprint 18b).
+ *
+ * A task of a plan generated under a selected training method is deliberately labelled with the
+ * axis it exercises, so a guided plan can be shown to cover both thinking (modelling, proofs) and
+ * templates (algorithms, implementation). A rule or legacy plan carries no axis at all.
+ */
+export type TrainingTaskAxis = GuidanceAxis;
+
+/** Axes a guided task may name; exported so generator, validator and tests share one list. */
+export const TRAINING_TASK_AXES: readonly TrainingTaskAxis[] = GUIDANCE_AXES;
+
+/** Longest accepted per-task training objective and diagnosis sentence. */
+export const MAX_PLAN_OBJECTIVE_CHARS = MAX_GUIDANCE_SHORT_CHARS;
+
+/**
+ * Dual-axis diagnosis of one guided plan.
+ *
+ * `priority` names the axis that currently blocks the other (`balanced` when neither does,
+ * `diagnostic` when the available evidence cannot name one), while `reason`, `readinessCheck` and
+ * `confidence` carry the bounded explanation a human reads before adopting the plan. The diagnosis
+ * is candidate-specific material: the unrevealed plan projection withholds its free-form text.
+ */
+export interface PlanDiagnosis {
+  readonly priority: GuidanceDiagnosisPriority;
+  readonly reason: string;
+  readonly readinessCheck: string;
+  readonly confidence: GuidanceConfidence;
+}
+
+/** Why one diagnosis value is not usable, or `null` when it is. */
+export function planDiagnosisProblem(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return 'a guided plan needs a dual-axis diagnosis';
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return 'plan diagnosis must be a JSON object';
+  }
+  const record = value as Record<string, unknown>;
+  const unknown = Object.keys(record).filter(
+    (key) => key !== 'priority' && key !== 'reason' && key !== 'readinessCheck' && key !== 'confidence',
+  );
+  if (unknown.length > 0) {
+    return `plan diagnosis has unknown keys: ${unknown.join(', ')}`;
+  }
+  if (!GUIDANCE_DIAGNOSIS_PRIORITIES.includes(record['priority'] as GuidanceDiagnosisPriority)) {
+    return `unknown plan diagnosis priority ${String(record['priority'])}`;
+  }
+  if (!GUIDANCE_CONFIDENCES.includes(record['confidence'] as GuidanceConfidence)) {
+    return `unknown plan diagnosis confidence ${String(record['confidence'])}`;
+  }
+  for (const key of ['reason', 'readinessCheck'] as const) {
+    const text = record[key];
+    if (typeof text !== 'string' || text.trim().length === 0) {
+      return `plan diagnosis ${key} must be a non-empty string`;
+    }
+    if (text.length > MAX_GUIDANCE_SHORT_CHARS) {
+      return `plan diagnosis ${key} is ${text.length} characters, above ${MAX_GUIDANCE_SHORT_CHARS}`;
+    }
+  }
+  return null;
+}
+
+/** Build one validated, frozen plan diagnosis; a malformed value is refused, never coerced. */
+export function validatePlanDiagnosis(value: unknown): PlanDiagnosis {
+  const problem = planDiagnosisProblem(value);
+  invariant(problem === null, 'invalid_input', problem ?? 'plan diagnosis is not valid', { value });
+  const record = value as Record<string, unknown>;
+  return deepFreeze({
+    priority: record['priority'] as GuidanceDiagnosisPriority,
+    reason: (record['reason'] as string).trim(),
+    readinessCheck: (record['readinessCheck'] as string).trim(),
+    confidence: record['confidence'] as GuidanceConfidence,
+  });
+}
 
 /** A real, addressable problem that may be scheduled. */
 export interface TrainingCandidate {
@@ -97,6 +183,17 @@ export interface TrainingTask {
   readonly status: TrainingTaskStatus;
   readonly checkedAt: string | null;
   readonly rationale: string;
+  /**
+   * Dual axis this task trains under a selected training method (Sprint 18b).
+   *
+   * **Absent, not `null`, on a rule or legacy plan**: a stored row that predates guided planning
+   * keeps hashing and rendering exactly as it did, and the field can only be set by a validated
+   * guided model draft. Together with {@link TrainingTask.objective} it keeps the plan's training
+   * philosophy distinguishable from the AI's scheduling answer.
+   */
+  readonly axis?: TrainingTaskAxis;
+  /** Bounded training objective of this task; absent on a rule or legacy plan. */
+  readonly objective?: string;
 }
 
 export interface UnmetMinutes {
@@ -117,6 +214,23 @@ export interface TrainingPlan {
   readonly tasks: readonly TrainingTask[];
   readonly evidence: TrainingEvidence;
   readonly unmetMinutes: readonly UnmetMinutes[];
+  /**
+   * Dual-axis diagnosis of a plan generated under a selected training method (Sprint 18b).
+   *
+   * **Absent, not `null`, on a rule or legacy plan**: a stored row that predates guided planning
+   * keeps its content hash byte-for-byte, and only a validated guided model draft can set it.
+   */
+  readonly diagnosis?: PlanDiagnosis;
+  /**
+   * Immutable capture of the training methods this plan was generated under (Sprint 18b).
+   *
+   * **Absent, not `null`, on a rule or legacy plan.** The capture names the selected method ids and
+   * carries their exact names, versions, hashes and source citations, so a plan's method
+   * attribution stays readable after the planning-attempt view is unloaded — and stays provably the
+   * text the model was shown after a companion package was upgraded or removed. It is the same
+   * frozen capture the preparation stored; nothing here is re-derived from "the current method".
+   */
+  readonly guidanceSnapshot?: GuidanceSnapshot;
 }
 
 /** Summarised plan for the preview step. */
@@ -153,6 +267,9 @@ export function createTrainingTask(input: {
   readonly rationale: string;
   readonly status?: TrainingTaskStatus;
   readonly checkedAt?: string | null;
+  /** Guided plans only; both are omitted (not `null`) for a rule or legacy task. */
+  readonly axis?: TrainingTaskAxis;
+  readonly objective?: string;
 }): TrainingTask {
   invariant(Number.isInteger(input.day) && input.day >= 1, 'invalid_input', 'task day must be >= 1', {
     day: input.day,
@@ -160,6 +277,23 @@ export function createTrainingTask(input: {
   invariant(Number.isInteger(input.order) && input.order >= 0, 'invalid_input', 'task order must be >= 0', {
     order: input.order,
   });
+  if (input.axis !== undefined) {
+    invariant(
+      TRAINING_TASK_AXES.includes(input.axis),
+      'invalid_input',
+      `unknown training task axis ${String(input.axis)}`,
+      { axis: input.axis },
+    );
+  }
+  const objective = input.objective?.trim();
+  if (objective !== undefined) {
+    invariant(
+      objective.length > 0 && objective.length <= MAX_PLAN_OBJECTIVE_CHARS,
+      'invalid_input',
+      `task objective must be 1..${MAX_PLAN_OBJECTIVE_CHARS} characters`,
+      { length: objective.length },
+    );
+  }
   return deepFreeze({
     taskId: `${input.planId}|${input.candidate.candidateId}`,
     planId: input.planId,
@@ -175,6 +309,8 @@ export function createTrainingTask(input: {
     status: input.status ?? 'planned',
     checkedAt: input.checkedAt ?? null,
     rationale: input.rationale,
+    ...(input.axis === undefined ? {} : { axis: input.axis }),
+    ...(objective === undefined ? {} : { objective }),
   });
 }
 

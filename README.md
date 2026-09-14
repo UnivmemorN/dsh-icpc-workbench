@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件。独立工作区、独立 SQLite 数据库；基于题解证据补全标签，保留原始标签、人工决定和分析版本。
 
-**0.1.12 实验版**已实现六页浏览器工作台、CF/洛谷/手工导入、持久化模型批次、逐级提示、人工审核、薄弱项与训练计划（AI 计划：免费准备、显式付费生成；以及免费规则计划）。新增 Windows 本地会话连接、洛谷历史回溯和自动同步；本轮验收与已知限制见 [0.1.12 验收报告](docs/reports/stage-17-acceptance.md)，早期模型质量评测见 [30 题报告](docs/reports/stage-05-acceptance.md)。
+**0.1.13 实验版**新增可装卸的训练方法插件、思维与板子综合计划、独立 AI 能力评估，以及虚拟参赛表现录入。支持 CF/洛谷/手工导入、标签完整性审核、逐级提示、知识点与难度统计、洛谷本地会话同步。见 [本轮验收](docs/reports/stage-18-acceptance.md) 与 [早期 30 题评测](docs/reports/stage-05-acceptance.md)。
 
 ## 构建和隔离安装
 
@@ -14,7 +14,7 @@ npm run check
 npm pack
 # 首次创建隔离的 Web 配置，保持日常配置独立
 dsh --profile icpc-acceptance --from-default-profile web --help
-dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.12.tgz
+dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.13.tgz
 ```
 
 插件不需要位于 harness 源码树中，构建也不依赖相邻的 harness checkout。默认数据目录为系统应用数据目录中的 `dsh-icpc-workbench`。如需自定义，在宿主的配置覆盖文件中设置绝对路径：
@@ -48,7 +48,7 @@ dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
 
 ## 模型和训练规则
 
-所有模型任务统一使用 **DSV4.1 Flash**（dsh 中的 `deepseek-official/deepseek-flash`）：标签分析、复核、无题解推理、逐级提示与训练计划均为 **max**，默认输出上限 65536。旧配置升级时会统一模型并保留额度和超时；新设置不接受 Pro 或其他模型。Flash 不可用会报错，不会自动切换。详见 [统一模型策略](docs/flash-only-policy.md)。
+所有模型任务统一使用 **DSV4.1 Flash**（dsh 中的 `deepseek-official/deepseek-flash`）：标签分析、复核、无题解推理、逐级提示、训练计划与独立能力评估均为 **max**，默认输出上限 65536。旧配置升级时会统一模型并保留额度和超时；新设置不接受 Pro 或其他模型。Flash 不可用会报错，不会自动切换。详见 [统一模型策略](docs/flash-only-policy.md)。
 
 批次默认 20 题、50 次分析/复核调用、5 次推理调用，并发 2；重试计入额度，未知费用保留为未知。先准备并查看设置版本，再显式启动；版本变化需重新确认，重启不自动续跑。
 
@@ -92,3 +92,7 @@ dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
 个人水平不再由练习难度中位数推断；可保存带来源的账号自评范围用于新 AI 计划。见[个人水平校准](docs/ability-calibration.md)。
 
 自动分采用 CF 官方当前 rating，可同步完整比赛评分历史；历史最高分和个人自评分别保留。见[评分方法与来源](docs/ability-scoring.md)。
+
+训练计划与独立 AI 能力评估可选择安装的方法插件。综合方法分别观察思维和板子，优先补强阻碍下一阶段学习的方向；计划说明诊断、优先方向与每道题的训练目标。另附可选刻意练习方法，来源与文本许可独立保留。见 [安装、卸载和扩展方法](docs/guidance-plugins.md)。
+
+在「薄弱项 → 能力评估」免费准备并查看统计材料后，可生成持久保存的 AI 报告，参考官方 CF 评分、虚拟参赛表现、全部/近期/较早做题记录及各难度知识点证据。报告分开解释思维与板子、置信度和下一阶段条件；没有客观评分依据时保持分数未知。虚拟表现目前需录入已有计算结果及来源，未自动计算。见 [AI 评估流程与数据边界](docs/ai-ability-assessment.md)。

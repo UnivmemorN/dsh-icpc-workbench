@@ -120,13 +120,19 @@ export type AuditedJson = string | number | boolean | null | readonly AuditedJso
 /**
  * Roles this client may audit.
  *
- * The application's {@link ModelCallRole} union and its budget kinds are unchanged: `coaching` and
- * `planning` are parser-only roles of the audited client, added here and nowhere else.
+ * The application's {@link ModelCallRole} union and its budget kinds are unchanged: `coaching`,
+ * `planning` and `assessment` are parser-only roles of the audited client, added here and nowhere
+ * else.
  */
-export type AuditedModelRole = ModelCallRole | 'coaching' | 'planning';
+export type AuditedModelRole = ModelCallRole | 'coaching' | 'planning' | 'assessment';
 
 /** The accepted audit roles; the application's own role list stays untouched. */
-export const AUDITED_MODEL_ROLES: readonly AuditedModelRole[] = [...MODEL_CALL_ROLES, 'coaching', 'planning'];
+export const AUDITED_MODEL_ROLES: readonly AuditedModelRole[] = [
+  ...MODEL_CALL_ROLES,
+  'coaching',
+  'planning',
+  'assessment',
+];
 
 /** Pre-dispatch record: the exact input, messages and effective options of one call. */
 export interface IcpcModelCallAudit {

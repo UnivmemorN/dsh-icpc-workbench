@@ -68,6 +68,7 @@
  */
 import {
   DomainError,
+  MAX_GUIDANCE_SELECTION,
   assertIsoTimestamp,
   contentHashOf,
   createCancellationSource,
@@ -78,6 +79,7 @@ import {
   problemKey as canonicalProblemKeyOf,
   validateModelPlan,
   type CancellationToken,
+  type GuidanceSnapshot,
   type ModelUsage,
   type TrainingCandidate,
   type TrainingEvidence,
@@ -261,6 +263,18 @@ export interface PlanPrepareRequest {
    * typed conflict rather than a truncation.
    */
   readonly candidateProblemKeys?: readonly string[] | null;
+  /**
+   * Explicit installed training-method selection of this preparation (Sprint 18b), or
+   * omitted/`null` for the legacy unguided contract.
+   *
+   * When present it must hold `1..MAX_GUIDANCE_SELECTION` distinct installed method ids that offer
+   * plan guidance: the collaborator captures their exact definitions into the preparation, and the
+   * paid run then demands the guided answer shape (`diagnosis` plus a per-task `axis`/`objective`).
+   * A missing, replaced or plan-incapable method is a typed refusal before anything is stored —
+   * never a silent fallback to an unguided plan. When omitted, the preparation carries no capture at
+   * all and keeps the pre-guidance evidence hash.
+   */
+  readonly guidanceMethodIds?: readonly string[] | null;
   /** Show candidate tags and provisional raw labels in the returned preview. */
   readonly reveal?: boolean;
 }
@@ -342,6 +356,21 @@ export interface PlanningPreparationView {
   readonly weakness: PlanAttemptWeakness;
   readonly ability: PlanAttemptPreparation['ability'];
   readonly generator: PlanningGeneratorView;
+  /**
+   * The exact method ids this preparation was built under, or `null` for the legacy unguided
+   * contract (Sprint 18b); the same statement as {@link PlanningPreparationView.guidance}, in
+   * selector form.
+   */
+  readonly guidanceMethodIds: readonly string[] | null;
+  /**
+   * Immutable capture of the selected methods, or `null` when no method was involved.
+   *
+   * It carries the method text itself — never a pointer at "the currently installed" package — so the
+   * preparation stays readable and provably unchanged after a companion package is upgraded or
+   * uninstalled, and a later audit can prove what the paid call was shown.
+   */
+  readonly guidance: GuidanceSnapshot | null;
+  readonly virtualPerformance?: PlanAttemptPreparation['virtualPerformance'];
   /** Fixed disclosure text the UI must render before the paid call. */
   readonly disclosure: string;
   readonly spoilersVisible: boolean;
@@ -522,6 +551,7 @@ export class PlanningService {
         settings: parsed.settings,
         candidateLimit: parsed.candidateLimit,
         candidateProblemKeys: parsed.candidateProblemKeys,
+        guidanceMethodIds: parsed.guidanceMethodIds,
         preparedAt,
       },
       token,
@@ -1072,6 +1102,9 @@ export class PlanningService {
           return { attempt, error };
         }
         const settings = reservation.preparation.settings;
+        // The reservation's stored method capture — never the model answer — decides whether the
+        // answer is guided: a guided attempt must carry a diagnosis and a per-task axis/objective,
+        // and an unguided one must not invent them. No agnostic default exists.
         const validated = validateModelPlan({
           raw: draftToRaw(result.value.draft),
           candidates: reserved.candidates,
@@ -1082,6 +1115,7 @@ export class PlanningService {
           },
           now: at,
           accountId: reservation.accountId,
+          guided: reservation.preparation.guidanceSnapshot !== undefined,
         });
         if (!validated.ok || validated.plan === null) {
           const codes = validated.errors.map((entry) => entry.code).join(', ');
@@ -1114,7 +1148,7 @@ export class PlanningService {
           attemptedDistinctTotal: weak.attemptedDistinctTotal,
           sufficientTagIds: [...weak.sufficientTagIds],
         };
-        const planWithEvidence = deepFreeze({ ...validated.plan, evidence });
+        const planWithEvidence = deepFreeze({ ...validated.plan, evidence, ...(reservation.preparation.guidanceSnapshot === undefined ? {} : { guidanceSnapshot: reservation.preparation.guidanceSnapshot }) });
         assertStoredModelPlan(planWithEvidence, reservation.accountId, reservation.id);
         // Second re-validation under the non-cancellable settlement token: between dispatch and
         // this write the account, the candidate metadata, an AC, the effective tags or the ability
@@ -1525,6 +1559,7 @@ const PREPARE_REQUEST_KEYS: readonly string[] = [
   'settings',
   'candidateLimit',
   'candidateProblemKeys',
+  'guidanceMethodIds',
   'reveal',
 ];
 const RUN_REQUEST_KEYS: readonly string[] = ['requestId', 'accountId', 'expectedSettingsRevision'];
@@ -1538,6 +1573,8 @@ interface ParsedPrepare {
   readonly candidateLimit: number;
   /** `null` means the automatic pool; a list is the caller's explicit stored selection. */
   readonly candidateProblemKeys: readonly string[] | null;
+  /** `null` means the legacy unguided contract; a list is the caller's explicit method selection. */
+  readonly guidanceMethodIds: readonly string[] | null;
   readonly reveal: boolean;
 }
 
@@ -1630,6 +1667,7 @@ function parsePrepareRequest(request: PlanPrepareRequest): ParsedPrepare {
     throw new PlanningServiceError('invalid_request', 'prepare reveal must be boolean when present', {});
   }
   const candidateProblemKeys = parseCandidateSelection(request.candidateProblemKeys);
+  const guidanceMethodIds = parseGuidanceSelection(request.guidanceMethodIds);
   if (
     candidateProblemKeys !== null &&
     limit !== undefined &&
@@ -1659,6 +1697,7 @@ function parsePrepareRequest(request: PlanPrepareRequest): ParsedPrepare {
           : Math.max(1, candidateProblemKeys.length)
         : limit,
     candidateProblemKeys,
+    guidanceMethodIds,
     reveal: request.reveal === true,
   };
 }
@@ -1784,6 +1823,20 @@ function assertPrepareIdentity(attempt: PlanAttempt, parsed: ParsedPrepare): voi
       },
     );
   }
+  const storedGuidance = attempt.preparation.guidanceSnapshot;
+  const storedGuidanceIds = storedGuidance === undefined ? null : [...storedGuidance.selectedMethodIds];
+  if (canonicalGuidance(storedGuidanceIds) !== canonicalGuidance(parsed.guidanceMethodIds)) {
+    throw new PlanningServiceError(
+      'request_conflict',
+      `requestId ${parsed.requestId} was prepared with a different training-method selection; generate a new request id instead of reusing one`,
+      {
+        requestId: parsed.requestId,
+        reason: 'request_guidance_conflict',
+        stored: storedGuidanceIds,
+        requested: parsed.guidanceMethodIds,
+      },
+    );
+  }
 }
 
 /** A stored attempt is only ever read/written for its own account. */
@@ -1810,6 +1863,17 @@ function canonicalSettings(settings: PlanAttemptSettings): string {
  */
 function canonicalSelection(selection: readonly string[] | null): string {
   return contentHashOf(selection === null ? { scope: 'automatic' } : { scope: 'explicit', keys: selection });
+}
+
+/**
+ * Canonical form of a requested training-method selection.
+ *
+ * `null` is the legacy unguided contract and hashes as its own scope marker, so it can never compare
+ * equal to an explicit selection. The explicit list stays **order-sensitive**, because a method's own
+ * training steps are ordered and the caller's order is the order the model is shown.
+ */
+function canonicalGuidance(selection: readonly string[] | null): string {
+  return contentHashOf(selection === null ? { scope: 'legacy_unguided' } : { scope: 'methods', ids: selection });
 }
 
 /**
@@ -1875,6 +1939,63 @@ function parseCandidateSelection(value: readonly string[] | null | undefined): r
     keys.push(key);
   }
   return keys;
+}
+
+/**
+ * Validate one explicit training-method selection: distinct non-empty ids, bounded like the domain
+ * capture.
+ *
+ * `undefined`/`null` is the legacy unguided contract and is preserved as `null`. An explicit empty
+ * list is refused instead of being read as "no method": the AI planning path either follows an
+ * installed method capture or runs the legacy contract, and a silently unguided paid plan is exactly
+ * what that rule forbids.
+ */
+function parseGuidanceSelection(value: readonly string[] | null | undefined): readonly string[] | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Array.isArray(value)) {
+    throw new PlanningServiceError(
+      'invalid_request',
+      'guidanceMethodIds must be an array of installed method ids when present',
+      {},
+    );
+  }
+  if (value.length === 0) {
+    throw new PlanningServiceError(
+      'invalid_request',
+      'an explicit guidanceMethodIds list needs at least one installed training method; omit the field for the legacy unguided preparation',
+      { reason: 'missing_method' },
+    );
+  }
+  if (value.length > MAX_GUIDANCE_SELECTION) {
+    throw new PlanningServiceError(
+      'invalid_request',
+      `guidanceMethodIds holds at most ${MAX_GUIDANCE_SELECTION} methods`,
+      { reason: 'selection_too_long', length: value.length, bound: MAX_GUIDANCE_SELECTION },
+    );
+  }
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.trim().length === 0) {
+      throw new PlanningServiceError(
+        'invalid_request',
+        'every guidanceMethodIds entry must be a non-empty installed method id',
+        { entry },
+      );
+    }
+    const id = entry.trim();
+    if (seen.has(id)) {
+      throw new PlanningServiceError('invalid_request', `guidanceMethodIds repeats ${id}`, {
+        reason: 'duplicate_selection',
+        methodId: id,
+      });
+    }
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
 }
 
 /** Page size of one account-scoped history read: bounded to the approved maximum. */
@@ -1944,6 +2065,12 @@ function generationRequestOf(
     })),
     weakTags: preparation.weakness.ranking.map((tag) => ({ ...tag })),
     attemptedDistinctTotal: preparation.weakness.attemptedDistinctTotal,
+    // `null` for the legacy unguided contract; a guided call carries the exact stored capture, so the
+    // adapter can inject the selected methods' plan guidance and demand the guided answer shape.
+    guidance: preparation.guidanceSnapshot ?? null,
+    // The identifier-free virtual-contest capture, or `null` when the preparation predates Sprint
+    // 18c. It carries no account id, contest id, note, URL, rank or exact timestamp.
+    virtualPerformance: preparation.virtualPerformance ?? null,
   };
 }
 
@@ -1951,11 +2078,17 @@ function generationRequestOf(
 function draftToRaw(draft: PlanGenerationDraft): unknown {
   return {
     ...(draft.title === null ? {} : { title: draft.title }),
+    // The guided fields are handed to the domain parser whenever the answer carries them, including
+    // for an unguided attempt: the validator decides from the reservation whether they were required
+    // or forbidden, so nothing is dropped here and silently forgiven.
+    ...(draft.diagnosis === null || draft.diagnosis === undefined ? {} : { diagnosis: draft.diagnosis }),
     tasks: draft.tasks.map((task) => ({
       candidateId: task.candidateId,
       day: task.day,
       ...(task.minutes === null ? {} : { minutes: task.minutes }),
       ...(task.kind === null ? {} : { kind: task.kind }),
+      ...(task.axis === null || task.axis === undefined ? {} : { axis: task.axis }),
+      ...(task.objective === null || task.objective === undefined ? {} : { objective: task.objective }),
     })),
   };
 }
@@ -1985,7 +2118,9 @@ function attemptView(attempt: PlanAttempt): PlanningAttemptView {
  *
  * Candidate tags and provisional raw labels stay **absent** own properties unless the caller asked
  * for spoilers explicitly, exactly like the bank projections; the aggregate weakness and the
- * identifier-free ability summary are aggregate statements and stay visible.
+ * identifier-free ability summary are aggregate statements and stay visible. The training-method
+ * capture is public instructional text and is returned in full; `null` states the legacy unguided
+ * contract and is never a substituted method.
  */
 function preparationView(
   attempt: PlanAttempt,
@@ -2017,6 +2152,10 @@ function preparationView(
       quotaWindowMs: PLANNING_QUOTA_WINDOW_MS,
       maxConcurrent: PLANNING_MAX_CONCURRENT,
     },
+    guidanceMethodIds:
+      preparation.guidanceSnapshot === undefined ? null : [...preparation.guidanceSnapshot.selectedMethodIds],
+    guidance: preparation.guidanceSnapshot ?? null,
+    ...(preparation.virtualPerformance === undefined ? {} : {virtualPerformance:preparation.virtualPerformance}),
     disclosure: PLANNING_DISCLOSURE,
     spoilersVisible: reveal,
     contentHash: attempt.inputHash,

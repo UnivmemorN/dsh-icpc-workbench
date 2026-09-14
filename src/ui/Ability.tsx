@@ -1,6 +1,8 @@
 import { OfficialRating } from './OfficialRating.js';
+import { AiAssessment } from './AiAssessment.js';
 import { AbilityCalibrationEditor } from './AbilityCalibration.js';
 import { AbilityHistory } from './AbilityHistory.js';
+import { VirtualPerformance } from './VirtualPerformance.js';
 import type { ApiWeaknessResult } from '../application/workbench-api.js';
 import { Empty, Notice, Panel, Stats } from './common.js';
 import {
@@ -23,12 +25,14 @@ export function Ability({ ability, onSaved }: { ability: AbilityViewData; onSave
   const estimate = ability.estimate;
   const estimated = estimate.status === 'estimated';
   return (
+    <>
     <Panel title="能力评估与练习记录">
       <Notice>
         个人水平与练习选题是两个不同的量：基础题练得多、近期题目变简单，都不能据此降低能力评价。
         自动分使用官方比赛 rating，已保存的自评可作为计划的主要水平参考。{ABILITY_NO_CONVERSION_NOTE}
       </Notice>
       <OfficialRating key={ability.accountId} ability={ability} onSaved={onSaved} />
+      <AiAssessment key={ability.accountId} accountId={ability.accountId} />
       <AbilityCalibrationEditor key={ability.accountId + ':' + ability.trainingReference.revision} ability={ability} onSaved={onSaved} />
       <AbilityHistory history={ability.history} platform={ability.platform} />
       <details>
@@ -121,5 +125,7 @@ export function Ability({ ability, onSaved }: { ability: AbilityViewData; onSave
         。训练计划使用个人水平校准、聚合练习统计与真实候选题：发给模型的摘要只含聚合量，不含账号标识、提交明细或复盘笔记。
       </p>
     </Panel>
+    <VirtualPerformance key={ability.accountId} accountId={ability.accountId} platform={ability.platform} onSaved={onSaved} />
+    </>
   );
 }

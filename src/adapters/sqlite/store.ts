@@ -65,6 +65,7 @@ import {
   problemKey,
   recoverAfterRestart,
   transitionJob,
+  validateVirtualPerformanceLedger,
   type Account,
   type AnalysisJobState,
   type AnalysisJobStatus,
@@ -79,6 +80,7 @@ import {
   type Submission,
   type TagDecision,
   type TrainingPlan,
+  type VirtualPerformanceLedger,
 } from '../../domain/index.js';
 import {
   BROWSE_PAGE_LIMITS,
@@ -140,6 +142,16 @@ import {
   type SyncResource,
 } from '../../application/storage-types.js';
 import {
+  ASSESSMENT_ATTEMPT_STATUSES,
+  validateAssessmentAttempt,
+  validateAssessmentAttemptTransition,
+  type AssessmentAttempt,
+  type AssessmentAttemptCountQuery,
+  type AssessmentAttemptQuery,
+  type AssessmentAttemptStatus,
+  type AssessmentStore,
+} from '../../application/assessment-types.js';
+import {
   PLAN_ATTEMPT_STATUSES,
   validatePlanAttempt,
   validatePlanAttemptTransition,
@@ -175,6 +187,7 @@ import {
   MANUAL_DECISION_FIELDS,
   MODEL_CALL_ATTEMPT_FIELDS,
   PLAN_FIELDS,
+  PLAN_OPTIONAL_FIELDS,
   PLAN_ATTEMPT_FIELDS,
   PROBLEM_FIELDS,
   RETROSPECTIVE_FIELDS,
@@ -203,6 +216,7 @@ import {
   SCHEMA_VERSION_V4,
   SCHEMA_VERSION_V5,
   SCHEMA_VERSION_V6,
+  SCHEMA_VERSION_V7,
   SCHEMA_VERSION_V1,
   SCHEMA_VERSION_V2,
   SCHEMA_VERSION_V3,
@@ -211,7 +225,7 @@ import {
   backupFileName,
   configureConnection,
   detectSchemaState,
-  migrateToSchemaV7,
+  migrateToSchemaV8,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -296,8 +310,55 @@ function originOf(value: string): string | null {
   }
 }
 
+/**
+ * Fields projected into `ability_evaluation_attempts.body`.
+ *
+ * The body is the record: declared fields only, so an undeclared member cannot be persisted, and the
+ * row's own columns stay the indexed identity the reads re-check against the body.
+ */
+const ASSESSMENT_ATTEMPT_FIELDS: readonly string[] = [
+  'id',
+  'accountId',
+  'sourceInstanceId',
+  'status',
+  'requestedAt',
+  'expiresAt',
+  'finishedAt',
+  'provider',
+  'model',
+  'promptVersion',
+  'settingsRevision',
+  'inputHash',
+  'revision',
+  'preparation',
+  'hostSessionId',
+  'hostCallId',
+  'usage',
+  'report',
+  'error',
+];
+
+/** Validate one assessment status filter or charged-status value. */
+function requireAssessmentStatus(status: AssessmentAttemptStatus): AssessmentAttemptStatus {
+  invariant(
+    ASSESSMENT_ATTEMPT_STATUSES.includes(status),
+    'invalid_input',
+    `unknown assessment status ${String(status)}`,
+    { status },
+  );
+  return status;
+}
+
+/** Refuse an unknown assessment page ordering (a value outside the declared union). */
+function invalidAssessmentOrder(order: unknown): never {
+  throw new DomainError('invalid_input', `unknown assessment order ${String(order)}`, {
+    reason: 'invalid_assessment_order',
+    order,
+  });
+}
+
 export class SqliteTrainingStore
-  implements TrainingStore, SettingsStore, CoachingStore, PlanningStore, LuoguSyncStore
+  implements TrainingStore, SettingsStore, CoachingStore, PlanningStore, AssessmentStore, LuoguSyncStore
 {
   readonly path: string;
 
@@ -373,13 +434,15 @@ export class SqliteTrainingStore
       transactional: true,
       notes: [
         `node:sqlite DatabaseSync; schema marker ${STORE_MARKER}; one serialized connection`,
-        'Databases from a newer schema are rejected before any write; v0 through v6 databases are migrated after a verified consistent backup',
+        'Databases from a newer schema are rejected before any write; v0 through v7 databases are migrated after a verified consistent backup',
         'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
         'Batches are revision-guarded with monotonic counters; model-call attempts move reserved -> uncertain|settled and settled rows are immutable',
         'Workbench settings are a singleton row saved under revision CAS',
         'Coaching attempts are indexed audits: reserved -> uncertain|settled, settled rows immutable, bodies re-validated on read, bounded cursor pages over a three-valued account scope, global count',
         'AI planning attempts are indexed audits of their own: prepared (free, never charged) -> reserved (single in-flight call, lease recovery) | cancelled, reserved -> settled|uncertain, terminal rows immutable, bodies re-validated on read, account-scoped cursor pages and a global rolling-window count',
         'Luogu sync settings, durable state and connection references are per-account rows saved under revision CAS; disconnecting must pass the revision it read, and no cookie or session value is representable',
+        'Virtual-contest performance ledgers are one revision-guarded row per account holding user-entered Codeforces evidence only; every save and delete appends the next revision (an emptied ledger keeps its row), bodies are re-validated on read, and no official rating snapshot is ever written by this path',
+        'Ability-assessment attempts are indexed audits on ability_evaluation_attempts: prepared (free, never charged) -> reserved (single in-flight paid call, lease recovery) | cancelled, reserved -> settled|uncertain|cancelled, revision-CAS saves, terminal rows immutable, bodies re-validated against their identity columns on read, account-scoped cursor pages and a global rolling-window count',
       ],
     };
   }
@@ -643,6 +706,51 @@ export class SqliteTrainingStore
       const current = this.find('SELECT revision FROM ability_calibrations WHERE account_id = ? ORDER BY revision DESC LIMIT 1', [value.accountId]);
       invariant((current === null ? 0 : intColumn(current, 'revision')) === expectedRevision, 'invalid_transition', 'calibration revision changed');
       this.write('INSERT INTO ability_calibrations (account_id, revision, body) VALUES (?, ?, ?)', [value.accountId, value.revision, canonicalJson(value)]);
+    });
+  }
+
+  /**
+   * One account's user-entered virtual-contest performance ledger, or `null`.
+   *
+   * The stored body is re-validated on read and cross-checked against the row's own identity
+   * columns, so a hand-edited body — or one naming another account or revision — is reported as
+   * `corrupt_row` instead of being handed out as a servable ledger.
+   */
+  async getVirtualPerformanceLedger(accountId: string): Promise<VirtualPerformanceLedger | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT account_id, revision, body FROM virtual_performance_ledgers WHERE account_id = ?', [requireId('account id', accountId)]);
+      if (row === null) return null;
+      try {
+        const value = validateVirtualPerformanceLedger(JSON.parse(textColumn(row, 'body')));
+        invariant(value.accountId === accountId && value.revision === intColumn(row, 'revision'), 'invalid_input', 'virtual performance ledger identity mismatch');
+        return value;
+      } catch (error) { throw new StorageError('corrupt_row', 'invalid virtual performance ledger body', { cause: String(error) }); }
+    });
+  }
+
+  /**
+   * Append the next ledger revision under compare-and-set.
+   *
+   * The account must already be stored and the incoming record must be exactly `expectedRevision + 1`
+   * of its own validated body; a stale `expectedRevision` rejects before any write, so a caller that
+   * read an older ledger can neither overwrite a newer one nor resurrect deleted rows. The row is
+   * kept (and its revision advanced) even when its entry list is empty, which is what makes a delete
+   * monotonic. Nothing here writes an official rating snapshot.
+   */
+  async saveVirtualPerformanceLedger(record: VirtualPerformanceLedger, expectedRevision: number): Promise<void> {
+    this.assertOpen();
+    const value = validateVirtualPerformanceLedger(record);
+    invariant(Number.isSafeInteger(expectedRevision) && expectedRevision >= 0 && value.revision === expectedRevision + 1, 'invalid_input', 'virtual performance ledger must append the next revision');
+    return this.withWrite(() => {
+      invariant(this.find('SELECT id FROM accounts WHERE id = ?', [value.accountId]) !== null, 'missing_reference', 'virtual performance ledger account is not stored');
+      const current = this.find('SELECT revision FROM virtual_performance_ledgers WHERE account_id = ?', [value.accountId]);
+      invariant((current === null ? 0 : intColumn(current, 'revision')) === expectedRevision, 'invalid_transition', 'virtual performance ledger revision changed');
+      this.write(
+        `INSERT INTO virtual_performance_ledgers (account_id, revision, body) VALUES (?, ?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET revision = excluded.revision, body = excluded.body`,
+        [value.accountId, value.revision, canonicalJson(value)],
+      );
     });
   }
 
@@ -1777,6 +1885,279 @@ export class SqliteTrainingStore
   }
 
   // -------------------------------------------------------------------------------------
+  // Ability-assessment attempts (AssessmentStore)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * One assessment attempt by id, or `null`.
+   *
+   * The stored canonical body is the record, and it is re-validated on read together with the row's
+   * own identity columns (id, account, status, requested/expiry instants): a hand-edited body, a body
+   * that disagrees with its columns, or a malformed capture is reported as `corrupt_row` instead of
+   * being cast to an attempt. A row that claims an account whose column names another is refused for
+   * the same reason — an attempt is never served under a borrowed identity.
+   */
+  async getAssessmentAttempt(id: string): Promise<AssessmentAttempt | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find(
+        `SELECT id, account_id, status, requested_at, expires_at, body FROM ability_evaluation_attempts WHERE id = ?`,
+        [requireId('assessment attempt id', id)],
+      );
+      return row === null ? null : this.readAssessmentAttempt(row);
+    });
+  }
+
+  /** Insert a free preparation or advance it; see {@link AssessmentStore.saveAssessmentAttempt}. */
+  async saveAssessmentAttempt(attempt: AssessmentAttempt): Promise<void> {
+    this.assertOpen();
+    return this.withWrite(() => this.writeAssessmentAttempt(attempt));
+  }
+
+  /**
+   * One page of assessment attempts in deterministic `requestedAt, id` order.
+   *
+   * Continuation is keyset-based, never `OFFSET`, and the opaque cursor is bound to the effective
+   * filter set (account scope, status, inclusive `since` **and** ordering): a cursor produced by
+   * another query is rejected instead of silently paging a different history. `accountId` omitted or
+   * `null` reads every account (the global recovery/quota walk); a string reads that account alone,
+   * so an account-scoped history can never mix two accounts.
+   */
+  async listAssessmentAttempts(query: AssessmentAttemptQuery): Promise<Page<AssessmentAttempt>> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const limit = pageLimit(query.limit);
+      const filters = this.assessmentFilters(query);
+      const fingerprint = contentHashOf(filters).slice(0, 32);
+      const cursor = query.cursor === null ? null : this.decodeAssessmentCursor(query.cursor, fingerprint);
+      const descending = filters.order === 'desc';
+      const clauses: string[] = [];
+      const params: SqlValue[] = [];
+      if (filters.accountId !== null) {
+        clauses.push('account_id = ?');
+        params.push(filters.accountId);
+      }
+      if (filters.status !== null) {
+        clauses.push('status = ?');
+        params.push(filters.status);
+      }
+      if (filters.since !== null) {
+        clauses.push('requested_at >= ?');
+        params.push(filters.since);
+      }
+      if (cursor !== null) {
+        // Keyset continuation on the selected order: strictly after the last key in that direction.
+        clauses.push(
+          descending
+            ? '(requested_at < ? OR (requested_at = ? AND id < ?))'
+            : '(requested_at > ? OR (requested_at = ? AND id > ?))',
+        );
+        params.push(cursor.requestedAt, cursor.requestedAt, cursor.id);
+      }
+      const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+      // Only the boolean direction, never caller text, reaches the statement.
+      const direction = descending ? 'DESC' : 'ASC';
+      const rows = this.all(
+        `SELECT id, account_id, status, requested_at, expires_at, body FROM ability_evaluation_attempts${where}
+          ORDER BY requested_at ${direction}, id ${direction} LIMIT ?`,
+        [...params, limit + 1],
+      );
+      const items = rows.slice(0, limit).map((row) => this.readAssessmentAttempt(row));
+      const last = items.at(-1);
+      return {
+        items,
+        nextCursor:
+          rows.length > limit && last !== undefined
+            ? encodeCursor('assessment', JSON.stringify({ f: fingerprint, t: last.requestedAt, i: last.id }))
+            : null,
+        fetchedAt: this.clock(),
+      };
+    });
+  }
+
+  /**
+   * Count assessment attempts for the plugin-wide rolling quota.
+   *
+   * A single `COUNT(*)` resolves through the v8 indexes and never loads attempt bodies. There is no
+   * account scope here on purpose — the budget is plugin-wide, so switching accounts cannot hand out
+   * a fresh allowance — and the caller supplies the charged statuses, so a free `prepared` row can
+   * never be counted as a call.
+   */
+  async countAssessmentAttempts(query: AssessmentAttemptCountQuery): Promise<number> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const clauses: string[] = [];
+      const params: SqlValue[] = [];
+      if (query.since !== undefined && query.since !== null) {
+        clauses.push('requested_at >= ?');
+        params.push(assertIsoTimestamp('assessment since', query.since));
+      }
+      if (query.statuses !== undefined && query.statuses !== null) {
+        const statuses = query.statuses.map((status) => requireAssessmentStatus(status));
+        invariant(
+          statuses.length > 0,
+          'invalid_input',
+          'an assessment count with an empty status list matches nothing by construction; omit the filter instead',
+          { reason: 'empty_status_list' },
+        );
+        clauses.push(`status IN (${statuses.map(() => '?').join(', ')})`);
+        params.push(...statuses);
+      }
+      const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+      const row = this.find(`SELECT COUNT(*) AS total FROM ability_evaluation_attempts${where}`, params);
+      return row === null ? 0 : intColumn(row, 'total');
+    });
+  }
+
+  /** Normalize the filter set of one assessment page; the ordering is part of the cursor binding. */
+  private assessmentFilters(query: AssessmentAttemptQuery): {
+    readonly accountId: string | null;
+    readonly status: AssessmentAttemptStatus | null;
+    readonly since: string | null;
+    readonly order: 'asc' | 'desc';
+  } {
+    return {
+      accountId:
+        query.accountId === undefined || query.accountId === null
+          ? null
+          : requireId('assessment account id', query.accountId),
+      status: query.status === undefined || query.status === null ? null : requireAssessmentStatus(query.status),
+      since:
+        query.since === undefined || query.since === null
+          ? null
+          : assertIsoTimestamp('assessment since', query.since),
+      order: query.order === 'desc' ? 'desc' : query.order === undefined || query.order === null || query.order === 'asc' ? 'asc' : invalidAssessmentOrder(query.order),
+    };
+  }
+
+  /** Decode an assessment cursor and refuse one produced under different filters or ordering. */
+  private decodeAssessmentCursor(cursor: string, fingerprint: string): { requestedAt: string; id: string } {
+    const payload = decodeCursor('assessment', cursor);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch (error) {
+      throw new DomainError('invalid_input', 'assessment cursor payload is not valid JSON', { cause: String(error) });
+    }
+    invariant(
+      parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed),
+      'invalid_input',
+      'assessment cursor payload must be an object',
+      { cursor },
+    );
+    const record = parsed as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    invariant(
+      keys.length === 3 && keys[0] === 'f' && keys[1] === 'i' && keys[2] === 't',
+      'invalid_input',
+      'assessment cursor payload has an unexpected shape',
+      { cursor, keys },
+    );
+    const bound = record['f'];
+    const requestedAt = record['t'];
+    const id = record['i'];
+    invariant(
+      typeof bound === 'string' && typeof requestedAt === 'string' && typeof id === 'string' && id.length > 0,
+      'invalid_input',
+      'assessment cursor payload fields must be strings',
+      { cursor },
+    );
+    invariant(
+      bound === fingerprint,
+      'invalid_input',
+      'assessment cursor belongs to a different filter set; re-read the first page',
+      { cursor, reason: 'cursor_filter_mismatch' },
+    );
+    invariant(
+      Number.isFinite(Date.parse(requestedAt)),
+      'invalid_input',
+      'assessment cursor timestamp is not parseable',
+      { cursor, reason: 'cursor_time' },
+    );
+    return { requestedAt: new Date(Date.parse(requestedAt)).toISOString(), id };
+  }
+
+  /**
+   * Insert one prepared assessment attempt, or advance an existing one.
+   *
+   * A new attempt must be `prepared` at revision 1: the free preparation is what the paid call is
+   * bound to, so a dispatched or settled call can never be recorded first (and a duplicate id cannot
+   * overwrite a charged attempt). An identical re-save is a no-op so recovery may replay a record;
+   * otherwise the stored row is re-read and the application validator enforces identity immutability,
+   * the next revision, forward-only statuses, a fixed lease and outcome preservation. The indexed
+   * `status`/`requested_at`/`expires_at` columns move with the body, so a reader can never see a new
+   * body under an old status.
+   */
+  private writeAssessmentAttempt(value: AssessmentAttempt): void {
+    const attempt = validateAssessmentAttempt(value);
+    const body = bodyOf(attempt, ASSESSMENT_ATTEMPT_FIELDS);
+    const existing = this.find(
+      `SELECT id, account_id, status, requested_at, expires_at, body FROM ability_evaluation_attempts WHERE id = ?`,
+      [attempt.id],
+    );
+    if (existing === null) {
+      invariant(
+        attempt.status === 'prepared',
+        'invalid_transition',
+        `assessment attempt ${attempt.id} must be inserted as prepared before any paid call`,
+        { id: attempt.id, status: attempt.status },
+      );
+      invariant(
+        attempt.revision === 1,
+        'invalid_input',
+        `assessment attempt ${attempt.id} must be inserted at revision 1`,
+        { id: attempt.id, revision: attempt.revision },
+      );
+      this.write(
+        `INSERT INTO ability_evaluation_attempts (id, account_id, status, requested_at, expires_at, body)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [attempt.id, attempt.accountId, attempt.status, attempt.requestedAt, attempt.expiresAt, body],
+      );
+      return;
+    }
+    if (textColumn(existing, 'body') === body) {
+      return;
+    }
+    const stored = this.readAssessmentAttempt(existing);
+    validateAssessmentAttemptTransition(stored, attempt);
+    this.write(
+      `UPDATE ability_evaluation_attempts SET status = ?, requested_at = ?, expires_at = ?, body = ? WHERE id = ?`,
+      [attempt.status, attempt.requestedAt, attempt.expiresAt, body, attempt.id],
+    );
+  }
+
+  /**
+   * Decode one assessment attempt from its stored canonical body and prove it against its columns.
+   *
+   * This is the one place a stored assessment row becomes an application object, so a body that is
+   * not a valid attempt (hand-edited, truncated or written by a buggy build) is `corrupt_row`, and a
+   * body whose identity disagrees with its indexed columns is refused as well.
+   */
+  private readAssessmentAttempt(row: Row): AssessmentAttempt {
+    let attempt: AssessmentAttempt;
+    try {
+      attempt = validateAssessmentAttempt(
+        parseBody<unknown>('ability_evaluation_attempts.body', textColumn(row, 'body')),
+      );
+    } catch (error) {
+      throw new StorageError('corrupt_row', 'stored assessment attempt is not a valid attempt', {
+        cause: String(error),
+      });
+    }
+    invariant(
+      attempt.id === textColumn(row, 'id') &&
+        attempt.accountId === textColumn(row, 'account_id') &&
+        attempt.status === textColumn(row, 'status') &&
+        attempt.requestedAt === textColumn(row, 'requested_at') &&
+        attempt.expiresAt === textColumn(row, 'expires_at'),
+      'invalid_input',
+      `stored assessment attempt ${attempt.id} disagrees with its own identity columns`,
+      { reason: 'assessment_row_mismatch', attemptId: attempt.id },
+    );
+    return attempt;
+  }
+
+  // -------------------------------------------------------------------------------------
   // Luogu synchronization state (LuoguSyncStore)
   // -------------------------------------------------------------------------------------
 
@@ -2535,7 +2916,7 @@ export class SqliteTrainingStore
        VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(plan_id) DO UPDATE SET account_id = excluded.account_id, status = excluded.status,
          created_at = excluded.created_at, adopted_at = excluded.adopted_at, body = excluded.body`,
-      [plan.planId, plan.accountId, plan.status, plan.createdAt, plan.adoptedAt, bodyOf(plan, PLAN_FIELDS)],
+      [plan.planId, plan.accountId, plan.status, plan.createdAt, plan.adoptedAt, bodyOf(plan, PLAN_FIELDS, PLAN_OPTIONAL_FIELDS)],
     );
   }
 
@@ -3059,7 +3440,7 @@ export class SqliteTrainingStore
    *    so the backup is the database as it was found and switching the journal mode is not part
    *    of the pre-migration state. The copy is verified before migration starts, at the literal
    *    version the file was found in.
-   * 3. `migrateToSchemaV7` applies only the missing versions in one transaction and ends at the
+   * 3. `migrateToSchemaV8` applies only the missing versions in one transaction and ends at the
    *    current version; every existing row is retained, and exactly one pre-migration backup was
    *    already taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
@@ -3075,7 +3456,8 @@ export class SqliteTrainingStore
       state === 'v3' ||
       state === 'v4' ||
       state === 'v5' ||
-      state === 'v6'
+      state === 'v6' ||
+      state === 'v7'
     ) {
       // Keep a consistent copy of the database as found before any migration writes to it.
       const from =
@@ -3091,14 +3473,16 @@ export class SqliteTrainingStore
                   ? SCHEMA_VERSION_V4
                   : state === 'v5'
                     ? SCHEMA_VERSION_V5
-                    : SCHEMA_VERSION_V6;
+                    : state === 'v6'
+                      ? SCHEMA_VERSION_V6
+                      : SCHEMA_VERSION_V7;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
       this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        migrateToSchemaV7(this.connection, readUserVersion(this.connection));
+        migrateToSchemaV8(this.connection, readUserVersion(this.connection));
       } catch (error) {
         if (error instanceof StorageError) {
           throw error;

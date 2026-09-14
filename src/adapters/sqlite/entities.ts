@@ -6,7 +6,9 @@
  * - **Only declared fields are persisted.** Every entity is projected onto an explicit field
  *   list before it becomes a JSON body, so a caller cannot smuggle an undeclared member
  *   (a cookie, a token, a UI-only hint) into the database. Accounts and source instances are
- *   the important case: a credential has no column and no body field to live in.
+ *   the important case: a credential has no column and no body field to live in. A plan's guided
+ *   fields are declared but optional, so an absent one is omitted rather than written as `null`
+ *   and a body that predates guided planning keeps its exact hash.
  * - **Reading is strict.** A row that lost a column, holds malformed JSON or holds a body
  *   that is not a JSON object raises `corrupt_row` instead of returning `undefined` or a
  *   half-built object. These are structural boundary checks: a parsed object is handed to the
@@ -146,6 +148,14 @@ export const RETROSPECTIVE_FIELDS: readonly string[] = [
   'recordedAt',
   'note',
 ];
+/**
+ * Declared fields of one training plan.
+ *
+ * `diagnosis` and `guidanceSnapshot` are the guided-plan fields of Sprint 18b. They are declared
+ * here so a stored body round-trips them, but they are **optional** (see
+ * {@link PLAN_OPTIONAL_FIELDS}): a rule plan or a plan stored before guided planning has neither
+ * member, and writing `null` for it would rewrite the stored body and its content hash.
+ */
 export const PLAN_FIELDS: readonly string[] = [
   'planId',
   'title',
@@ -159,7 +169,11 @@ export const PLAN_FIELDS: readonly string[] = [
   'tasks',
   'evidence',
   'unmetMinutes',
+  'diagnosis',
+  'guidanceSnapshot',
 ];
+/** Plan fields persisted only when the plan actually carries them (the Sprint 18b guided fields). */
+export const PLAN_OPTIONAL_FIELDS: readonly string[] = ['diagnosis', 'guidanceSnapshot'];
 export const BATCH_FIELDS: readonly string[] = [
   'batchId',
   'jobs',
@@ -344,13 +358,28 @@ export function entityFromRow<T>(label: string, row: Row): T {
   return parseBody<T>(label, textColumn(row, 'body'));
 }
 
-/** Project onto declared fields and encode deterministically (sorted keys). */
-export function project(value: object, fields: readonly string[]): Record<string, unknown> {
+/**
+ * Project onto declared fields and encode deterministically (sorted keys).
+ *
+ * A field listed in `optionalFields` may be absent; it is then **omitted** from the projection
+ * instead of being written as an explicit `null`, so an entity that never carried a guided field
+ * keeps the exact body (and content hash) it had before that field existed. A required field that
+ * is missing is still a domain defect and is refused.
+ */
+export function project(
+  value: object,
+  fields: readonly string[],
+  optionalFields: readonly string[] = [],
+): Record<string, unknown> {
   const record = value as Record<string, unknown>;
+  const optional = new Set(optionalFields);
   const projected: Record<string, unknown> = {};
   for (const field of fields) {
     const member = record[field];
     if (member === undefined) {
+      if (optional.has(field)) {
+        continue;
+      }
       throw new DomainError('non_serializable_content', `entity is missing required field ${field}`, { field });
     }
     projected[field] = member;
@@ -359,8 +388,8 @@ export function project(value: object, fields: readonly string[]): Record<string
 }
 
 /** Canonical JSON body of one entity, limited to its declared fields. */
-export function bodyOf(value: object, fields: readonly string[]): string {
-  return canonicalJson(project(value, fields));
+export function bodyOf(value: object, fields: readonly string[], optionalFields: readonly string[] = []): string {
+  return canonicalJson(project(value, fields, optionalFields));
 }
 
 /** Reject a problem key that is not the canonical key of a real problem reference. */
@@ -473,7 +502,7 @@ export function jobCounters(state: Pick<AnalysisJobState, 'attempts' | 'counters
 // Cursor codec
 // ---------------------------------------------------------------------------------------
 
-export type CursorKind = 'problem' | 'submission' | 'coaching' | 'plan';
+export type CursorKind = 'problem' | 'submission' | 'coaching' | 'plan' | 'assessment';
 
 const CURSOR_PAYLOAD = /^[A-Za-z0-9_-]+$/u;
 

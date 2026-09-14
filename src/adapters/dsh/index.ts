@@ -39,11 +39,23 @@ export type { DshCoachingGeneratorClient, DshCoachingGeneratorOptions } from './
 
 export {
   DshPlanGenerator,
+  PLANNING_GUIDANCE_HEADING,
   PLANNING_SYSTEM_PROMPT,
   PLANNING_TEMPERATURE,
   parsePlanGenerationOutput,
+  planningGuidedSystemPrompt,
 } from './plan-generator.js';
-export type { DshPlanGeneratorClient, DshPlanGeneratorOptions } from './plan-generator.js';
+export type { DshPlanGeneratorClient, DshPlanGeneratorOptions, ParsePlanGenerationOptions } from './plan-generator.js';
+
+export {
+  ASSESSMENT_GUIDANCE_HEADING,
+  ASSESSMENT_SYSTEM_PROMPT,
+  ASSESSMENT_TEMPERATURE,
+  DshAssessmentGenerator,
+  assessmentGuidedSystemPrompt,
+  parseAssessmentOutput,
+} from './assessment-generator.js';
+export type { DshAssessmentGeneratorClient, DshAssessmentGeneratorOptions } from './assessment-generator.js';
 
 export {
   MAX_ANALYSIS_SUGGESTIONS,

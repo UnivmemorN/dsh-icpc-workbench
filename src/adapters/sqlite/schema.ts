@@ -10,7 +10,7 @@
  * - **v0** means "no store tables yet": an empty file is initialized transactionally, a file
  *   with our marker table but no data tables is migrated after a consistent backup, and any
  *   other v0 layout is rejected instead of being migrated.
- * - **v1** … **v6** (the previous versions of this build) are recognized exactly — marker
+ * - **v1** … **v7** (the previous versions of this build) are recognized exactly — marker
  *   plus their own table set — copied consistently and then migrated to the current version in one
  *   transaction that only adds tables. Existing rows are retained.
  * - A failure while initializing or migrating rolls back, so the original file stays readable.
@@ -19,7 +19,7 @@
  * {@link SCHEMA_DDL_V2}/{@link applySchemaV2} and {@link SCHEMA_DDL_V3}/{@link applySchemaV3} keep
  * creating exactly their own version's tables **and write exactly their own literal
  * `user_version`**, so a fixture built with them is a real older database and the migration under
- * test is the real one. The current version adds {@link SCHEMA_DDL_V7} on top.
+ * test is the real one. The current version adds {@link SCHEMA_DDL_V8} on top.
  *
  * All metadata the adapter writes are immutable JSON bodies plus indexed identity columns.
  */
@@ -30,7 +30,8 @@ import { StorageError } from './errors.js';
 export const STORE_MARKER = 'dsh-icpc-workbench/training-store';
 
 /** Schema version this build reads and writes. */
-export const STORE_SCHEMA_VERSION = 7;
+export const STORE_SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION_V7 = 7;
 export const SCHEMA_VERSION_V6 = 6;
 export const SCHEMA_VERSION_V5 = 5;
 export const SCHEMA_VERSION_V4 = 4;
@@ -427,7 +428,52 @@ export const SCHEMA_DDL_V7: readonly string[] = [
      body TEXT NOT NULL
    )`,
 ];
-export type SchemaState = 'empty' | 'legacy_v0' | 'v1' | 'v2' | 'v3' | 'v4' | 'v5' | 'v6' | 'current';
+
+/**
+ * Schema v8 — user-entered virtual-contest performance evidence (Sprint 18c) plus the table
+ * reserved for the next ability-evaluation stage.
+ *
+ * `virtual_performance_ledgers` holds one row per Codeforces account: the monotonic `revision`
+ * drives the compare-and-set write and the validated canonical JSON `body` is the whole ledger
+ * (rows unique by contest id, at most 200 per account). The table has **no** column an official
+ * rating could be written into, so a performance save can never touch
+ * `official_rating_snapshots`. `ability_evaluation_attempts` is created empty and has **no access
+ * methods yet** — it is the schema half of stage 18d, not a capability this build implements;
+ * durable AI-planning attempts and their quota stay in `plan_attempts`.
+ */
+export const STORE_TABLES_V8: readonly string[] = [
+  ...STORE_TABLES_V7,
+  'ability_evaluation_attempts',
+  'virtual_performance_ledgers',
+];
+export const SCHEMA_DDL_V8: readonly string[] = [
+  `CREATE TABLE virtual_performance_ledgers (
+     account_id TEXT PRIMARY KEY NOT NULL REFERENCES accounts(id),
+     revision INTEGER NOT NULL CHECK (revision > 0),
+     body TEXT NOT NULL
+   )`,
+  `CREATE TABLE ability_evaluation_attempts (
+     id TEXT PRIMARY KEY NOT NULL,
+     account_id TEXT NOT NULL,
+     status TEXT NOT NULL,
+     requested_at TEXT NOT NULL,
+     expires_at TEXT NOT NULL,
+     body TEXT NOT NULL
+   )`,
+  `CREATE INDEX ability_evaluation_attempts_by_account ON ability_evaluation_attempts (account_id, requested_at, id)`,
+  `CREATE INDEX ability_evaluation_attempts_by_status ON ability_evaluation_attempts (status, expires_at, id)`,
+];
+export type SchemaState =
+  | 'empty'
+  | 'legacy_v0'
+  | 'v1'
+  | 'v2'
+  | 'v3'
+  | 'v4'
+  | 'v5'
+  | 'v6'
+  | 'v7'
+  | 'current';
 
 function pragmaRow(db: DatabaseSync, sql: string): Record<string, unknown> | undefined {
   return db.prepare(sql).get() as Record<string, unknown> | undefined;
@@ -485,8 +531,13 @@ export function detectSchemaState(db: DatabaseSync): SchemaState {
   const tables = tableNames(db);
   if (version === STORE_SCHEMA_VERSION) {
     requireStoreMarker(db, version);
-    requireTables(tables, STORE_TABLES_V7, version);
+    requireTables(tables, STORE_TABLES_V8, version);
     return 'current';
+  }
+  if (version === SCHEMA_VERSION_V7) {
+    requireStoreMarker(db, version);
+    requireTables(tables, STORE_TABLES_V7, version);
+    return 'v7';
   }
   if (version === SCHEMA_VERSION_V6) {
     requireStoreMarker(db, version);
@@ -760,11 +811,11 @@ export function migrateToSchemaV6(db: DatabaseSync, from: number): void {
 }
 
 /**
- * Add exactly the missing versions and end at the current schema, in one transaction.
+ * Add only missing versions and end at **v7**, whatever this build's current version is.
  *
- * The caller has already taken (and verified) the pre-migration backup. Every historical DDL helper
- * keeps writing **its own** literal version, so a v6 fixture stays a genuine v6 database; only this
- * function moves a file to the version this build writes.
+ * Frozen historical helper: every recognized schema through v6 is byte-for-byte unchanged, a real
+ * v7 file went through exactly this step, and the v8 migration below calls it for a file older than
+ * v7 — so it must keep writing the literal `user_version = 7`.
  */
 export function migrateToSchemaV7(db: DatabaseSync, from: number): void {
   inTransaction(db, () => {
@@ -775,8 +826,29 @@ export function migrateToSchemaV7(db: DatabaseSync, from: number): void {
     if (from < 5) for (const statement of SCHEMA_DDL_V5) db.exec(statement);
     if (from < 6) for (const statement of SCHEMA_DDL_V6) db.exec(statement);
     for (const statement of SCHEMA_DDL_V7) db.exec(statement);
-    db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+    db.exec('PRAGMA user_version = 7');
   }, 'schema v7 migration');
+}
+
+/**
+ * Add exactly the missing versions and end at the current schema, in one transaction.
+ *
+ * The caller has already taken (and verified) the pre-migration backup. Every historical DDL helper
+ * keeps writing **its own** literal version, so a v7 fixture stays a genuine v7 database; only this
+ * function moves a file to the version this build writes.
+ */
+export function migrateToSchemaV8(db: DatabaseSync, from: number): void {
+  inTransaction(db, () => {
+    if (from < 1) applySchemaV1(db);
+    if (from < 2) applySchemaV2(db);
+    if (from < 3) applySchemaV3(db);
+    if (from < 4) applySchemaV4(db);
+    if (from < 5) for (const statement of SCHEMA_DDL_V5) db.exec(statement);
+    if (from < 6) for (const statement of SCHEMA_DDL_V6) db.exec(statement);
+    if (from < 7) for (const statement of SCHEMA_DDL_V7) db.exec(statement);
+    for (const statement of SCHEMA_DDL_V8) db.exec(statement);
+    db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+  }, 'schema v8 migration');
 }
 
 function inTransaction(db: DatabaseSync, work: () => void, label: string): void {

@@ -32,6 +32,11 @@
 import { validateCompetitionSummary } from '../domain/official-rating.js';
 import { validateTrainingReference } from '../domain/ability-calibration.js';
 import {
+  validateVirtualPerformancePlanningSummary,
+  virtualPerformanceEvidenceIdentity,
+  type VirtualPerformancePlanningSummary,
+} from '../domain/virtual-performance.js';
+import {
   DomainError,
   assertIsoTimestamp,
   canonicalJson,
@@ -39,8 +44,10 @@ import {
   invariant,
   parseProblemKey,
   problemKey as canonicalProblemKeyOf,
+  validateGuidanceSnapshot,
   type AbilityPlanningAggregate,
   type CancellationToken,
+  type GuidanceSnapshot,
   type TrainingCandidate,
   type TrainingCandidateOrigin,
   type TrainingPlan,
@@ -190,6 +197,26 @@ export interface PlanAttemptPreparation {
   readonly weakness: PlanAttemptWeakness;
   /** The 11a assessment reduced to its identifier-free aggregate. */
   readonly ability: AbilityPlanningAggregate;
+  /**
+   * Immutable capture of the detachable training methods this preparation was built under (18b).
+   *
+   * **Absent, not `[]`, when no method was involved.** A row persisted before this stage has no such
+   * key at all, and `evidenceHash` is computed without it, so an old row re-reads byte-for-byte. A
+   * *new* preparation that selected no method records an explicit empty capture instead, whose hash
+   * is `guidanceSnapshotHash(kind, [])` — "the user chose the free baseline" is a statement, and it
+   * is a different statement from "this row predates guidance".
+   */
+  readonly guidanceSnapshot?: GuidanceSnapshot;
+  /**
+   * Identifier-free capture of the account's user-entered virtual-contest evidence (Sprint 18c).
+   *
+   * **Absent, not `null`, on a row persisted before this stage.** A new preparation always carries
+   * one — an explicit empty capture when the account has no ledger — and its clock-free `ledgerHash`
+   * covers every stored semantic field (contest id, note, source URL, rank, exact instants), so a
+   * later save or delete is a typed `virtual_performance_changed` staleness finding even though the
+   * model never sees those fields. The summary itself carries no identifier.
+   */
+  readonly virtualPerformance?: VirtualPerformancePlanningSummary;
   /** Stable hash over the semantic evidence above (see the interface comment). */
   readonly evidenceHash: string;
 }
@@ -283,6 +310,7 @@ const PREPARATION_KEYS = [
   'ability',
   'evidenceHash',
 ] as const;
+
 const SETTINGS_KEYS = ['horizonDays', 'minutesPerDay', 'maxTasksPerDay', 'estimatedMinutes'] as const;
 const CANDIDATE_KEYS = [
   'candidateId',
@@ -597,6 +625,15 @@ function validatePlanAttemptShape(attempt: PlanAttempt): void {
  * Observation instants are excluded on purpose: two preparations built from unchanged evidence
  * must hash the same even when a clock moved, so a revalidation can distinguish a real data change
  * from a wallclock-only difference.
+ *
+ * The guidance capture is included **only when the preparation has one**. A row persisted before
+ * the detachable-method stage has no `guidanceSnapshot` member, so it hashes exactly as it did when
+ * it was written; adding a defaulted empty capture to old rows would silently rewrite every stored
+ * hash. A new preparation always carries a capture — an empty one for the free baseline.
+ *
+ * The virtual-contest capture (Sprint 18c) follows the same presence rule and contributes its
+ * clock-free {@link virtualPerformanceEvidenceIdentity}, so an unchanged ledger hashes identically
+ * after a clock move while any save or delete changes the hash.
  */
 export function planPreparationEvidenceHash(input: {
   readonly accountId: string;
@@ -607,8 +644,14 @@ export function planPreparationEvidenceHash(input: {
   readonly candidates: readonly PlanAttemptCandidate[];
   readonly weakness: PlanAttemptWeakness;
   readonly ability: AbilityPlanningAggregate;
+  /** Absent for a row that predates guidance; see the function comment. */
+  readonly guidanceSnapshot?: GuidanceSnapshot;
+  /** Absent for a row that predates virtual-contest evidence; see the function comment. */
+  readonly virtualPerformance?: VirtualPerformancePlanningSummary;
 }): string {
-  return contentHashOf({
+  const guidance = input.guidanceSnapshot;
+  const virtualPerformance = input.virtualPerformance;
+  const base = {
     accountId: input.accountId,
     sourceInstanceId: input.sourceInstanceId,
     requestedCandidateKeys: input.requestedCandidateKeys,
@@ -616,7 +659,16 @@ export function planPreparationEvidenceHash(input: {
     candidates: input.candidates,
     weakness: input.weakness,
     ability: input.ability,
-  });
+  };
+  // The virtual capture enters through its clock-free identity: the summary's own age bucket is
+  // derived from the preparation instant, so hashing it verbatim would make unchanged evidence
+  // hash differently after a clock move. The identity still covers the ledger hash over every
+  // stored semantic field.
+  const withVirtual =
+    virtualPerformance === undefined
+      ? base
+      : { ...base, virtualPerformance: virtualPerformanceEvidenceIdentity(virtualPerformance) };
+  return guidance === undefined ? contentHashOf(withVirtual) : contentHashOf({ ...withVirtual, guidance });
 }
 
 /**
@@ -693,6 +745,16 @@ export interface PlanPreparationRequest {
   readonly candidateProblemKeys?: readonly string[] | null;
   /** The instant the preparation was requested; it is the ability assessment's observation time. */
   readonly preparedAt: string;
+  /**
+   * Explicit training-method selection of this preparation (Sprint 18b), or omitted/`null` for the
+   * legacy unguided contract.
+   *
+   * When present the collaborator **captures** the currently installed definitions into the
+   * preparation's immutable `guidanceSnapshot` (and refuses the whole preparation when a selected
+   * method is not installed, is installed at another version, or offers no plan guidance). When
+   * omitted, the preparation carries no capture at all and keeps the pre-guidance evidence hash.
+   */
+  readonly guidanceMethodIds?: readonly string[] | null;
 }
 
 /** One prepared bundle: the persisted preparation plus the live candidate data it describes. */
@@ -714,7 +776,18 @@ export type PlanStalenessReason =
   | 'candidate_tags_changed'
   | 'weakness_changed'
   | 'ability_changed'
-  | 'scope_changed';
+  | 'scope_changed'
+  /**
+   * The account's user-entered virtual-contest ledger was saved or deleted after the preparation
+   * (Sprint 18c), so the plan would otherwise describe evidence the user no longer has.
+   */
+  | 'virtual_performance_changed'
+  /**
+   * A selected training method was uninstalled, replaced or upgraded after the preparation was
+   * made (Sprint 18b). The plan must not claim to follow text the model never saw, so this is a
+   * typed staleness refusal exactly like a moved candidate.
+   */
+  | 'guidance_changed';
 
 /** One typed staleness finding, with the concrete problem it was found on when there is one. */
 export interface PlanStaleness {
@@ -945,7 +1018,14 @@ function requireError(value: unknown): ModelGatewayError {
 
 function requirePreparation(value: unknown): PlanAttemptPreparation {
   const record = requireObject('planning preparation', value);
-  requireExactKeys('planning preparation', record, PREPARATION_KEYS);
+  // `guidanceSnapshot` is accepted only when the row actually carries it: a row persisted before the
+  // detachable-method stage has no such key, and a defaulted empty capture would rewrite every
+  // stored evidence hash instead of preserving it byte-for-byte.
+  requireExactKeys('planning preparation', record, [
+    ...PREPARATION_KEYS,
+    ...(Object.hasOwn(record, 'guidanceSnapshot') ? ['guidanceSnapshot'] : []),
+    ...(Object.hasOwn(record, 'virtualPerformance') ? ['virtualPerformance'] : []),
+  ]);
   const preparedAt = requireTimestamp('planning preparation preparedAt', record['preparedAt']);
   const accountId = requireText('planning preparation accountId', record['accountId']);
   const sourceInstanceId = requireText('planning preparation sourceInstanceId', record['sourceInstanceId']);
@@ -1023,6 +1103,14 @@ function requirePreparation(value: unknown): PlanAttemptPreparation {
 
   const ability = requireAbilityAggregate(record['ability']);
   const requestedCandidateKeys = requireRequestedCandidateKeys(record['requestedCandidateKeys']);
+  const guidanceSnapshot = Object.hasOwn(record, 'guidanceSnapshot')
+    ? validateGuidanceSnapshot(record['guidanceSnapshot'])
+    : undefined;
+  // Same rule as the guidance capture: present only when the stored row really carries it, so a
+  // row persisted before Sprint 18c keeps its original evidence hash byte-for-byte.
+  const virtualPerformance = Object.hasOwn(record, 'virtualPerformance')
+    ? validateVirtualPerformancePlanningSummary(record['virtualPerformance'])
+    : undefined;
   const evidenceHash = requireHash('planning preparation evidenceHash', record['evidenceHash']);
   const expected = planPreparationEvidenceHash({
     accountId,
@@ -1032,6 +1120,8 @@ function requirePreparation(value: unknown): PlanAttemptPreparation {
     candidates,
     weakness: weaknessValue,
     ability,
+    ...(guidanceSnapshot === undefined ? {} : { guidanceSnapshot }),
+    ...(virtualPerformance === undefined ? {} : { virtualPerformance }),
   });
   invariant(
     expected === evidenceHash,
@@ -1050,6 +1140,8 @@ function requirePreparation(value: unknown): PlanAttemptPreparation {
     exclusions: exclusionsValue,
     weakness: weaknessValue,
     ability,
+    ...(guidanceSnapshot === undefined ? {} : { guidanceSnapshot }),
+    ...(virtualPerformance === undefined ? {} : { virtualPerformance }),
     evidenceHash,
   };
 }
@@ -1231,6 +1323,16 @@ function requireAbilityAggregate(value: unknown): AbilityPlanningAggregate {
   };
 }
 
+
+/**
+ * Strict public validator of the identifier-free 11a ability aggregate (Sprint 18d1).
+ *
+ * The assessment capture and its stored attempt bodies carry the same aggregate, so they re-validate
+ * it through this one function instead of duplicating the (large) closed shape.
+ */
+export function validateAbilityPlanningAggregate(value: unknown): AbilityPlanningAggregate {
+  return requireAbilityAggregate(value);
+}
 
 /** Closed additive history shape. Legacy preparations omit it and round-trip without rewriting. */
 function requireAbilityHistory(value: unknown): NonNullable<AbilityPlanningAggregate['history']> {

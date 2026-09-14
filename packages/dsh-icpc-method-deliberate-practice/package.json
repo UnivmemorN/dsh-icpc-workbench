@@ -1,0 +1,30 @@
+{
+  "name": "dsh-icpc-method-deliberate-practice",
+  "version": "0.1.0",
+  "description": "Optional companion method for dsh-icpc-workbench: a short paraphrase of the USACO Guide deliberate-practice loop.",
+  "license": "(MIT AND CC-BY-NC-SA-4.0)",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE.md",
+    "LICENSE.method-text"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

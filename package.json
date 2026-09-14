@@ -1,6 +1,6 @@
 {
   "name": "dsh-icpc-workbench",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Personal ICPC training workbench plugin: normalized problems, evidence-checked tag analysis, weakness statistics and training plans.",
   "license": "MIT",
   "type": "module",
@@ -83,7 +83,19 @@
     "docs/reports/stage-17c2-sync-service.md",
     "docs/reports/stage-17d1-luogu-host.md",
     "docs/reports/stage-17d2-luogu-ui.md",
-    "docs/reports/stage-17-acceptance.md"
+    "docs/reports/stage-17-acceptance.md",
+    "docs/reports/stage-18c-virtual-performance.md",
+    "docs/guidance-plugins.md",
+    "docs/ai-ability-assessment.md",
+    "docs/reports/stage-18a-design.md",
+    "docs/reports/stage-18b1-foundation.md",
+    "docs/reports/stage-18b2a-services.md",
+    "docs/reports/stage-18c2-ui.md",
+    "docs/reports/stage-18d1-assessment-foundation.md",
+    "docs/reports/stage-18d2-assessment-service.md",
+    "docs/reports/stage-18e-assessment-ui.md",
+    "docs/reports/stage-18f-assessment-integration.md",
+    "docs/reports/stage-18-acceptance.md"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

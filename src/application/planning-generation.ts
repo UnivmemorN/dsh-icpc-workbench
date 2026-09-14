@@ -22,14 +22,24 @@
  *   mismatched URL, a duplicate candidate or an out-of-range day is refused there and never
  *   silently repaired.
  */
-import { invariant, type AbilityPlanningAggregate, type TrainingTaskKind } from '../domain/index.js';
+import {
+  invariant,
+  validateGuidanceSnapshot,
+  validateVirtualPerformancePlanningSummary,
+  type AbilityPlanningAggregate,
+  type GuidanceSnapshot,
+  type PlanDiagnosis,
+  type TrainingTaskAxis,
+  type TrainingTaskKind,
+  type VirtualPerformancePlanningSummary,
+} from '../domain/index.js';
 import { TRAINING_TASK_KINDS } from '../domain/index.js';
 import type { CancellationToken } from '../domain/index.js';
 import type { ModelCallResult } from './ports.js';
 import { MAX_PLANNING_CANDIDATES, type PlanAttemptSettings, type PlanAttemptWeakTag } from './planning-types.js';
 
 /** Prompt identity this build records for planning calls; the service reuses it when reserving. */
-export const PLANNING_PROMPT_VERSION = 'planning-v4-official-rating';
+export const PLANNING_PROMPT_VERSION = 'planning-v5-dual-axis';
 
 /** Approved reasoning effort of every planning call; v1 never runs a lower effort. */
 export const PLANNING_EFFORT = 'max';
@@ -84,6 +94,28 @@ export interface PlanGenerationRequest {
   /** Sufficient-sample weak tags of this account (aggregate only). */
   readonly weakTags: readonly PlanAttemptWeakTag[];
   readonly attemptedDistinctTotal: number;
+  /**
+   * Immutable capture of the training methods this call must follow, or omitted/`null` for the
+   * unguided legacy contract (Sprint 18b).
+   *
+   * When present it is the **exact** stored capture of the reservation — the adapter injects the
+   * selected methods' plan guidance into the task data and demands the guided output shape
+   * (`diagnosis` plus a per-task `axis`/`objective`). The capture carries method text only: no
+   * account id, handle or candidate-specific material can enter through it.
+   */
+  readonly guidance?: GuidanceSnapshot | null;
+  /**
+   * Identifier-free capture of the account's user-entered virtual-contest evidence, or
+   * omitted/`null` when the preparation predates this stage (Sprint 18c).
+   *
+   * The summary carries entered performance values, a synthetic `evidenceRef`, a coarse age bucket,
+   * the calculation-method label, independence and prior exposure — and nothing else. Assisted and
+   * prior-exposed runs travel in their own groups so a prompt can present them separately from
+   * eligible evidence; `estimation` is `not_estimated` because this stage performs no numeric
+   * estimate. The dispatch re-validates the summary structurally, so a rewritten body is refused
+   * instead of reaching the prompt.
+   */
+  readonly virtualPerformance?: VirtualPerformancePlanningSummary | null;
 }
 
 /** One normalized task of a model draft; `minutes`/`kind` are `null` when the model omitted them. */
@@ -92,19 +124,26 @@ export interface PlanGenerationDraftTask {
   readonly day: number;
   readonly minutes: number | null;
   readonly kind: TrainingTaskKind | null;
+  /** Dual axis of a guided task; omitted entirely for an unguided (legacy) draft. */
+  readonly axis?: TrainingTaskAxis | null;
+  /** Bounded training objective of a guided task; omitted for an unguided draft. */
+  readonly objective?: string | null;
 }
 
 /**
  * The strict, normalized model draft.
  *
- * This is the *only* shape a generator may hand back: exactly `title` and `tasks`, where every
- * task carries exactly a candidate id, a day and optionally minutes and a kind. A draft is still
+ * This is the *only* shape a generator may hand back: exactly `title` and `tasks` — plus, for a
+ * guided request, the dual-axis `diagnosis` — where every task carries exactly a candidate id, a day
+ * and optionally minutes, a kind, and (guided only) an axis and an objective. A draft is still
  * untrusted — it is fed to `validateModelPlan` unchanged — but it can no longer carry a URL, a
  * problem key or arbitrary extra data into the plan.
  */
 export interface PlanGenerationDraft {
   readonly title: string | null;
   readonly tasks: readonly PlanGenerationDraftTask[];
+  /** Dual-axis diagnosis; present only for a guided request, never defaulted. */
+  readonly diagnosis?: PlanDiagnosis | null;
 }
 
 export interface PlanGenerationOutcome {
@@ -221,6 +260,27 @@ export function planningGenerationProblem(request: unknown): string | null {
   const attempted = request['attemptedDistinctTotal'];
   if (typeof attempted !== 'number' || !Number.isSafeInteger(attempted) || attempted < 0) {
     return 'planning attemptedDistinctTotal must be a non-negative integer';
+  }
+  if (request['guidance'] !== undefined && request['guidance'] !== null) {
+    // The capture is re-validated structurally at dispatch: it is trusted method text, but a
+    // rewritten or truncated body must refuse the paid call instead of reaching the prompt.
+    try {
+      const snapshot = validateGuidanceSnapshot(request['guidance']);
+      if (snapshot.kind !== 'plan') {
+        return 'planning guidance must be a plan-kind method capture';
+      }
+    } catch (error) {
+      return `planning guidance is not a valid method capture: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+  if (request['virtualPerformance'] !== undefined && request['virtualPerformance'] !== null) {
+    // The identifier-free summary is re-validated structurally at dispatch: its closed shape is the
+    // privacy guarantee, so a rewritten body must refuse the paid call instead of reaching a prompt.
+    try {
+      validateVirtualPerformancePlanningSummary(request['virtualPerformance']);
+    } catch (error) {
+      return `planning virtual-performance summary is not valid: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
   return null;
 }

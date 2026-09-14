@@ -1,3 +1,4 @@
+import {GuidancePicker,GuidanceSources,useGuidance,AXIS_LABELS,PRIORITY_LABELS} from './GuidancePicker.js';
 import { abilityHistoryLabel, abilityPeriodValue } from './ability-history-view.js';
 import {useEffect,useRef,useState} from 'react';
 import type {ApiResponse} from '../application/workbench-api.js';
@@ -17,8 +18,8 @@ function PlanTask({task,plan,onChange}:{task:WorkbenchPlanTaskView;plan:Workbenc
  const {accountId,boot,navigate}=useWorkbench(),action=useAction(),[editing,setEditing]=useState(false),[day,setDay]=useState(task.day),[minutes,setMinutes]=useState(task.minutes),[kind,setKind]=useState(task.kind);
  const valid=Number.isInteger(day)&&day>=1&&day<=plan.horizonDays&&Number.isInteger(minutes)&&minutes>=1&&minutes<=plan.minutesPerDay;
  const cas={planId:plan.planId,accountId:accountId!,expectedHash:plan.contentHash,taskId:task.taskId};
- return <article className="icpc-task"><div className="icpc-toolbar"><strong>第 {task.day} 天 · {task.minutes} 分钟</strong><span className="icpc-tag">{kinds[task.kind]}</span><button onClick={()=>navigate('bank',task.problemKey)}>{task.title}</button><ExternalLink href={task.sourceUrl}>原题</ExternalLink><span>{task.status==='planned'?'待完成':task.status==='done'?'已打卡':'已跳过'}</span></div>
- {task.taxonomyIds&&<p className="icpc-muted">{task.taxonomyIds.map(t=>tagName(t,boot)).join('、')} · {task.rationale}</p>}
+ return <article className="icpc-task"><div className="icpc-toolbar"><strong>第 {task.day} 天 · {task.minutes} 分钟</strong><span className="icpc-tag">{kinds[task.kind]}</span>{task.axis&&<span className="icpc-tag">{AXIS_LABELS[task.axis]}</span>}<button onClick={()=>navigate('bank',task.problemKey)}>{task.title}</button><ExternalLink href={task.sourceUrl}>原题</ExternalLink><span>{task.status==='planned'?'待完成':task.status==='done'?'已打卡':'已跳过'}</span></div>
+ {task.objective&&<p>训练目标：{task.objective}</p>}{task.taxonomyIds&&<p className="icpc-muted">{task.taxonomyIds.map(t=>tagName(t,boot)).join('、')} · {task.rationale}</p>}
  <ErrorNotice error={action.error}/><div className="icpc-actions"><button disabled={action.busy||task.status!=='planned'} onClick={()=>setEditing(v=>!v)}>{editing?'收起编辑':'调整安排'}</button>{plan.status==='adopted'&&(['done','skipped'] as const).map(status=><button key={status} disabled={action.busy||task.status!=='planned'} onClick={()=>{void action.run(async signal=>{await api.request('plan.checkoff',{...cas,status},signal);onChange();return true;});}}>{status==='done'?'完成打卡':'跳过此项'}</button>)}</div>
  {editing&&<form className="icpc-toolbar" onSubmit={e=>{e.preventDefault();void action.run(async signal=>{await api.request('plan.edit',{...cas,patch:{day,minutes,kind}},signal);setEditing(false);onChange();return true;});}}><label>第几天<input type="number" min="1" max={plan.horizonDays} value={day} onChange={e=>setDay(Number(e.target.value))}/></label><label>分钟<input type="number" min="1" max={plan.minutesPerDay} value={minutes} onChange={e=>setMinutes(Number(e.target.value))}/></label><label>类型<select value={kind} onChange={e=>setKind(e.target.value as typeof kind)}>{Object.entries(kinds).map(([id,label])=><option key={id} value={id}>{label}</option>)}</select></label><button disabled={!valid||action.busy}>保存调整</button></form>}
  </article>;
@@ -41,6 +42,7 @@ function PlanningFailure({error}:{error:unknown}){
  */
 export function Plans(){
  const {accountId,selectedKeys,navigate,boot}=useWorkbench(),action=useAction();
+ const guidance=useGuidance('plan',accountId);
  const [mode,setMode]=useState<PlanningMode>(DEFAULT_PLANNING_MODE);
  const [reveal,setReveal]=useState(false);
  const [draft,setDraft]=useState<PlanningDraft>(()=>({...AI_PLAN_DEFAULTS}));
@@ -58,7 +60,7 @@ export function Plans(){
  const statusRead=useRequest('plan.aiStatus',accountId!==null&&trackedHere!==null?{requestId:trackedHere.requestId,accountId,reveal}:null);
  const candidateRequest=planningCandidateRequest(scope,selectedKeys),scopeCheck=candidateScopeValidation(scope,selectedKeys);
  const draftCheck=validateAiDraft(draft),ruleCheck=validateRuleDraft(rule);
- const signature=planningInputSignature({accountId:accountId??'',settingsRevision:boot.settings.revision,scope,selectedKeys,draft,reveal});
+ const signature=planningInputSignature({accountId:accountId??'',settingsRevision:boot.settings.revision,scope,selectedKeys,draft,reveal})+guidance.signature;
  const signatureRef=useRef(signature);signatureRef.current=signature;
  const currentPrepared=preparedSignature===signature?prepared:null;
  const view=currentPrepared?.outcome==='prepared'?currentPrepared.view:null,summary=view?planningAbilitySummary(view.ability):null;
@@ -83,11 +85,11 @@ export function Plans(){
  const selectPlan=(planId:string|null)=>{if(planId===null)return;setId(planId);list.refresh();};
  const trackItem=(requestId:string)=>{if(accountId===null)return;setTracked({requestId,accountId,ownedRunning:false});setRunNote(null);setCancelNote(null);};
  const prepare=()=>{
-  if(accountId===null||!draftCheck.valid||!scopeCheck.valid)return;
+  if(accountId===null||!draftCheck.valid||!scopeCheck.valid||!guidance.ready)return;
   const snapshot=signature;
   void action.run(async signal=>{
    const requestId=newPlanningRequestId();
-   const value=await api.request('plan.aiPrepare',{requestId,accountId,settings:{...draft},candidateLimit:candidateRequest.candidateLimit,candidateProblemKeys:candidateRequest.candidateProblemKeys,reveal},signal);
+   const value=await api.request('plan.aiPrepare',{requestId,accountId,settings:{...draft},candidateLimit:candidateRequest.candidateLimit,candidateProblemKeys:candidateRequest.candidateProblemKeys,guidanceMethodIds:guidance.ids,reveal},signal);
    // A late answer of an older snapshot is ignored instead of being adopted as the current form.
    const adopted=adoptPreparation(value,snapshot,signatureRef.current);
    if(adopted===null)return value;
@@ -136,7 +138,7 @@ export function Plans(){
  {mode==='ai'?<>
  <Panel title="准备 AI 计划（免费）">
   <Notice>{PLANNING_PREPARE_FREE_NOTE}{PLANNING_PAID_DISCLOSURE_NOTE}{PLANNING_CONFIG_NOTE}</Notice>
-  <PlanningFailure error={action.error}/>
+  <GuidancePicker value={guidance}/><PlanningFailure error={action.error}/>
   {currentPrepared?.outcome==='refused'&&<div className="icpc-notice icpc-error" role="alert">{planningErrorText(currentPrepared.error.code,'准备被拒绝。')}（{planningRetryText(currentPrepared.error.retryable)}）</div>}
   <form onSubmit={e=>{e.preventDefault();prepare();}}>
    <div className="icpc-form-grid">
@@ -156,19 +158,20 @@ export function Plans(){
    {!draftCheck.valid&&<p className="icpc-plan-invalid" role="status">{draftCheck.message}</p>}
    {!scopeCheck.valid&&<p className="icpc-plan-invalid" role="status">{scopeCheck.message}</p>}
    <div className="icpc-actions">
-    <button className="icpc-primary" disabled={action.busy||!draftCheck.valid||!scopeCheck.valid} aria-busy={action.busy}>{action.busy?'正在准备…':'免费准备'}</button>
+    <button className="icpc-primary" disabled={action.busy||!draftCheck.valid||!scopeCheck.valid||!guidance.ready} aria-busy={action.busy}>{action.busy?'正在准备…':'免费准备'}</button>
     <button type="button" onClick={()=>navigate('bank')}>去题库选择候选题</button>
     {prepared!==null&&<button type="button" disabled={action.busy} onClick={()=>setPrepared(null)}>清除本页准备结果</button>}
    </div>
    {prepared!==null&&<p className="icpc-muted">清除只隐藏本页显示；已保存的免费准备仍可在下方“最近的 AI 计划记录”中取消。</p>}
   </form>
   {view&&summary&&<div className="icpc-plan-prepared">
-   <h3>准备记录（{planningStatusLabel(view.status)}）</h3>
+   <h3>准备记录（{planningStatusLabel(view.status)}）</h3><GuidanceSources snapshot={view.guidance}/>
    <div className="icpc-plan-meta">
     <span>请求：{view.requestId}</span><span>准备时间：{new Date(view.preparedAt).toLocaleString()}</span>
     <span>设置版本：{view.settingsRevision??'未捕获（无法付费生成）'}</span><span>候选上限：{view.exclusions.candidateLimit}</span>
    </div>
    <p className="icpc-muted">数据披露：{view.disclosure}。一次生成只发起一次模型调用，费用取决于输入和输出用量；候选原始标签只是临时参考。</p>
+   {view.virtualPerformance&&<details><summary>将发送的虚拟参赛摘要：{view.virtualPerformance.entryCount} 条，其中独立且赛前未见题 {view.virtualPerformance.counts.eligibleIndependent} 条</summary><p>{view.virtualPerformance.disclosure}</p><pre style={{whiteSpace:"pre-wrap"}}>{JSON.stringify({eligible:view.virtualPerformance.eligible,knownAssistedOrPriorExposed:view.virtualPerformance.knownAssistedOrPriorExposed,unknownIndependence:view.virtualPerformance.unknownIndependence},null,2)}</pre></details>}
    <Stats items={[
     {label:'能力评估（聚合）',value:summary.headline},
     {label:'练习样本 P25–P75',value:summary.band},
@@ -267,6 +270,6 @@ export function Plans(){
   {preview&&preview.rejectedCandidates.length>0&&<details><summary>查看未纳入候选（{preview.rejectedCandidates.length}）</summary>{preview.rejectedCandidates.map((c,i)=><p key={i}>{c.candidateId?.split('||').at(-1)??'候选'}：{c.reason} · {c.detail}</p>)}</details>}
  </Panel>}
  <Panel title="已保存计划"><ErrorNotice error={list.error}/><label>选择计划<select value={id??''} onChange={e=>setId(e.target.value||null)}><option value="">请选择</option>{list.data?.plans.map(p=><option key={p.planId} value={p.planId}>{p.title} · {p.status==='draft'?'草案':'已采用'} · {new Date(p.createdAt).toLocaleDateString()}</option>)}</select></label><div className="icpc-toolbar"><label className="icpc-check"><input type="checkbox" checked={reveal} onChange={e=>setReveal(e.target.checked)}/>显示计划中的算法提示与候选临时标签（未复核）</label><button onClick={update}>刷新计划</button></div><ErrorNotice error={detail.error}/>
- {plan?<><h3>{plan.title}</h3><Notice>{plan.horizonDays} 天，共 {plan.taskCount} 项 / {plan.totalPlannedMinutes} 分钟。候选不足而未安排 {plan.totalUnmetMinutes} 分钟。依据：{plan.evidence.level==='personal_history'?'已有训练记录':'历史样本不足'}；已尝试 {plan.evidence.attemptedDistinctTotal} 道题。{plan.source==='model'?'此计划由 AI 生成（未经验证），采用前请自行检查。':''}</Notice><p className="icpc-muted">打卡只记录计划执行，不会把题目改成评测通过。</p>{plan.status==='draft'&&<button className="icpc-primary" disabled={action.busy} onClick={()=>{void action.run(async signal=>{await api.request('plan.adopt',{accountId,planId:plan.planId,expectedHash:plan.contentHash},signal);update();return true;});}}>采用这份计划</button>}{plan.tasks.map(task=><PlanTask key={task.taskId+'|'+plan.contentHash} task={task} plan={plan} onChange={update}/>)}</>:<Empty>选择一份草案或已采用的计划查看安排。</Empty>}</Panel>
+ {plan?<><h3>{plan.title}</h3><GuidanceSources snapshot={plan.guidanceSnapshot}/>{plan.diagnosis&&<Notice><strong>{PRIORITY_LABELS[plan.diagnosis.priority]}</strong><p>{plan.diagnosis.reason}</p><p>进入下一阶段的条件：{plan.diagnosis.readinessCheck}</p><p>置信度：{plan.diagnosis.confidence}</p></Notice>}{plan.diagnosisHidden&&<p>训练诊断可能涉及选题思路；勾选上方“显示计划中的算法提示”后查看。</p>}<Notice>{plan.horizonDays} 天，共 {plan.taskCount} 项 / {plan.totalPlannedMinutes} 分钟。候选不足而未安排 {plan.totalUnmetMinutes} 分钟。依据：{plan.evidence.level==='personal_history'?'已有训练记录':'历史样本不足'}；已尝试 {plan.evidence.attemptedDistinctTotal} 道题。{plan.source==='model'?'此计划由 AI 生成（未经验证），采用前请自行检查。':''}</Notice><p className="icpc-muted">打卡只记录计划执行，不会把题目改成评测通过。</p>{plan.status==='draft'&&<button className="icpc-primary" disabled={action.busy} onClick={()=>{void action.run(async signal=>{await api.request('plan.adopt',{accountId,planId:plan.planId,expectedHash:plan.contentHash},signal);update();return true;});}}>采用这份计划</button>}{plan.tasks.map(task=><PlanTask key={task.taskId+'|'+plan.contentHash} task={task} plan={plan} onChange={update}/>)}</>:<Empty>选择一份草案或已采用的计划查看安排。</Empty>}</Panel>
  </>}</>;
 }

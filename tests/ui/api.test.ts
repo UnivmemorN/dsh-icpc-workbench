@@ -26,3 +26,11 @@ test('merged bank transport retains the account selection and exact authenticate
  });
  await client.request('problem.mergedBrowse',input,controller.signal);assert.equal(called,true);
 });
+test('guidance and virtual performance operations reach authenticated browser transport',async()=>{
+ const calls:string[]=[];const client=new ApiClient(async(url,init)=>{calls.push(String(url));assert.equal(init?.credentials,'same-origin');return Response.json({apiVersion:1,ok:true,value:{}});});
+ await client.request('guidance.catalog',{});
+ await client.request('performance.list',{accountId:'synthetic'});
+ await client.request('performance.save',{accountId:'synthetic',expectedRevision:0,contestId:1,participatedAt:'2026-09-01T00:00:00.000Z',performance:1700,calculationMethod:'calculator',sourceUrl:'https://example.com',independence:'independent',priorExposure:false});
+ await client.request('performance.delete',{accountId:'synthetic',expectedRevision:1,evidenceId:'example'});
+ assert.deepEqual(calls,['guidance.catalog','performance.list','performance.save','performance.delete'].map(op=>'/api/icpc/v1/'+op));
+});

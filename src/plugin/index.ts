@@ -12,6 +12,10 @@ import { randomUUID } from 'node:crypto';
 import { SqliteTrainingStore } from '../adapters/sqlite/index.js';
 import { CodeforcesAdapter, codeforcesSourceInstance } from '../adapters/codeforces/index.js';
 import { LuoguAdapter, luoguSourceInstance } from '../adapters/luogu/index.js';
+import {AssessmentService} from '../application/assessment-service.js';
+import {DshAssessmentGenerator} from '../adapters/dsh/assessment-generator.js';
+import {registerAssessmentApi} from './assessment-api.js';
+import { GuidanceMethodRegistry } from '../adapters/guidance/index.js';
 import { DshAuditedModelClient, type DshAuditedHost } from '../adapters/dsh/audited-client.js';
 import { DshModelGateway } from '../adapters/dsh/model-gateway.js';
 import { DshCoachingGenerator } from '../adapters/dsh/coaching-generator.js';
@@ -20,20 +24,25 @@ import { AnalysisPipeline } from '../application/analysis-pipeline.js';
 import { CoachingService } from '../application/coaching-service.js';
 import { ImportService } from '../application/import-service.js';
 import { PlanningService } from '../application/planning-service.js';
+import { VirtualPerformanceService } from '../application/virtual-performance-service.js';
 import { WorkbenchService } from '../application/workbench-service.js';
 import { defaultWorkbenchSettings, isFlashOnlySettings, withFlashOnlyModels } from '../application/workbench-settings.js';
 import { DEFAULT_PLATFORM_LIMITS, type PlatformAdapter } from '../application/ports.js';
+import type { GuidanceCatalog } from '../application/guidance-catalog.js';
 import { CURRENT_TAXONOMY, createCancellationSource, createTaxonomyIndex } from '../domain/index.js';
 import { checkHostCompatibility, type HostCompatibilityProbe } from './compatibility.js';
 import { parsePluginConfig, resolveDataDir } from './config.js';
 import { ModelCatalog, type CatalogHost } from './model-catalog.js';
 import { ModelOperations } from './model-operations.js';
 import { registerBusinessApi } from './business-api.js';
+import { registerPerformanceApi } from './performance-api.js';
 import { registerModelApi } from './model-api.js';
 import { registerBootstrapApi } from './bootstrap-api.js';
 import { registerLuoguApi } from './luogu-api.js';
 import { createLuoguHost, type LuoguHostSeam } from './luogu-host.js';
 import { disposeAll, rollback } from './lifecycle.js';
+import { registerGuidanceApi } from './guidance-api.js';
+import { applyGuidanceService } from './guidance-service.js';
 export const name='icpc-workbench';
 export const inject=['connection','llm','sessions','sessionPersistence'];
 export interface PublicHost extends DshAuditedHost {
@@ -47,9 +56,11 @@ export interface ActivationEnvironment {
   readonly probe?:HostCompatibilityProbe; readonly closeWaitMs?:number;
   /** Injected Luogu seams (vault, platform, clock, wait, timers, transport, metadata source). */
   readonly luogu?:LuoguHostSeam;
+  /** Injected installed-method catalogue (Sprint 18b1 seam); production passes the Cordis service catalogue. */
+  readonly guidance?:GuidanceCatalog;
 }
 export interface PluginRuntime {
-  readonly dataDir:string; readonly controller:ModelOperations; readonly dispose:()=>Promise<void>;
+  readonly dataDir:string; readonly controller:ModelOperations; readonly guidance:GuidanceCatalog; readonly dispose:()=>Promise<void>;
 }
 export function resolveHarnessHome(value:string|undefined,home=homedir()):string {
   const input=value?.trim();if(!input)return join(home,'.dsh');
@@ -63,6 +74,9 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
   const dataDir=resolveDataDir(parsed,{dshHome:resolveHarnessHome(environment.dshHome??process.env.DSH_HOME),installationRoot:compatibility.installationRoot});
   await mkdir(dataDir,{recursive:true});
   const now=()=>new Date().toISOString(),uniqueId=(prefix:string)=>prefix+'-'+randomUUID();
+  // Sprint 18b1: installed training methods. Production shares this registry with the Cordis
+  // `icpcGuidance` service; `environment.guidance` is the offline lifecycle seam.
+  const guidance=environment.guidance??new GuidanceMethodRegistry();
   const store=new SqliteTrainingStore({path:join(dataDir,'training.sqlite'),now});
   const auditSessions=new DurableAuditSessions(host.sessions,host.sessionPersistence);
   const closeStorage=async()=>{try{await auditSessions.close();}finally{await store.close();}};
@@ -84,8 +98,11 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
     });
     const adapters:PlatformAdapter[]=[new CodeforcesAdapter({sourceInstance:sources[0]!}),new LuoguAdapter({sourceInstance:sources[1]!})];
     const byId=new Map(adapters.map(a=>[a.sourceInstance.id,a]));
-    const imports=new ImportService({store,now}),workbench=new WorkbenchService({store,taxonomy:createTaxonomyIndex(CURRENT_TAXONOMY),now,uniqueId:randomUUID});
+    const imports=new ImportService({store,now}),workbench=new WorkbenchService({store,taxonomy:createTaxonomyIndex(CURRENT_TAXONOMY),now,uniqueId:randomUUID,guidance});
     const client=new DshAuditedModelClient({llm:host.llm,sessions:auditSessions},{now,flashOnly:true}),catalog=new ModelCatalog(host.llm);
+    const assessment=new AssessmentService({store,capture:workbench,generator:new DshAssessmentGenerator({client,now}),now});
+    disposers.push(async()=>{const result=await assessment.close();if(result.failures.length)throw Error('ICPC_ASSESSMENT_SETTLEMENT_FAILED');});
+    await assessment.recoverExpiredReservations(createCancellationSource().token);
     const coaching=new CoachingService({store,now,generator:new DshCoachingGenerator({client,now}),onInternalError:reportFailure});
     // AI planning (Sprint 11d): the accepted durable service over the same audited client, with the
     // workbench's own preparation/revalidation/save methods bound as its data port. The port names
@@ -117,14 +134,23 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
       connectionPlatform:luoguHost.connectionPlatform,now,...observer}));
     disposers.push(await registerBusinessApi({registry:host.connection.fetch,store,imports,workbench,sources:sources.map(instance=>({instance})),settings:()=>store.getWorkbenchSettings(),now,uniqueId:randomUUID,
       adapterFor:async id=>{const adapter=byId.get(id);if(!adapter)throw Error('ICPC_SOURCE_ADAPTER_UNSUPPORTED');return adapter;},...observer,onDisposeError:reportFailure}));
+    disposers.push(registerGuidanceApi(host.connection.fetch,guidance));
+    disposers.push(await registerAssessmentApi(host.connection.fetch,assessment));
+    // Virtual-contest performance ledger (Sprint 18c): free local CRUD over the durable per-account
+    // ledger the same store owns; no model, platform or credential path is reachable from it.
+    disposers.push(await registerPerformanceApi({registry:host.connection.fetch,...observer,
+      service:new VirtualPerformanceService({store,now,uniqueId:()=>uniqueId('virtual-performance')})}));
     disposers.push(await registerModelApi({registry:host.connection.fetch,controller,...observer}));
     disposers.push(await registerBootstrapApi({registry:host.connection.fetch,store,controller,catalog,dataDir,hostVersion:compatibility.packageVersion,adapters,...observer}));
-    return {dataDir,controller,dispose:disposeAll(disposers)};
+    return {dataDir,controller,guidance,dispose:disposeAll(disposers)};
   } catch(error){return rollback(error,disposers);}
 }
 /** Cordis owns the returned runtime through one disposable effect. */
 export async function apply(ctx:Context,config:unknown={}):Promise<void> {
-  const runtime=await activateHost(ctx,config);
-  try {ctx.effect(()=>runtime.dispose,'icpc-workbench: host');}
+  // One registry instance is shared by the documented `icpcGuidance` service and the host runtime,
+  // so a method a companion package registers is immediately the catalogue the host reads.
+  const guidance=new GuidanceMethodRegistry();
+  const runtime=await activateHost(ctx,config,{guidance});
+  try {applyGuidanceService(ctx,{registry:guidance});ctx.effect(()=>runtime.dispose,'icpc-workbench: host');}
   catch(error){return rollback(error,[runtime.dispose]);}
 }

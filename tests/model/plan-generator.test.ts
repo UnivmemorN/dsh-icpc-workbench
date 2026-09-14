@@ -403,3 +403,36 @@ void test('incoherent requests are refused with zero known usage and no dispatch
     assert.equal(state.created.length, 0, 'a refused request creates no audit session');
   }
 });
+test('installed method instructions reach the audited model and valid dual-axis output parses', async()=>{
+ const {captureGuidanceSnapshot,validateGuidanceMethodRegistration}=await import('../../src/domain/guidance.js');
+ const {balancedMethod}=await import('../../packages/dsh-icpc-method-balanced/index.js');
+ const guidance=captureGuidanceSnapshot('plan',[validateGuidanceMethodRegistration(balancedMethod)]);
+ const answer={title:'综合训练',diagnosis:{priority:'balanced',reason:'证据不足，先进行双方向诊断',readinessCheck:'分别完成独立建模与实现',confidence:'low'},tasks:[
+  {candidateId:'candidate-1',day:1,minutes:30,kind:'solve',axis:'thinking',objective:'独立推导'},
+  {candidateId:'candidate-2',day:2,minutes:30,kind:'solve',axis:'templates',objective:'实现并解释不变量'}
+ ]};
+ const {state,generator}=harness([{payload:answer}]);
+ const result=await generator.generate(request({guidance}));
+ assert.equal(result.ok,true,JSON.stringify(result));
+ if(!result.ok)return;
+ assert.equal(result.value.draft.diagnosis?.priority,'balanced');
+ assert.deepEqual(result.value.draft.tasks.map(t=>t.axis),['thinking','templates']);
+ assert.equal(state.dispatch.length,1);
+ assert.ok(state.dispatch[0]?.system?.includes(guidance.methods[0]!.planGuidance.summary));
+ assert.ok(state.dispatch[0]?.system?.includes(guidance.methods[0]!.name));
+ assert.equal(result.usage?.calls,1);
+});
+
+test('virtual performance reaches the planning provider without stored private fields', async()=>{
+ const {validateVirtualPerformanceLedger,virtualPerformancePlanningSummary}=await import('../../src/domain/virtual-performance.js');
+ const ledger=validateVirtualPerformanceLedger({accountId:ACCOUNT_ID,revision:1,updatedAt:AT,source:'user_import',entries:[{
+  evidenceId:'private-evidence-row',contestId:998877,participatedAt:'2026-10-03T12:13:14.000Z',performance:1900,calculationMethod:'external performance calculator',sourceUrl:'https://example.com/private-reference',independence:'independent',priorExposure:false,rank:37,note:'private participation note'
+ }]});
+ const virtualPerformance=virtualPerformancePlanningSummary(ledger,AT);
+ const {state,generator}=harness([{payload:ANSWER}]);
+ assert.equal((await generator.generate(request({virtualPerformance}))).ok,true);
+ const payload=promptPayload(state.dispatch[0]);
+ assert.deepEqual(payload.virtualPerformance,virtualPerformance);
+ const sent=JSON.stringify(payload);
+ for(const privateValue of [ACCOUNT_ID,'private-evidence-row','998877','2026-10-03T12:13:14.000Z','https://example.com/private-reference','private participation note'])assert.equal(sent.includes(privateValue),false,privateValue);
+});

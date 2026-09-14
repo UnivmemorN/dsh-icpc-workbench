@@ -39,12 +39,14 @@ import {
   computeAbilityAssessment,
   computeKnowledgeEvidence,
   computeTrainingStatistics,
+  competitionSummary,
   computeWeaknessReports,
   contentHashOf,
   createManualTagDecision,
   createRetrospective,
   createTagDecision,
   createTrainingCandidate,
+  captureGuidanceSnapshot,
   decisionIsEffective,
   editPlanTask as editTrainingTask,
   expectedRatingDimension,
@@ -59,6 +61,8 @@ import {
   problemKey,
   reportForAccount,
   verificationFor,
+  virtualPerformanceLedgerHash,
+  virtualPerformancePlanningSummary,
   type Account,
   type AccountWeaknessReport,
   COMPLETENESS_AUDIT_VERSION,
@@ -66,6 +70,7 @@ import {
   type BeginnerRecommendation,
   type CancellationToken,
   type CompletionMode,
+  type GuidanceSnapshot,
   type ManualTagAction,
   type ManualTagDecision,
   type NormalizedProblem,
@@ -88,6 +93,14 @@ import {
 import { currentDecisionPerTag } from '../domain/tags.js';
 import { MergedBankService, type MergedBankBrowseRequest } from './merged-bank-service.js';
 import {
+  MAX_ASSESSMENT_KNOWLEDGE_ROWS,
+  createAssessmentCapture,
+  type AssessmentCapture,
+  type AssessmentCaptureRequest,
+  type AssessmentKnowledgeRow,
+  type AssessmentSourceSnapshot,
+} from './assessment-capture.js';
+import {
   BROWSE_PAGE_LIMITS,
   MAX_RATING_DIMENSION_CHARS,
   PROBLEM_SOLVED_FILTERS,
@@ -98,6 +111,12 @@ import {
   type TrainingStore,
 } from './ports.js';
 import { STORAGE_PAGE_LIMITS } from './storage-types.js';
+import {
+  captureGuidance,
+  revalidateGuidance,
+  type GuidanceCatalog,
+  type GuidanceRefusal,
+} from './guidance-catalog.js';
 import {
   MAX_PLANNING_CANDIDATES,
   planPreparationEvidenceHash,
@@ -218,6 +237,13 @@ export interface WorkbenchServiceOptions {
   readonly taxonomy: TaxonomyIndex;
   readonly now: () => string;
   readonly uniqueId: () => string;
+  /**
+   * Installed training-method catalogue (Sprint 18b), shared with the host's `icpcGuidance` service.
+   *
+   * It is optional so a rule-only composition stays valid: without it a guidance selection is a
+   * typed refusal, while a legacy request that names no method keeps working unchanged.
+   */
+  readonly guidance?: GuidanceCatalog;
 }
 
 /** Bank page request. `accountId` is a solved/spoiler context, not an implicit attempt filter. */
@@ -389,6 +415,8 @@ export class WorkbenchService {
   private readonly taxonomy: TaxonomyIndex;
   private readonly now: () => string;
   private readonly uniqueId: () => string;
+  /** Installed-method catalogue; `undefined` in a rule-only composition. */
+  private readonly guidance: GuidanceCatalog | undefined;
   /** Merged cross-site bank; it borrows this service's own summary projection. */
   private readonly merged: MergedBankService;
 
@@ -413,6 +441,12 @@ export class WorkbenchService {
     this.taxonomy = options.taxonomy;
     this.now = options.now;
     this.uniqueId = options.uniqueId;
+    if (options.guidance !== undefined) {
+      if (options.guidance === null || typeof options.guidance.catalog !== 'function') {
+        throw new DomainError('unfilled_settings', 'workbench guidance catalogue must expose catalog()', {});
+      }
+    }
+    this.guidance = options.guidance;
     // The merged bank is composed here, with this service's own summary projection as a callback: a
     // merged member row therefore applies exactly the same spoiler rule as a `problem.browse` row,
     // and the merged service stays a small delegate instead of a second spoiler implementation.
@@ -1311,6 +1345,11 @@ export class WorkbenchService {
    * of another source instance is refused, the ones this account already accepted are excluded and
    * counted, and the list is never truncated. The requested scope is stored on the preparation, so
    * a re-prepare under the same request id with a different selection is a typed conflict.
+   *
+   * An explicit `guidanceMethodIds` selection is captured through the installed catalogue before the
+   * read transaction opens (see {@link WorkbenchService.capturePlanGuidance}) and stored on the
+   * preparation together with the evidence hash, so the plan is bound to the exact method text the
+   * user selected. Omitting it keeps the legacy unguided preparation, whose hash is unchanged.
    */
   async preparePlanInput(request: PlanPreparationRequest, token: CancellationToken): Promise<PlanPreparationBundle> {
     requireToken(token);
@@ -1321,6 +1360,9 @@ export class WorkbenchService {
       'plan preparation needs a request object',
       {},
     );
+    // The method capture is taken before the read transaction opens: it is pure catalogue data, and
+    // a refused selection must cost nothing and write nothing.
+    const guidanceSnapshot = await this.capturePlanGuidance(request.guidanceMethodIds, token);
     // One transaction for the whole preparation: submissions, retrospectives, decisions, effective
     // tags, solved status and the candidate pool are a single serialized read, so the ability
     // summary and the candidates that travel with it always describe the same store state.
@@ -1351,6 +1393,14 @@ export class WorkbenchService {
         }),
       );
       const weakTagIds = report.ranking.map((tag) => tag.taxonomyId);
+      // Sprint 18c: this account's own user-entered virtual-contest evidence, reduced to the
+      // identifier-free summary. An absent ledger becomes an explicit empty capture (never a zero
+      // score), so creating a ledger later is a real staleness finding instead of silence.
+      const virtualPerformance = virtualPerformancePlanningSummary(
+        await this.store.getVirtualPerformanceLedger(account.id),
+        request.preparedAt,
+      );
+      token.throwIfCancelled();
       const requestedCandidateKeys = request.candidateProblemKeys ?? null;
       const pool = await this.readPlanCandidatePool(
         account,
@@ -1375,6 +1425,12 @@ export class WorkbenchService {
           ranking: report.ranking.map((tag) => ({ taxonomyId: tag.taxonomyId, solveRate: tag.solveRate })),
         },
         ability,
+        // Absent for the legacy unguided contract; a new guided preparation always carries the exact
+        // method text it was built under, and the evidence hash below covers that capture.
+        ...(guidanceSnapshot === undefined ? {} : { guidanceSnapshot }),
+        // A new preparation always carries the identifier-free virtual evidence capture; a row
+        // persisted before Sprint 18c has no such key and keeps its original evidence hash.
+        virtualPerformance,
         evidenceHash: '',
       };
       token.throwIfCancelled();
@@ -1385,6 +1441,182 @@ export class WorkbenchService {
     });
   }
 
+  // -------------------------------------------------------------------------------------
+  // Assessment source capture (Sprint 18d1)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * Free, durable source capture of one ability assessment.
+   *
+   * This is the application-facing method a later assessment service injects as its
+   * `AssessmentDataPort.capture`: one serialized read transaction collects the account's own
+   * evidence — submissions, retrospectives, decisions, effective tags, the exact official rating and
+   * self-assessment, the per-native-difficulty knowledge summary, the identifier-free 18c
+   * virtual-contest summary and the frozen training-method capture — and reduces it to an
+   * identifier-free prompt payload plus an internal snapshot with two clock-free hashes. Nothing is
+   * written, no model is contacted and no number is invented: the snapshot carries exact official
+   * values, aggregate practice counts and explicit coverage gaps, and every `evidenceRef` in the
+   * prompt is synthesized from that snapshot.
+   *
+   * The evidence read reuses {@link WorkbenchService.collectWeaknessEvidence} and the same bounded
+   * reductions the workbench already serves, so an assessment can never describe a different account
+   * or a broader sample than the weakness/ability view. The knowledge summary is bounded to
+   * {@link MAX_ASSESSMENT_KNOWLEDGE_ROWS} rows and reports how many rows the bound omitted, instead
+   * of silently shrinking the evidence.
+   *
+   * A method selection is captured from the installed catalogue before the read transaction opens:
+   * an uninstalled, replaced or assessment-incapable method is a typed refusal that writes nothing,
+   * and an explicit empty selection captures the honest unguided baseline. Recapturing with the same
+   * request and comparing `sourceHash` is the later service's staleness check, because every
+   * clock-derived label (the capture instant, the official-rating activity label, the virtual age
+   * buckets) is excluded from both hashes.
+   */
+  async captureAssessmentInput(
+    request: AssessmentCaptureRequest,
+    token: CancellationToken,
+    transactionMode: 'own' | 'join' = 'own',
+  ): Promise<AssessmentCapture> {
+    requireToken(token);
+    token.throwIfCancelled();
+    invariant(
+      request !== null && typeof request === 'object',
+      'invalid_input',
+      'assessment capture needs a request object',
+      {},
+    );
+    const capturedAt = assertIsoTimestamp('assessment capture capturedAt', request.capturedAt);
+    const accountId = requireRequiredId('accountId', request.accountId);
+
+    // One transaction for the whole capture: submissions, retrospectives, decisions, tags, the
+    // official rating, the calibration, the virtual ledger and the method capture are a single
+    // serialized read, so the prompt and the snapshot always describe the same store state.
+    const collect = async (): Promise<AssessmentCapture> => {
+      const guidance = await this.captureAssessmentGuidance(request.guidanceMethodIds, token);
+      token.throwIfCancelled();
+      const account = await this.requireAccount(accountId, token);
+      const source = await this.store.getSourceInstance(account.sourceInstanceId);
+      token.throwIfCancelled();
+      invariant(
+        source !== null,
+        'invalid_input',
+        `account ${account.id} names source instance ${account.sourceInstanceId}, which is not stored`,
+        { reason: 'source_instance_missing', accountId: account.id, sourceInstanceId: account.sourceInstanceId },
+      );
+      const evidence = await this.collectWeaknessEvidence(account, token);
+      const officialRatingSnapshot = await this.store.getOfficialRating(account.id);
+      token.throwIfCancelled();
+      const calibration = await this.store.getAbilityCalibration(account.id);
+      token.throwIfCancelled();
+      const ability = aggregateAbilityForPlanning(
+        computeAbilityAssessment({
+          calibration,
+          officialRating: officialRatingSnapshot,
+          accountId: account.id,
+          sourceInstanceId: account.sourceInstanceId,
+          platform: source.platform,
+          problems: evidence.problems,
+          submissions: evidence.submissions,
+          retrospectives: evidence.retrospectives,
+          now: capturedAt,
+        }),
+      );
+      const trainingReference = ability.trainingReference;
+      invariant(
+        trainingReference !== undefined,
+        'invalid_input',
+        'the ability aggregate carries no training reference',
+        { reason: 'ability_aggregate_incomplete', accountId: account.id },
+      );
+      // The knowledge reduction reuses exactly the evidence above: no additional store, platform or
+      // model read, and no change to the weakness/ability projections beside it.
+      const knowledge = computeKnowledgeEvidence({
+        taxonomy: this.taxonomy,
+        accountId: account.id,
+        problems: evidence.problems,
+        submissions: evidence.submissions,
+        decisions: evidence.decisions,
+        retrospectives: evidence.retrospectives,
+        minimumIndependentProblems: WORKBENCH_MIN_WEAKNESS_SAMPLE,
+      });
+      const knowledgeRows: AssessmentKnowledgeRow[] = knowledge.difficultyBands.flatMap((band) =>
+        band.nodes.map((node) => ({
+          band: band.band.kind === 'unknown' ? `${band.band.dimension}: unknown` : band.band.kind === 'interval' ? `${band.band.dimension}: [${band.band.value}, ${band.band.upperExclusive})` : `${band.band.dimension}: ${band.band.value}`,
+          taxonomyId: node.taxonomyId,
+          status: node.status,
+          observedRelatedDistinct: node.observedRelatedDistinct,
+          platformSolvedDistinct: node.platformSolvedDistinct,
+          verifiedSolvedDistinct: node.verifiedSolvedDistinct,
+          retrospectiveIndependentDistinct: node.retrospectiveIndependentDistinct,
+          retrospectiveAssistedDistinct: node.retrospectiveAssistedDistinct,
+          retrospectiveSolutionUsedDistinct: node.retrospectiveSolutionUsedDistinct,
+        })),
+      );
+      // The rows are already in the domain's deterministic (band, catalog) order, so the bound keeps
+      // a stable prefix and the omitted count is an explicit statement, never a silent truncation.
+      const keptKnowledge = knowledgeRows.slice(0, MAX_ASSESSMENT_KNOWLEDGE_ROWS);
+      const virtualPerformance = virtualPerformancePlanningSummary(
+        await this.store.getVirtualPerformanceLedger(account.id),
+        capturedAt,
+      );
+      token.throwIfCancelled();
+      const snapshot: AssessmentSourceSnapshot = {
+        sourceEvidenceHash: contentHashOf({account,source,problems:evidence.problems,submissions:evidence.submissions,retrospectives:evidence.retrospectives,decisions:evidence.decisions,coverage:evidence.coverage,calibration,officialRatingSnapshot,virtualLedgerHash:virtualPerformance.ledgerHash,taxonomyVersion:knowledge.taxonomyVersion,tagMappingVersion:knowledge.tagMappingVersion}),
+        platform: source.platform,
+        taxonomyVersion: this.taxonomy.taxonomy.version,
+        officialRating: competitionSummary(officialRatingSnapshot, capturedAt),
+        trainingReference,
+        calibration: calibration === null ? null : { revision: calibration.revision, range: calibration.range },
+        ability,
+        knowledge: keptKnowledge,
+        knowledgeTotalRows: knowledgeRows.length,
+        knowledgeOmittedRows: knowledgeRows.length - keptKnowledge.length,
+        virtualPerformance,
+        guidance,
+      };
+      const capture = createAssessmentCapture({
+        capturedAt,
+        accountId: account.id,
+        sourceInstanceId: account.sourceInstanceId,
+        snapshot,
+      });
+      token.throwIfCancelled();
+      return capture;
+    };
+    return transactionMode === 'join' ? collect() : this.store.transaction(collect);
+  }
+
+  /**
+   * Capture the installed definitions of one explicit assessment-method selection.
+   *
+   * An empty/omitted selection is the honest unguided baseline and needs no installed catalogue (an
+   * explicit empty capture is a real choice, never a silent substitution). A non-empty selection is
+   * captured through the live catalogue and must resolve to installed methods that offer assessment
+   * guidance: a missing, replaced or assessment-incapable method is a typed refusal *before* any
+   * evidence is read, so an assessment can never claim to follow text the model was not shown.
+   */
+  private async captureAssessmentGuidance(
+    methodIds: readonly string[] | null | undefined,
+    token: CancellationToken,
+  ): Promise<GuidanceSnapshot> {
+    const selected = methodIds ?? [];
+    if (selected.length === 0) {
+      return captureGuidanceSnapshot('assessment', []);
+    }
+    const catalog = this.guidance;
+    invariant(
+      catalog !== undefined,
+      'unfilled_settings',
+      'an assessment method selection needs an installed training-method catalogue; compose the icpcGuidance service, or omit guidanceMethodIds for the unguided diagnostic baseline',
+      { reason: 'guidance_unavailable' },
+    );
+    const capture = await captureGuidance(catalog, 'assessment', selected, { required: true });
+    token.throwIfCancelled();
+    if (!capture.ok) {
+      throw guidanceRefusalError(capture.refusal);
+    }
+    return capture.snapshot;
+  }
+
   /**
    * Prove a stored preparation still describes the store, and rebuild its candidates.
    *
@@ -1393,8 +1625,11 @@ export class WorkbenchService {
    * Every check is a typed `stale_preparation` finding instead of a silently repaired plan: the
    * account, its source instance, every candidate's stored metadata, own AC state and effective
    * tags, and the aggregate weakness and ability evidence must still match the preparation. The
-   * returned candidates are rebuilt through the domain factory with the **same** candidate ids, so
-   * the model's answer can only ever name a candidate the user actually saw.
+   * stored training-method capture is re-proved against the live catalogue the same way, so an
+   * uninstalled or upgraded method is a `guidance_changed` refusal at reservation and again
+   * immediately before the plan write. The returned candidates are rebuilt through the domain factory
+   * with the **same** candidate ids, so the model's answer can only ever name a candidate the user
+   * actually saw.
    */
   async revalidatePlanInput(
     preparation: PlanAttemptPreparation,
@@ -1428,6 +1663,31 @@ export class WorkbenchService {
         `source instance ${account.sourceInstanceId} is no longer stored`,
         null,
       );
+    }
+    // The stored method capture is re-proved against the live catalogue before the expensive evidence
+    // walk. The planning service calls this at reservation and again at settlement, so a method that
+    // was uninstalled, replaced or upgraded while a paid call was in flight refuses the stale
+    // preparation (18b `guidance_changed`) instead of storing a plan that claims to follow text the
+    // model never saw. A legacy preparation without a capture has nothing to re-prove.
+    const captured = preparation.guidanceSnapshot;
+    if (captured !== undefined) {
+      const catalog = this.guidance;
+      if (catalog === undefined) {
+        return stalePreparation(
+          'guidance_changed',
+          'this preparation selected training methods, but no method catalogue is installed in this composition',
+          null,
+        );
+      }
+      const resolution = await revalidateGuidance(catalog, captured);
+      token.throwIfCancelled();
+      if (!resolution.ok) {
+        return stalePreparation(
+          'guidance_changed',
+          `the training-method selection of this preparation is no longer installed as captured (${resolution.refusal.reason}): ${resolution.refusal.detail}`,
+          null,
+        );
+      }
     }
     const evidence = await this.collectWeaknessEvidence(account, token);
     const report = this.weaknessReportOf(account, evidence);
@@ -1464,6 +1724,22 @@ export class WorkbenchService {
     );
     if (contentHashOf(ability) !== contentHashOf(preparation.ability)) {
       return stalePreparation('ability_changed', `the ability evidence of account ${account.id} changed`, null);
+    }
+
+    // User-entered virtual-contest evidence (Sprint 18c) belongs to the preparation's evidence too:
+    // saving or deleting a row after the preparation is a typed staleness finding. The comparison is
+    // the clock-free ledger hash, so a moved clock alone never invalidates a plan, and a legacy
+    // preparation without the capture has nothing to compare and stays valid.
+    if (preparation.virtualPerformance !== undefined) {
+      const currentLedger = await this.store.getVirtualPerformanceLedger(account.id);
+      token.throwIfCancelled();
+      if (virtualPerformanceLedgerHash(currentLedger) !== preparation.virtualPerformance.ledgerHash) {
+        return stalePreparation(
+          'virtual_performance_changed',
+          `the user-entered virtual-contest evidence of account ${account.id} changed after this plan was prepared`,
+          null,
+        );
+      }
     }
 
     // An explicit selection is part of the scope this plan was prepared under. A selected problem
@@ -1558,9 +1834,12 @@ export class WorkbenchService {
    *
    * The planning service calls this from inside its settlement transaction, so this method joins
    * that transaction instead of opening one: the plan row and the settled attempt then commit or
-   * roll back together, and a plan can never exist without the audit row that paid for it. The
-   * stored plan is read back and its full content hash compared before the hash is reported, so a
-   * caller can never record a hash of something that was not written.
+   * roll back together, and a plan can never exist without the audit row that paid for it. A guided
+   * plan reaches this method only after the settlement re-proved the attempt's stored method capture
+   * through {@link WorkbenchService.revalidatePlanInput}, so its diagnosis and per-task axes describe
+   * the method text the model was actually shown. The stored plan is read back and its full content
+   * hash compared before the hash is reported, so a caller can never record a hash of something that
+   * was not written.
    */
   async saveModelPlan(
     plan: TrainingPlan,
@@ -1604,6 +1883,37 @@ export class WorkbenchService {
   // -------------------------------------------------------------------------------------
   // Weakness & plan internals (always called inside the caller's transaction)
   // -------------------------------------------------------------------------------------
+
+  /**
+   * Capture the installed definitions of one explicit training-method selection (Sprint 18b).
+   *
+   * `undefined`/`null` is the legacy unguided contract and returns no capture at all, so a
+   * preparation that named no method keeps the pre-guidance evidence hash byte-for-byte. An explicit
+   * selection is captured through the live catalogue and must resolve to at least one installed
+   * method that offers plan guidance: a missing, replaced or plan-incapable method is a typed
+   * refusal *before* any candidate is read, never a silent fallback to an unguided plan.
+   */
+  private async capturePlanGuidance(
+    methodIds: readonly string[] | null | undefined,
+    token: CancellationToken,
+  ): Promise<GuidanceSnapshot | undefined> {
+    if (methodIds === undefined || methodIds === null) {
+      return undefined;
+    }
+    const catalog = this.guidance;
+    invariant(
+      catalog !== undefined,
+      'unfilled_settings',
+      'a guidance selection needs an installed training-method catalogue; compose the icpcGuidance service, or omit guidanceMethodIds for the legacy unguided preparation',
+      { reason: 'guidance_unavailable' },
+    );
+    const capture = await captureGuidance(catalog, 'plan', methodIds, { required: true });
+    token.throwIfCancelled();
+    if (!capture.ok) {
+      throw guidanceRefusalError(capture.refusal);
+    }
+    return capture.snapshot;
+  }
 
   /**
    * The bounded real candidate pool of one AI plan preparation.
@@ -2010,6 +2320,8 @@ export class WorkbenchService {
   private projectPlan(plan: TrainingPlan, solvedKeys: ReadonlySet<string>, reveal: boolean): WorkbenchPlanView {
     const summary = summariseTrainingPlan(plan);
     const view: WorkbenchPlanView = {
+      ...(plan.guidanceSnapshot === undefined ? {} : {guidanceSnapshot: plan.guidanceSnapshot}),
+      ...(plan.diagnosis === undefined ? {} : reveal || plan.tasks.every(t => solvedKeys.has(t.problemKey)) ? {diagnosis:plan.diagnosis} : {diagnosisHidden:true}),
       planId: plan.planId,
       // A model may name the solution algorithm in its title, even when task tags are withheld.
       title: plan.source === 'model' && !reveal && plan.tasks.some(task => !solvedKeys.has(task.problemKey))
@@ -2612,6 +2924,21 @@ function latestDecidedAt(decisions: readonly ManualTagDecision[]): string | null
 /** Source mismatch is the same typed failure whether it is found on a read or on a plan candidate. */
 function stalePreparation(reason: PlanStalenessReason, detail: string, problemKey: string | null): PlanRevalidationResult {
   return { ok: false, staleness: { reason, detail, problemKey } };
+}
+
+/**
+ * One typed catalogue refusal as the caller-facing error of a preparation.
+ *
+ * The whole preparation is refused — no candidate is read and nothing is written — because a plan
+ * must be bound to exactly the method text the user selected or to nothing at all; substituting a
+ * different installed method or silently degrading to the unguided contract is never an option.
+ */
+function guidanceRefusalError(refusal: GuidanceRefusal): DomainError {
+  return new DomainError(
+    'invalid_input',
+    `the selected training methods cannot be captured (${refusal.reason}): ${refusal.detail}`,
+    { reason: 'guidance_refused', refusal: refusal.reason, methodId: refusal.methodId },
+  );
 }
 
 function sourceMismatch(account: Account, sourceInstanceId: string): DomainError {
@@ -3218,6 +3545,7 @@ function parseTaskPatch(value: WorkbenchPlanTaskPatch | null | undefined): PlanT
 /** One task: identity and links always, tags/rationale only when `visible`. */
 function projectPlanTask(task: TrainingTask, visible: boolean): WorkbenchPlanTaskView {
   const view: WorkbenchPlanTaskView = {
+    ...(task.axis === undefined ? {} : {axis:task.axis}),
     taskId: task.taskId,
     planId: task.planId,
     day: task.day,
@@ -3234,7 +3562,7 @@ function projectPlanTask(task: TrainingTask, visible: boolean): WorkbenchPlanTas
   if (!visible) {
     return view;
   }
-  return { ...view, taxonomyIds: [...task.taxonomyIds], rationale: task.rationale };
+  return { ...view, taxonomyIds: [...task.taxonomyIds], rationale: task.rationale, ...(task.objective === undefined ? {} : {objective:task.objective}) };
 }
 
 function planEvidenceView(evidence: TrainingEvidence): WorkbenchPlanEvidenceView {
