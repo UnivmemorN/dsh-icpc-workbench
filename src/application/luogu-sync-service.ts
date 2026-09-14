@@ -475,13 +475,13 @@ function failureCodeOf(code: PlatformErrorCode): LuoguSyncFailureCode {
   }
 }
 
-/** Canonical external key of a user-created (private) Luogu problem: `U` followed by digits. */
-const PRIVATE_USER_PROBLEM_KEY = /^U\d+$/u;
+/** Custom problem key: `U` or `T` followed by digits; access is classified only after a refusal. */
+const PRIVATE_USER_PROBLEM_KEY = /^[UT]\d+$/u;
 
 /**
  * True when one metadata answer is an **item-level** refusal of a private/user-created problem.
  *
- * The platform publishes user-created personal problems under `U` ids, and its public problem guide
+ * The platform publishes user-created personal problems under `U` / `T` ids, and its public problem guide
  * documents private personal problems
  * (<https://help.luogu.com.cn/manual/luogu/problem/>). An anonymous metadata read of one may
  * therefore answer `auth_required` or `forbidden` while the session and every public problem remain

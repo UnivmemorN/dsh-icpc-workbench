@@ -64,3 +64,7 @@ New test names (all passing):
 ## Coordinator acceptance
 
 Packaged and live results after these worker checks are recorded in [Stage 22 acceptance](stage-22-acceptance.md). Worker-only pending items above describe the worker invocation, not the final release.
+
+## Team/custom reference follow-up
+
+Live verification also encountered T-prefixed custom problems with the same anonymous access refusal. The coordinator extended the existing exact numeric-prefix rule to U/T and added both auth-required and forbidden T fixtures. Public-problem refusals and global rate limits retain their stop behavior. See the final acceptance report for the full gate and resumed live progress.

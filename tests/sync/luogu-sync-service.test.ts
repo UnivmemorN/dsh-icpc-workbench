@@ -2251,15 +2251,15 @@ void test('refreshProfile refuses a foreign or unknown account before touching t
 // Sprint 22c: a private (U-prefixed) problem refusal is an item failure, not a session stop
 // ---------------------------------------------------------------------------------------
 
-for (const code of ['auth_required', 'forbidden'] as const) {
-  void test(`a ${code} refusal of a U-prefixed problem is remembered per item and the drain continues`, async () => {
+for (const [pid, code] of [['U700001', 'auth_required'], ['U700001', 'forbidden'], ['T700001', 'auth_required'], ['T700001', 'forbidden']] as const) {
+  void test(`a ${code} refusal of ${pid} is remembered per item and the drain continues`, async () => {
     const world = await createWorld();
     try {
       const service = world.makeService(`svc-meta-private-${code}`);
-      await seedBacklog(world, world.alice.id, ['U700001', 'P1001']);
+      await seedBacklog(world, world.alice.id, [pid, 'P1001']);
       const feedCallsBefore = world.feed.calls.length;
       world.metadata.fail.set(
-        'U700001',
+        pid,
         new PlatformError({
           code,
           operation: 'problem',
@@ -2273,7 +2273,7 @@ for (const code of ['auth_required', 'forbidden'] as const) {
       const status = await service.status(world.alice.id);
       assert.deepEqual(
         world.metadata.calls,
-        ['U700001', 'P1001'],
+        [pid, 'P1001'],
         'the refused private key never stops the keys behind it',
       );
       assert.equal(status.metadataResolved, 1, 'the public key after the refusal was still fetched');
@@ -2286,7 +2286,7 @@ for (const code of ['auth_required', 'forbidden'] as const) {
       assert.equal(record?.value.missingMetadata.length, 1);
       assert.equal(
         record?.value.missingMetadata[0],
-        problemKeyOf(world.instance, 'U700001'),
+        problemKeyOf(world.instance, pid),
         'the refused key is rotated to the end of the durable backlog',
       );
     } finally {
