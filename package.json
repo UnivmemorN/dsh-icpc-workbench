@@ -126,7 +126,7 @@
     "test": "node --experimental-strip-types --import ./tests/loader.mjs --test --experimental-test-isolation=none \"tests/**/*.test.ts\"",
     "build": "node scripts/build.mjs",
     "check:architecture": "node scripts/check-architecture.mjs",
-    "check": "npm run typecheck && npm run check:architecture && npm run test && node --test --experimental-test-isolation=none scripts/usage.test.mjs scripts/worker-context.test.mjs && npm run build && node scripts/check-client.mjs"
+    "check": "npm run typecheck && npm run check:architecture && npm run test && node --test --experimental-test-isolation=none scripts/usage.test.mjs scripts/worker-context.test.mjs scripts/patch-balance-client.test.mjs && npm run build && node scripts/check-client.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.2",

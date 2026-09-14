@@ -108,3 +108,7 @@ The balanced thinking/templates method implements this project user's design req
 [Carrot](https://github.com/meooow25/carrot) is cited to explain a performance definition, not incorporated or executed. User-imported performance remains separate from official CF rating. The sources do not certify the workbench's AI assessment.
 
 The build reproduces full notices for every resolved client dependency. `remark-math@6.0.0` and `rehype-katex@7.0.1` omit their notice in npm; exact upstream notices are retained under `licenses/`, with commit provenance and SHA-256 verification in the build. PostCSS (MIT, https://github.com/postcss/postcss) is used only at build time to isolate formula styles. KaTeX fonts are embedded from its installed npm package with its published license notice.
+
+## Balance companion compatibility
+
+The reproducible client compatibility patch and its synthetic fixtures reference small portions of [LemCAE/dsh-balance](https://github.com/LemCAE/dsh-balance), package `@lemcae/dsh-balance` 0.1.7, MIT, Copyright (c) 2026 LemCAE. The complete original license is preserved in [licenses/dsh-balance-MIT.txt](licenses/dsh-balance-MIT.txt). This is an independently maintained local compatibility patch, not an upstream release. The balance plugin remains separately installed and removable; the ICPC model gateway does not acquire provider credentials. No installed profile, runtime log, balance amount or credential is included in the repository.
