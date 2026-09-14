@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件。独立工作区、独立 SQLite 数据库；基于题解证据补全标签，保留原始标签、人工决定和分析版本。
 
-**0.1.14 实验版**改进洛谷登录：默认只粘贴 `__client_id` 的值，`_uid` 使用当前账号的数字 UID；整段 Cookie 输入和旧凭据兼容，只保留这两项。同步错误区分提交记录与题目资料补齐，不再一概提示登录失效。保留可装卸的训练方法插件、思维与板子综合计划、AI 能力评估与其他题库功能。见 [本轮验收](docs/reports/stage-19-acceptance.md)、[上一轮功能](docs/reports/stage-18-acceptance.md) 与 [早期 30 题评测](docs/reports/stage-05-acceptance.md)。
+**0.1.15 实验版**新增独立的「账号与同步」页面，集中管理账号、平台同步和 JSON/CSV 导入。登录凭据、详细进度、自动同步设置与高级操作按需展开；题库保留浏览、筛选和选题。支持此前的双 Cookie 洛谷连接、训练方法插件与 AI 能力评估。见 [本轮验收](docs/reports/stage-20-acceptance.md)、[洛谷连接修复](docs/reports/stage-19-acceptance.md) 与 [早期 30 题评测](docs/reports/stage-05-acceptance.md)。
 
 ## 构建和隔离安装
 
@@ -14,7 +14,7 @@ npm run check
 npm pack
 # 首次创建隔离的 Web 配置，保持日常配置独立
 dsh --profile icpc-acceptance --from-default-profile web --help
-dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.14.tgz
+dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.15.tgz
 ```
 
 插件不需要位于 harness 源码树中，构建也不依赖相邻的 harness checkout。默认数据目录为系统应用数据目录中的 `dsh-icpc-workbench`。如需自定义，在宿主的配置覆盖文件中设置绝对路径：
@@ -31,10 +31,10 @@ dsh plugin --profile icpc-acceptance add ./dsh-icpc-workbench-0.1.14.tgz
 dsh --profile icpc-acceptance --patch ./icpc.patch.yml --port 3081
 ```
 
-在 dsh 侧栏点击 **ICPC 训练** 进入工作台，点击 **返回对话** 退出。依次在题库导入材料、选择题目并准备分析；核对调用上限后再启动。个人训练记录可按 [JSON/CSV 格式](docs/manual-import.md) 导入。
+在 dsh 侧栏点击 **ICPC 训练** 进入工作台，点击 **返回对话** 退出。先在「账号与同步」导入材料，再到题库选择题目并准备分析；核对调用上限后再启动。个人训练记录可按 [JSON/CSV 格式](docs/manual-import.md) 导入。
 
 
-添加账号时会说明 **Codeforces Handle（用户名）** 和 **洛谷 UID（数字用户号）** 的查找方法，可直接粘贴官方个人主页链接。保存后需在题库导入或同步记录。洛谷账号可在「题库 → 导入与同步 → 洛谷账号连接与同步」连接本地会话；首次回溯可续传，自动同步默认关闭，开启后默认每 30 分钟运行，仅在 dsh 打开期间生效。会话保存在 Windows 凭据管理器中，不要粘贴到 AI 对话。
+添加账号时会说明 **Codeforces Handle（用户名）** 和 **洛谷 UID（数字用户号）** 的查找方法，可直接粘贴官方个人主页链接。在「账号与同步 → 添加账号」保存后，可以在同页导入或同步记录。洛谷账号通过「连接洛谷 / 更新登录凭据」展开本地会话输入框；首次回溯可续传，自动同步默认关闭，开启后默认每 30 分钟运行，仅在 dsh 打开期间生效。会话保存在 Windows 凭据管理器中，不要粘贴到 AI 对话。
 
 在「题库」切换到 **合并题库（跨站去重）**，可统一浏览各平台已导入题目，按各站选定账号联动显示 AC 来源。当前识别 CF 原题与洛谷 CF 镜像编号（如 `1A` ↔ `CF1A`），同题按一组计数；各站题号、难度、题解与原始提交仍分别保留。详见 [账号与合并题库说明](docs/merged-bank.md)。
 

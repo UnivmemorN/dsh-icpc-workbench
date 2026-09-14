@@ -113,19 +113,52 @@ export const styles=`
 .icpc-plan-history td.icpc-plan-usage{white-space:nowrap}
 @media(max-width:640px){.icpc-plan-history td.icpc-plan-usage{white-space:normal}.icpc-plan-candidates td:first-child{min-width:0}}
 @media(prefers-color-scheme:dark){.icpc-plan-invalid{color:#e9a184}}
-.icpc-luogu{margin-top:14px;padding:12px 14px;border:1px solid var(--icpc-line);border-radius:9px;background:var(--icpc-card)}
+/* Sprint 20b: the Luogu block is a compact section inside the import panel — a rule, not a second
+   card — whose default view is a few status lines plus the primary action. Credentials, sync details,
+   automatic-sync settings and advanced recovery each sit behind one native disclosure, and the long
+   copy lives inside those, so the closed card stays short and still names every failure it has. */
+.icpc-luogu{margin-top:14px;padding-top:12px;border-top:1px solid var(--icpc-line);min-width:0}
 .icpc-luogu>summary{cursor:pointer;font-weight:600;padding:4px 0;color:var(--icpc-ink)}
-.icpc-luogu[open]>summary{margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--icpc-line)}
-.icpc-luogu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:12px;min-width:0}
-.icpc-luogu-block{display:flex;flex-direction:column;gap:8px;min-width:0}
-.icpc-luogu-block>p,.icpc-luogu-block>small{overflow-wrap:anywhere}
-.icpc-luogu-block>label{font-size:12px}
+.icpc-luogu[open]>summary{margin-bottom:10px}
+.icpc-luogu-status{margin:0;overflow-wrap:anywhere}
+.icpc-luogu-status strong{font-weight:650}
+.icpc-luogu-alert{margin:0;padding:8px 10px;border-left:3px solid #b05532;border-radius:0 6px 6px 0;background:var(--icpc-soft);overflow-wrap:anywhere}
+.icpc-luogu .icpc-check{flex-direction:row;align-items:center;gap:6px}
+.icpc-luogu-credentials{margin-top:12px;padding:12px;border:1px solid var(--icpc-line);border-radius:8px;background:var(--icpc-soft);min-width:0}
+.icpc-luogu-credentials form{display:flex;flex-direction:column;gap:8px;min-width:0}
+.icpc-luogu-detail{margin-top:10px;min-width:0}
+.icpc-luogu-detail>summary{cursor:pointer;font-weight:600;color:var(--icpc-ink)}
+.icpc-luogu-detail-body{display:flex;flex-direction:column;gap:8px;padding:10px 0 2px;min-width:0}
+.icpc-luogu-detail-body p,.icpc-luogu-detail-body small,.icpc-luogu-detail-body label{overflow-wrap:anywhere}
+.icpc-luogu-detail-body label{font-size:12px}
+.icpc-luogu .icpc-actions{flex-wrap:wrap}
 .icpc-luogu .icpc-luogu-guide{font-size:12px;color:var(--icpc-muted);min-width:0}
 .icpc-luogu .icpc-luogu-guide summary{cursor:pointer;color:var(--icpc-ink)}
 .icpc-luogu .icpc-luogu-guide ol{margin:8px 0 0;padding-left:18px}
 .icpc-luogu .icpc-luogu-guide li+li{margin-top:4px}
 .icpc-luogu .icpc-luogu-guide p{margin-top:8px}
 .icpc-luogu .icpc-field-error{font-size:12px;font-weight:600;color:#b05532}
-@media(max-width:640px){.icpc-luogu{padding:10px 12px}.icpc-luogu-grid{grid-template-columns:1fr}}
-@media(prefers-color-scheme:dark){.icpc-root .icpc-luogu .icpc-field-error{color:#e9a184}}
+@media(max-width:640px){.icpc-luogu{padding-top:10px}.icpc-luogu-credentials{padding:10px}}
+@media(prefers-color-scheme:dark){.icpc-root .icpc-luogu .icpc-field-error{color:#e9a184}.icpc-root .icpc-luogu-alert{border-left-color:#e9a184}}
+/* Sprint 20a: dedicated accounts & sync page. Nav wraps instead of scrolling once it has one more
+   entry; every account rule stays inside .icpc-accounts or .icpc-sync-link under .icpc-root. */
+.icpc-root .icpc-nav{flex-wrap:wrap}
+.icpc-accounts{display:flex;flex-direction:column;gap:16px;min-width:0}
+.icpc-account-list{list-style:none;margin:0 0 12px;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;min-width:0}
+.icpc-account-list li{min-width:0}
+.icpc-account-list button{display:flex;flex-direction:column;align-items:flex-start;gap:3px;width:100%;text-align:left;overflow-wrap:anywhere}
+.icpc-account-list button[aria-pressed=true]{border-color:var(--icpc-accent);background:var(--icpc-soft);font-weight:650}
+.icpc-account-list span{font-size:12px;color:var(--icpc-muted)}
+.icpc-account-list button[aria-pressed=true] span{color:inherit}
+.icpc-account-current{font-size:12px;color:var(--icpc-muted);overflow-wrap:anywhere}
+.icpc-accounts .icpc-add-account{margin-top:14px;padding:14px 16px;border:1px solid var(--icpc-line);border-radius:9px;background:var(--icpc-soft)}
+.icpc-account-guide{font-size:12px;color:var(--icpc-muted);min-width:0}
+.icpc-account-guide summary{cursor:pointer;color:var(--icpc-ink)}
+.icpc-account-guide p{margin-top:6px}
+.icpc-accounts-source{display:flex;flex-direction:column;gap:12px;min-width:0}
+.icpc-accounts-source .icpc-toolbar{margin-bottom:0;align-items:center}
+.icpc-accounts-source .icpc-toolbar .icpc-muted{flex:1 1 240px;min-width:0;font-size:12px;overflow-wrap:anywhere}
+.icpc-sync-link{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin-bottom:16px}
+.icpc-sync-link .icpc-muted{flex:1 1 220px;min-width:0;font-size:12px;overflow-wrap:anywhere}
+@media(max-width:640px){.icpc-account-list{grid-template-columns:1fr}.icpc-accounts-source .icpc-toolbar>label{flex-basis:100%}}
 `;

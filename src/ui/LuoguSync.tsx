@@ -4,7 +4,6 @@ import {
   Empty,
   ErrorNotice,
   Notice,
-  Stats,
   useAction,
   usePollAfterSettle,
   useRequest,
@@ -15,6 +14,7 @@ import {
   LUOGU_AI_CHAT_WARNING,
   LUOGU_AUTOMATION_NOTE,
   LUOGU_CLIENT_ID_HELP,
+  LUOGU_CLIENT_ID_INSTRUCTION,
   LUOGU_COOKIE_GUIDE,
   LUOGU_DISCONNECT_NOTE,
   LUOGU_FULL_COOKIE_HELP,
@@ -25,6 +25,7 @@ import {
   LUOGU_PHASE_LABELS,
   LUOGU_POLL_IDLE_MS,
   LUOGU_RECENT_WINDOW_NOTE,
+  LUOGU_SECRET_LOCAL_ONLY_NOTE,
   LUOGU_SECRET_MEMORY_NOTE,
   LUOGU_SECRET_STORAGE_NOTE,
   LUOGU_START_OUTCOMES,
@@ -32,38 +33,59 @@ import {
   checkLuoguSessionCookie,
   luoguAttemptSummary,
   luoguBacklogSummary,
-  luoguConnectionText,
+  luoguCompactSummary,
   luoguControls,
+  luoguCredentialActionLabel,
   luoguFailureGuidance,
   luoguHistoryCoverage,
-  luoguHistoryCoverageLabel,
   luoguLoginCheckSummary,
-  luoguNextRunSummary,
   luoguPanelState,
   luoguPollDelayMs,
+  luoguPrimaryActionReason,
   luoguProgressSummary,
   luoguSettingsDirty,
   luoguSettingsDraft,
+  luoguSettingsEditable,
   luoguSettingsPatch,
+  luoguSyncFailureGuidance,
   luoguSyncProgressStep,
-  luoguTime,
   luoguUnsupportedOsNote,
   type LuoguAction,
-  type LuoguControl,
   type LuoguSecretMode,
   type LuoguSettingsDraft,
   type LuoguSyncProgressState,
 } from './luogu-view.js';
 
+/** Stable id of the one revealed credential region, so its trigger can name what it controls. */
+const CREDENTIALS_ID = 'icpc-luogu-credentials';
+
 /**
- * Dedicated Luogu account connection and synchronization panel (Sprint 17d2).
+ * Dedicated Luogu account connection and synchronization card (Sprint 17d2, compacted in 20b).
  *
- * It is the visible entry「题库 → 导入与同步 → 洛谷账号连接与同步」and drives exactly the seven typed
- * operations `luogu.status` / `luogu.connect` / `luogu.probe` / `luogu.disconnect` /
+ * It is the visible entry「账号与同步 → 数据来源：洛谷 → 导入与同步 → 洛谷账号连接与同步」and drives exactly the
+ * seven typed operations `luogu.status` / `luogu.connect` / `luogu.probe` / `luogu.disconnect` /
  * `luogu.configure` / `luogu.start` / `luogu.cancel`; it never talks to a platform, a database or a
  * credential store itself.
  *
- * The rules it follows:
+ * The compact disclosure rules (Sprint 20b):
+ *
+ * - **The default view is a few lines.** Connection state, last login check, history coverage, metadata
+ *   backlog and automation state, then the primary「开始 / 继续同步」action.「暂停本轮」is rendered only
+ *   while this instance is actually running. No textbox, textarea, statistics grid or tutorial
+ *   paragraph exists until the user asks for it, and a failure is still stated in one short sentence.
+ * - **One credential trigger, one form.** The single「连接洛谷」/「更新登录凭据」control
+ *   ({@link luoguCredentialActionLabel}) mounts the credential form. Closing it unmounts the inputs and
+ *   drops both drafts *and* the mode; an attempted submission clears them and collapses the form; a
+ *   submit-button click is the only path that ever calls `luogu.connect`.
+ * - **Each long sentence exists once.**「同步详情」holds the accurate progress, coverage, latest-attempt
+ *   and backlog answers plus the stage-aware advice;「自动同步设置」holds the editable per-account
+ *   settings;「高级操作」holds the explicitly confirmed whole-history reconciliation and the
+ *   pause-versus-automation note. All three are native `<details>` collapsed by default.
+ * - **Editable means the host can accept a change.** The automatic-sync fields are disabled only while
+ *   an action is in flight or the plugin is closing ({@link luoguSettingsEditable}), never because the
+ *   draft happens to be unchanged, while the save button still requires a real change.
+ *
+ * The rules it keeps from Stage 17d2/19:
  *
  * - **The durable status is the only state.** Every control's availability is derived from the last
  *   status answer ({@link luoguControls}), so remounting the page re-derives the same controls, and a
@@ -71,16 +93,18 @@ import {
  * - **The session draft is memory-only.** It lives in this component in one of two modes — the
  *   `__client_id` **value** (default) or an optional whole-Cookie paste — and the `_uid` is never
  *   typed: it is the readonly UID of the selected account. The draft is submitted only to
- *   `luogu.connect`, is cleared before that request settles (and again on account switch, mode switch
- *   or unmount), is never written to `localStorage`/`sessionStorage` and is never echoed in a message
- *   or an error.
+ *   `luogu.connect`, is cleared before that request settles (and again on account switch, mode switch,
+ *   closing the form or unmount), is never written to `localStorage`/`sessionStorage` and is never
+ *   echoed in a message or an error.
  * - **Safe polling.** `luogu.status` is polled only while this panel is mounted, only while something
  *   can actually change (a reserved/running pass, or automation that may start one), and each read is
  *   aborted by `useRequest` when the account changes or the panel unmounts, so a stale answer cannot
  *   overwrite a newer one.
- * - **Honest numbers.** History coverage, the latest attempt and the metadata backlog are rendered as
- *   three separate answers, and processed rows are labelled as including duplicate checks and rejudge
- *   replays rather than as new submissions.
+ * - **Honest numbers.** History coverage, the latest attempt and the metadata backlog stay three
+ *   separate answers — the compact card summarises them and「同步详情」states them in full — and
+ *   processed rows are labelled as including duplicate checks and rejudge replays rather than as new
+ *   submissions. A successful login check is shown as a current login check and never retracts a
+ *   failed pass.
  */
 export function LuoguSyncPanel({
   sourcePlatform,
@@ -95,12 +119,14 @@ export function LuoguSyncPanel({
   const account = boot.accounts.find((entry) => entry.id === accountId) ?? null;
   const source = account === null ? null : boot.sources.find((entry) => entry.id === account.sourceInstanceId) ?? null;
   const panelState = luoguPanelState(account !== null, source?.platform ?? null);
-  // The panel opens itself when it is already about a Luogu account, and stays collapsed otherwise.
-  const [open] = useState(panelState === 'ready');
+  // The block opens itself whenever it is already about a Luogu account, so the compact card is the
+  // default view there; it stays collapsed otherwise. The value only follows `panelState` transitions
+  // (mount, account selected/cleared) — a manual collapse is not re-applied on unrelated re-renders.
   const status = useRequest('luogu.status', panelState === 'ready' && accountId !== null ? { accountId } : null);
   const value = status.data;
   const hostAction = useAction();
   const [pending, setPending] = useState<LuoguAction | null>(null);
+  const [credentialsOpen, setCredentialsOpen] = useState(false);
   const [secretMode, setSecretMode] = useState<LuoguSecretMode>('client_id');
   const [clientId, setClientId] = useState('');
   const [fullCookie, setFullCookie] = useState('');
@@ -109,8 +135,9 @@ export function LuoguSyncPanel({
   const [message, setMessage] = useState<string | null>(null);
 
   // A draft is never carried into another account: switching accounts clears the secret immediately,
-  // and unmount clears it by dropping the only copy that exists.
+  // collapses the credential form, and unmount clears the drafts by dropping the only copy there is.
   useEffect(() => {
+    setCredentialsOpen(false);
     setSecretMode('client_id');
     setClientId('');
     setFullCookie('');
@@ -193,16 +220,29 @@ export function LuoguSyncPanel({
     }
   }
 
+  /**
+   * Close the one credential disclosure.
+   *
+   * The inputs unmount with it, and the mode and both drafts are dropped in the same commit: nothing
+   * that was typed can survive a close and reappear when the form is opened again.
+   */
+  function closeCredentials(): void {
+    setCredentialsOpen(false);
+    setSecretMode('client_id');
+    setClientId('');
+    setFullCookie('');
+  }
+
   function connect(): void {
     const target = accountId;
     const submitted = secret.cookie;
     if (target === null || submitted === null) {
       return;
     }
-    // Cleared before the request settles: the draft must not survive an attempted submission, and it
-    // is never rendered again — not in the success message, not in an error, not in a title.
-    setClientId('');
-    setFullCookie('');
+    // Cleared and collapsed before the request settles: the draft must not survive an attempted
+    // submission, and it is never rendered again — not in the success message, not in an error, not
+    // in a title. This submit path is the only caller of `luogu.connect`.
+    closeCredentials();
     void submit('connect', async (signal) => {
       await api.request('luogu.connect', { accountId: target, sessionCookie: submitted }, signal);
       setMessage('登录凭据已保存在本机凭据管理器，并用一次真实读取检查过登录。');
@@ -255,7 +295,7 @@ export function LuoguSyncPanel({
     void submit('cancel', async (signal) => {
       await api.request('luogu.cancel', { accountId: target }, signal);
       setMessage(
-        '已请求暂停本轮：已经提交的进度会保留，可以稍后继续。这不会关闭自动同步，自动同步要单独用下面的开关关闭。',
+        '已请求暂停本轮：已经提交的进度会保留，可以稍后继续。这不会关闭自动同步，自动同步要单独用「自动同步设置」里的开关关闭。',
       );
     });
   }
@@ -276,7 +316,6 @@ export function LuoguSyncPanel({
     });
   }
 
-  const ready = value !== null;
   const accountLabel = account === null ? '未选择账号' : account.displayName ?? account.handle;
   let body: ReactNode;
   if (panelState === 'no-account') {
@@ -300,7 +339,7 @@ export function LuoguSyncPanel({
         <p className="icpc-muted">{LUOGU_MANUAL_STILL_AVAILABLE}</p>
       </>
     );
-  } else if (!ready) {
+  } else if (value === null) {
     body = (
       <>
         <p className="icpc-muted">
@@ -316,232 +355,255 @@ export function LuoguSyncPanel({
             </button>
           </div>
         )}
-        <p className="icpc-muted">{LUOGU_MANUAL_STILL_AVAILABLE}</p>
       </>
     );
   } else {
-    const connectionReason = disabledReason(controls.connect, controls.probe, controls.disconnect);
-    const syncReason = disabledReason(controls.start, controls.reconcile, controls.cancel);
+    const compact = luoguCompactSummary(value);
+    const supported = value.connectionAvailable;
+    const connected = value.connection !== null && value.connection.status === 'connected';
+    const credentialLabel = luoguCredentialActionLabel(value);
+    const settingsEditable = luoguSettingsEditable(value, pending !== null);
+    const primaryReason = luoguPrimaryActionReason(value, controls.start, pending !== null);
     // A login check newer than the failure is shown as a successful check *now*; it never retracts
     // the failure and is never rendered as a successful synchronization.
     const loginCheck = luoguLoginCheckSummary(value);
+    // The connection record and a sync pass are different operations, but they can share one fixed
+    // sentence (the same `auth_required`, for example): every long sentence is rendered at most once.
+    const connectionAdvice = luoguFailureGuidance(value.connection?.failureCode ?? null);
+    const connectionOnlyAdvice =
+      connectionAdvice !== null && connectionAdvice !== luoguSyncFailureGuidance(value.failure)
+        ? connectionAdvice
+        : null;
+    // The whole-history confirmation is the checkbox's own sentence, so its "please confirm" reason
+    // is not repeated; every other reason (no connection, closing, running) is worth stating.
+    const reconcileReason =
+      fullConfirm && pending === null && !controls.reconcile.enabled ? controls.reconcile.reason : null;
+    const settingsHint = settingsEditable
+      ? settingsDirty
+        ? '有未保存的修改：保存后按账号立即生效。'
+        : '修改任意一项后，「保存自动同步设置」才会启用。'
+      : controls.configure.reason ?? '暂时无法修改自动同步设置。';
+
     body = (
       <>
         <p className="icpc-muted">
           账号：{accountLabel} · 洛谷 UID：{value.uid} · 来源：{source?.displayName ?? '洛谷'}
         </p>
-        <Stats
-          items={[
-            { label: '连接', value: luoguConnectionText(value) },
-            { label: '同步阶段', value: LUOGU_PHASE_LABELS[value.phase] },
-            { label: '历史覆盖', value: luoguHistoryCoverageLabel(value) },
-            { label: '待补题目资料', value: value.metadataBacklog },
-            { label: '累计处理提交记录', value: value.submissionsSeen },
-          ]}
-        />
+        <p className="icpc-luogu-status">
+          <strong>{compact.connection}</strong>
+          {compact.checkedAt !== null && <span className="icpc-muted"> · 最近检查 {compact.checkedAt}</span>}
+        </p>
+        <p className="icpc-luogu-status">
+          历史覆盖：{compact.history}
+          <span className="icpc-muted"> · {compact.backlog} · {compact.automation}</span>
+        </p>
         <ErrorNotice error={hostAction.error ?? status.error} />
         {message !== null && <Notice>{message}</Notice>}
+        {/* The compact card never hides a failure: one short sentence names it and the long,
+            stage-aware next-action sentence is rendered once inside「同步详情」. */}
+        {compact.alert !== null && (
+          <p className="icpc-luogu-alert" role="status">
+            {compact.alert}
+          </p>
+        )}
+        {value.connection?.cleanupPending === true && (
+          <p className="icpc-luogu-alert" role="status">
+            有一个旧的登录凭据还没有从 Windows 凭据管理器删除：请展开「更新登录凭据」，再点一次「断开连接」完成清理。
+          </p>
+        )}
+        {!supported && (
+          <>
+            <Notice>{luoguUnsupportedOsNote(value.connectionPlatform)}</Notice>
+            <p className="icpc-muted">{LUOGU_MANUAL_STILL_AVAILABLE}</p>
+          </>
+        )}
 
-        <div className="icpc-luogu-grid">
-          <section className="icpc-luogu-block">
-            <h3>连接</h3>
-            <p>状态：{luoguConnectionText(value)}</p>
-            {value.connection !== null && (
-              <p className="icpc-muted">
-                连接于 {luoguTime(value.connection.connectedAt)} · 最近检查 {luoguTime(value.connection.checkedAt)}
-              </p>
-            )}
-            {value.connection !== null && value.connection.failureCode !== null && (
-              <p className="icpc-muted">{luoguFailureGuidance(value.connection.failureCode)}</p>
-            )}
-            {value.connection?.cleanupPending === true && (
-              <p className="icpc-muted">
-                有一个旧的登录凭据还没有从 Windows 凭据管理器删除：请再点一次「断开连接」完成清理。
-              </p>
-            )}
-            {!value.connectionAvailable ? (
-              <Notice>{luoguUnsupportedOsNote(value.connectionPlatform)}</Notice>
-            ) : (
-              <>
-                <label htmlFor="icpc-luogu-uid">洛谷 UID（_uid，只读）</label>
-                <input
-                  id="icpc-luogu-uid"
-                  type="text"
-                  value={value.uid}
-                  readOnly
-                  aria-describedby="icpc-luogu-uid-help"
-                />
-                <small className="icpc-muted" id="icpc-luogu-uid-help">
-                  {LUOGU_UID_DISPLAY_NOTE}
-                </small>
-                {secretMode === 'client_id' ? (
-                  <>
-                    <label htmlFor="icpc-luogu-client-id">__client_id 的值（只在本机使用）</label>
-                    <input
-                      id="icpc-luogu-client-id"
-                      type="password"
-                      value={clientId}
-                      autoComplete="off"
-                      spellCheck={false}
-                      placeholder="只粘贴 Value（值）一列"
-                      aria-invalid={secret.message === null ? undefined : true}
-                      aria-describedby="icpc-luogu-client-id-help"
-                      onChange={(event) => setClientId(event.target.value)}
-                    />
-                    <small className="icpc-muted" id="icpc-luogu-client-id-help">
-                      {LUOGU_CLIENT_ID_HELP}
-                    </small>
-                  </>
-                ) : (
-                  <>
-                    <label htmlFor="icpc-luogu-cookie">整段 Cookie 值（高级，只在本机使用）</label>
-                    <input
-                      id="icpc-luogu-cookie"
-                      type="password"
-                      value={fullCookie}
-                      autoComplete="off"
-                      spellCheck={false}
-                      placeholder="粘贴浏览器请求里 Cookie 的完整值"
-                      aria-invalid={secret.message === null ? undefined : true}
-                      aria-describedby="icpc-luogu-cookie-help"
-                      onChange={(event) => setFullCookie(event.target.value)}
-                    />
-                    <small className="icpc-muted" id="icpc-luogu-cookie-help">
-                      {LUOGU_FULL_COOKIE_HELP}
-                    </small>
-                  </>
-                )}
-                <label className="icpc-check">
+        <div className="icpc-actions">
+          <button
+            type="button"
+            className="icpc-primary"
+            disabled={!controls.start.enabled}
+            aria-busy={pending === 'start'}
+            onClick={() => start('resume')}
+          >
+            {pending === 'start' ? '提交中…' : '开始 / 继续同步'}
+          </button>
+          {value.running && (
+            <button
+              type="button"
+              disabled={!controls.cancel.enabled}
+              aria-busy={pending === 'cancel'}
+              onClick={cancelPass}
+            >
+              {pending === 'cancel' ? '暂停中…' : '暂停本轮'}
+            </button>
+          )}
+          {supported && value.connection !== null && (
+            <button type="button" disabled={!controls.probe.enabled} aria-busy={pending === 'probe'} onClick={probe}>
+              {pending === 'probe' ? '检查中…' : '检查登录'}
+            </button>
+          )}
+          {supported && (
+            <button
+              type="button"
+              className={connected ? undefined : 'icpc-primary'}
+              aria-expanded={credentialsOpen}
+              aria-controls={CREDENTIALS_ID}
+              onClick={() => (credentialsOpen ? closeCredentials() : setCredentialsOpen(true))}
+            >
+              {credentialsOpen ? '收起登录凭据' : credentialLabel}
+            </button>
+          )}
+        </div>
+        {primaryReason !== null && (
+          <small className="icpc-muted" role="status">
+            {primaryReason}
+          </small>
+        )}
+
+        {supported && credentialsOpen && (
+          <section className="icpc-luogu-credentials" id={CREDENTIALS_ID} aria-label="洛谷登录凭据">
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                connect();
+              }}
+            >
+              <label htmlFor="icpc-luogu-uid">洛谷 UID（_uid，只读）</label>
+              <input id="icpc-luogu-uid" type="text" value={value.uid} readOnly />
+              {secretMode === 'client_id' ? (
+                <>
+                  <label htmlFor="icpc-luogu-client-id">__client_id 的值（只在本机使用）</label>
                   <input
-                    type="checkbox"
-                    checked={secretMode === 'full_cookie'}
-                    onChange={(event) => {
-                      // Switching the input mode drops whatever was typed: the two shapes are not
-                      // interchangeable, and neither draft may survive the switch.
-                      setSecretMode(event.target.checked ? 'full_cookie' : 'client_id');
-                      setClientId('');
-                      setFullCookie('');
-                    }}
+                    id="icpc-luogu-client-id"
+                    type="password"
+                    value={clientId}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="只粘贴 Value（值）一列"
+                    aria-invalid={secret.message === null ? undefined : true}
+                    aria-describedby="icpc-luogu-client-id-help"
+                    onChange={(event) => setClientId(event.target.value)}
                   />
-                  {LUOGU_FULL_COOKIE_TOGGLE}
-                </label>
-                <small className="icpc-muted">{LUOGU_SECRET_MEMORY_NOTE}</small>
-                {secret.message !== null && (
-                  <small className="icpc-field-error" role="alert">
-                    {secret.message}
+                  <small className="icpc-muted" id="icpc-luogu-client-id-help">
+                    {LUOGU_CLIENT_ID_INSTRUCTION}
                   </small>
+                </>
+              ) : (
+                <>
+                  <label htmlFor="icpc-luogu-cookie">整段 Cookie 值（高级，只在本机使用）</label>
+                  <input
+                    id="icpc-luogu-cookie"
+                    type="password"
+                    value={fullCookie}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="粘贴浏览器请求里 Cookie 的完整值"
+                    aria-invalid={secret.message === null ? undefined : true}
+                    aria-describedby="icpc-luogu-cookie-help"
+                    onChange={(event) => setFullCookie(event.target.value)}
+                  />
+                  <small className="icpc-muted" id="icpc-luogu-cookie-help">
+                    提交前只保留 __client_id 与 _uid 两项，其余 Cookie 一律丢弃。
+                  </small>
+                </>
+              )}
+              <label className="icpc-check">
+                <input
+                  type="checkbox"
+                  checked={secretMode === 'full_cookie'}
+                  onChange={(event) => {
+                    // Switching the input mode drops whatever was typed: the two shapes are not
+                    // interchangeable, and neither draft may survive the switch.
+                    setSecretMode(event.target.checked ? 'full_cookie' : 'client_id');
+                    setClientId('');
+                    setFullCookie('');
+                  }}
+                />
+                {LUOGU_FULL_COOKIE_TOGGLE}
+              </label>
+              <small className="icpc-muted">{LUOGU_SECRET_LOCAL_ONLY_NOTE}</small>
+              {secret.message !== null && (
+                <small className="icpc-field-error" role="alert">
+                  {secret.message}
+                </small>
+              )}
+              <div className="icpc-actions">
+                <button
+                  type="submit"
+                  className="icpc-primary"
+                  disabled={!controls.connect.enabled}
+                  aria-busy={pending === 'connect'}
+                >
+                  {pending === 'connect' ? '连接中…' : '连接'}
+                </button>
+                <button type="button" onClick={closeCredentials}>
+                  取消
+                </button>
+                {value.connection !== null && (
+                  <button
+                    type="button"
+                    disabled={!controls.disconnect.enabled}
+                    aria-busy={pending === 'disconnect'}
+                    onClick={disconnect}
+                  >
+                    {pending === 'disconnect' ? '断开中…' : '断开连接'}
+                  </button>
                 )}
-              </>
-            )}
-            <div className="icpc-actions">
-              <button
-                type="button"
-                className="icpc-primary"
-                disabled={!controls.connect.enabled}
-                aria-busy={pending === 'connect'}
-                onClick={connect}
-              >
-                {pending === 'connect' ? '连接中…' : '连接'}
-              </button>
-              <button
-                type="button"
-                disabled={!controls.probe.enabled}
-                aria-busy={pending === 'probe'}
-                onClick={probe}
-              >
-                {pending === 'probe' ? '检查中…' : '检查登录'}
-              </button>
-              <button
-                type="button"
-                disabled={!controls.disconnect.enabled}
-                aria-busy={pending === 'disconnect'}
-                onClick={disconnect}
-              >
-                {pending === 'disconnect' ? '断开中…' : '断开连接'}
-              </button>
-            </div>
-            {connectionReason !== null && (
-              <small className="icpc-muted" role="status">
-                {connectionReason}
-              </small>
-            )}
-            <p className="icpc-muted">{LUOGU_SECRET_STORAGE_NOTE}</p>
-            <p className="icpc-muted">{LUOGU_DISCONNECT_NOTE}</p>
-            <details className="icpc-luogu-guide">
-              <summary>怎样从自己的浏览器取得 Cookie 值</summary>
-              <ol>
-                {LUOGU_COOKIE_GUIDE.map((line) => (
-                  <li key={line}>{line}</li>
-                ))}
-              </ol>
-              <p className="icpc-muted">{LUOGU_AI_CHAT_WARNING}</p>
-            </details>
+              </div>
+              {pending === null && !controls.connect.enabled && controls.connect.reason !== null && (
+                <small className="icpc-muted" role="status">
+                  {controls.connect.reason}
+                </small>
+              )}
+              {value.connection !== null && <small className="icpc-muted">{LUOGU_DISCONNECT_NOTE}</small>}
+              <details className="icpc-luogu-guide">
+                <summary>如何获取 Cookie</summary>
+                <ol>
+                  {LUOGU_COOKIE_GUIDE.map((line) => (
+                    <li key={line}>{line}</li>
+                  ))}
+                </ol>
+                <p className="icpc-muted">{LUOGU_UID_DISPLAY_NOTE}</p>
+                <p className="icpc-muted">{LUOGU_CLIENT_ID_HELP}</p>
+                <p className="icpc-muted">{LUOGU_FULL_COOKIE_HELP}</p>
+                <p className="icpc-muted">{LUOGU_SECRET_MEMORY_NOTE}</p>
+                <p className="icpc-muted">{LUOGU_SECRET_STORAGE_NOTE}</p>
+                <p className="icpc-muted">{LUOGU_AI_CHAT_WARNING}</p>
+              </details>
+            </form>
           </section>
+        )}
 
-          <section className="icpc-luogu-block">
-            <h3>同步</h3>
+        <details className="icpc-luogu-detail">
+          <summary>同步详情</summary>
+          <div className="icpc-luogu-detail-body">
+            <p className="icpc-muted">同步阶段：{LUOGU_PHASE_LABELS[value.phase]}</p>
             <p>{luoguProgressSummary(value)}</p>
             <p>{luoguHistoryCoverage(value)}</p>
-            {/* This line is the panel's failure advice: it is rendered from the stage-aware helper,
-                so a metadata failure can never be described here as an expired cookie, and a legacy
-                record without a stage keeps the neutral wording. */}
+            {/* The panel's failure advice: rendered from the stage-aware helper, so a metadata
+                failure can never be described here as an expired cookie, and a legacy record without
+                a stage keeps the neutral wording. */}
             <p>{luoguAttemptSummary(value)}</p>
+            {connectionOnlyAdvice !== null && (
+              <p className="icpc-muted" role="status">
+                {connectionOnlyAdvice}
+              </p>
+            )}
             {loginCheck !== null && (
               <p className="icpc-muted" role="status">
                 {loginCheck}
               </p>
             )}
             <p>{luoguBacklogSummary(value)}</p>
-            <p>{luoguNextRunSummary(value)}</p>
-            {value.closing && (
-              <Notice>插件正在关闭或重启：不会开始新的同步；重启 dsh 后会从本机保存的进度继续。</Notice>
-            )}
-            <label className="icpc-check">
-              <input
-                type="checkbox"
-                checked={fullConfirm}
-                onChange={(event) => setFullConfirm(event.target.checked)}
-              />
-              我确认：全历史完整核对会重新扫描这个账号的全部历史
-            </label>
-            <div className="icpc-actions">
-              <button
-                type="button"
-                className="icpc-primary"
-                disabled={!controls.start.enabled}
-                aria-busy={pending === 'start'}
-                onClick={() => start('resume')}
-              >
-                {pending === 'start' ? '提交中…' : '开始 / 继续同步'}
-              </button>
-              <button
-                type="button"
-                disabled={!controls.reconcile.enabled}
-                aria-busy={pending === 'reconcile'}
-                onClick={() => start('full')}
-              >
-                {pending === 'reconcile' ? '提交中…' : '全历史完整核对'}
-              </button>
-              <button
-                type="button"
-                disabled={!controls.cancel.enabled}
-                aria-busy={pending === 'cancel'}
-                onClick={cancelPass}
-              >
-                {pending === 'cancel' ? '暂停中…' : '暂停本轮'}
-              </button>
-            </div>
-            {syncReason !== null && (
-              <small className="icpc-muted" role="status">
-                {syncReason}
-              </small>
-            )}
             <p className="icpc-muted">{LUOGU_RECENT_WINDOW_NOTE}</p>
             <p className="icpc-muted">{LUOGU_AC_EVIDENCE_NOTE}</p>
-          </section>
+          </div>
+        </details>
 
-          <section className="icpc-luogu-block">
-            <h3>自动同步（按账号）</h3>
+        <details className="icpc-luogu-detail">
+          <summary>自动同步设置</summary>
+          <div className="icpc-luogu-detail-body">
             {draft === null ? (
               <p className="icpc-muted">正在读取自动同步设置…</p>
             ) : (
@@ -550,7 +612,7 @@ export function LuoguSyncPanel({
                   <input
                     type="checkbox"
                     checked={draft.automaticEnabled}
-                    disabled={!controls.configure.enabled && !settingsDirty}
+                    disabled={!settingsEditable}
                     onChange={(event) => setDraft({ ...draft, automaticEnabled: event.target.checked })}
                   />
                   为本账号开启自动同步
@@ -559,7 +621,7 @@ export function LuoguSyncPanel({
                   <input
                     type="checkbox"
                     checked={draft.runOnStartup}
-                    disabled={!controls.configure.enabled && !settingsDirty}
+                    disabled={!settingsEditable}
                     onChange={(event) => setDraft({ ...draft, runOnStartup: event.target.checked })}
                   />
                   每次启动 dsh 后先同步一次
@@ -571,7 +633,8 @@ export function LuoguSyncPanel({
                   id="icpc-luogu-interval"
                   inputMode="numeric"
                   value={draft.intervalMinutes}
-                  aria-describedby="icpc-luogu-interval-help"
+                  disabled={!settingsEditable}
+                  aria-describedby="icpc-luogu-settings-help"
                   onChange={(event) => setDraft({ ...draft, intervalMinutes: event.target.value })}
                 />
                 <div className="icpc-actions">
@@ -584,42 +647,58 @@ export function LuoguSyncPanel({
                     {pending === 'configure' ? '保存中…' : '保存自动同步设置'}
                   </button>
                 </div>
-                {!controls.configure.enabled && controls.configure.reason !== null && (
-                  <small className="icpc-muted" role="status" id="icpc-luogu-interval-help">
-                    {controls.configure.reason}
-                  </small>
-                )}
-                <p className="icpc-muted">
-                  设置版本：{value.settingsRevision ?? '尚未建立'}
-                  （保存时会带上这个版本号；如果在别处改过，保存会被拒绝并提示刷新，而不是覆盖别人的决定。）
-                </p>
+                <small className="icpc-muted" role="status" id="icpc-luogu-settings-help">
+                  {settingsHint}
+                </small>
+                <p className="icpc-muted">{LUOGU_AUTOMATION_NOTE}</p>
               </>
             )}
-            <p className="icpc-muted">{LUOGU_AUTOMATION_NOTE}</p>
+          </div>
+        </details>
+
+        <details className="icpc-luogu-detail">
+          <summary>高级操作</summary>
+          <div className="icpc-luogu-detail-body">
+            <p className="icpc-muted">核对只重新读取并更新本地记录，不会删除已有记录。</p>
+            <label className="icpc-check">
+              <input
+                type="checkbox"
+                checked={fullConfirm}
+                disabled={pending !== null}
+                onChange={(event) => setFullConfirm(event.target.checked)}
+              />
+              我确认：全历史完整核对会重新扫描这个账号的全部历史
+            </label>
+            <div className="icpc-actions">
+              <button
+                type="button"
+                disabled={!controls.reconcile.enabled}
+                aria-busy={pending === 'reconcile'}
+                onClick={() => start('full')}
+              >
+                {pending === 'reconcile' ? '提交中…' : '全历史完整核对'}
+              </button>
+            </div>
+            {reconcileReason !== null && (
+              <small className="icpc-muted" role="status">
+                {reconcileReason}
+              </small>
+            )}
             <p className="icpc-muted">
-              「暂停本轮」只停止当前这一轮同步；是否以后自动运行由上面的开关决定，两者互不替代。
+              「暂停本轮」只停止当前这一轮同步；是否以后自动运行由「自动同步设置」决定，两者互不替代。
             </p>
-            <p className="icpc-muted">{LUOGU_MANUAL_STILL_AVAILABLE}</p>
-          </section>
-        </div>
+          </div>
+        </details>
       </>
     );
   }
 
   return (
-    <details className="icpc-luogu" open={open}>
+    <details className="icpc-luogu" open={panelState === 'ready'} onToggle={(event) => {
+      if (event.target === event.currentTarget && !event.currentTarget.open) closeCredentials();
+    }}>
       <summary>洛谷账号连接与同步</summary>
       {body}
     </details>
   );
-}
-
-/** First reason a group of controls is unavailable; `null` when the whole group is usable. */
-function disabledReason(...entries: readonly LuoguControl[]): string | null {
-  for (const entry of entries) {
-    if (!entry.enabled && entry.reason !== null) {
-      return entry.reason;
-    }
-  }
-  return null;
 }

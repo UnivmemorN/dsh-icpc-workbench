@@ -28,16 +28,20 @@ import {
   LUOGU_START_OUTCOMES,
   LUOGU_AI_CHAT_WARNING,
   LUOGU_CLIENT_ID_HELP,
+  LUOGU_CLIENT_ID_INSTRUCTION,
   LUOGU_COOKIE_GUIDE,
   LUOGU_FULL_COOKIE_HELP,
   LUOGU_FULL_COOKIE_TOGGLE,
+  LUOGU_SECRET_LOCAL_ONLY_NOTE,
   LUOGU_SECRET_MEMORY_NOTE,
   LUOGU_SECRET_STORAGE_NOTE,
   LUOGU_UID_DISPLAY_NOTE,
   checkLuoguSessionCookie,
   luoguAttemptSummary,
   luoguBacklogSummary,
+  luoguCompactSummary,
   luoguControls,
+  luoguCredentialActionLabel,
   luoguFailureGuidance,
   luoguHistoryCoverage,
   luoguHistoryCoverageLabel,
@@ -46,9 +50,11 @@ import {
   luoguNextRunSummary,
   luoguPanelState,
   luoguPollDelayMs,
+  luoguPrimaryActionReason,
   luoguProgressSummary,
   luoguSettingsDirty,
   luoguSettingsDraft,
+  luoguSettingsEditable,
   luoguSettingsPatch,
   luoguSyncFailureGuidance,
   luoguTime,
@@ -598,4 +604,161 @@ void test('a successful probe after a sync failure is a current login check, nev
     null,
   );
   assert.equal(luoguLoginCheckSummary(null), null);
+});
+
+void test('the collapsed card states the same facts as the expanded sections', () => {
+  const unread = luoguCompactSummary(null);
+  for (const claim of [unread.connection, unread.history, unread.backlog, unread.automation]) {
+    assert.match(claim, /尚未读取/);
+  }
+  assert.equal(unread.checkedAt, null);
+  assert.equal(unread.alert, null);
+
+  const view = status();
+  const compact = luoguCompactSummary(view);
+  assert.equal(compact.connection, '已连接');
+  assert.equal(compact.checkedAt, luoguTime(AT));
+  assert.equal(compact.history, luoguHistoryCoverageLabel(view), 'the compact claim is the expanded label');
+  assert.equal(compact.backlog, '资料无积压');
+  assert.equal(compact.automation, '自动同步：未开启');
+  assert.equal(compact.alert, null, 'a successful latest attempt needs no alert');
+  assert.equal(luoguCompactSummary(status({ connection: null })).checkedAt, null);
+
+  // A never-synced account claims exactly the same "not yet" its label does; no completed state is
+  // invented by the compact view.
+  const untouched = status({
+    phase: 'backfill',
+    historyComplete: false,
+    historyCompletedAt: null,
+    resumePending: false,
+    scanStartedAt: null,
+    lastScanStartedAt: null,
+    lastSuccessAt: null,
+    totalPages: 0,
+    submissionsSeen: 0,
+  });
+  assert.equal(luoguCompactSummary(untouched).history, LUOGU_HISTORY_STATE_LABELS.never);
+  assert.doesNotMatch(luoguCompactSummary(untouched).history, /已完成/);
+
+  // Backlog and backpressure stay stated, never silently zeroed.
+  assert.equal(luoguCompactSummary(status({ metadataBacklog: 12 })).backlog, '资料积压 12 题');
+  assert.match(
+    luoguCompactSummary(status({ metadataBacklog: 2000, metadataBacklogFull: true })).backlog,
+    /已达上限/,
+  );
+
+  // Automation keeps the next planned instant when there is one, and says "closing" while closing.
+  const automated = status({ settings: { ...status().settings, automaticEnabled: true }, nextRunAt: AT });
+  assert.match(luoguCompactSummary(automated).automation, /已开启/);
+  assert.ok(luoguCompactSummary(automated).automation.includes(luoguTime(AT)));
+  assert.equal(luoguCompactSummary(status({ closing: true })).automation, '自动同步：关闭中');
+  assert.equal(
+    luoguCompactSummary(
+      status({ settings: { ...status().settings, automaticEnabled: true }, failure: { code: 'auth_required', at: AT, retryAt: null, paused: true } }),
+    ).automation,
+    '自动同步：已暂停',
+  );
+});
+
+void test('a failed latest attempt gets one short sentence, never a second copy of the long advice', () => {
+  const metadataFailure: LuoguSyncFailure = {
+    code: 'auth_required',
+    at: AT,
+    retryAt: null,
+    paused: true,
+    stage: 'metadata',
+  };
+  const paused = luoguCompactSummary(status({ settings: { ...status().settings, automaticEnabled: true }, failure: metadataFailure }));
+  assert.ok(paused.alert !== null);
+  assert.match(paused.alert, /在补齐题目资料时失败/);
+  assert.match(paused.alert, /已暂停/);
+  assert.match(paused.alert, /同步详情/);
+  const advice = luoguSyncFailureGuidance(metadataFailure);
+  assert.ok(!paused.alert.includes(advice), 'the long stage-aware advice is rendered once, in 同步详情');
+  assert.ok(advice.length > paused.alert.length);
+
+  const retrying = luoguCompactSummary(
+    status({ settings: { ...status().settings, automaticEnabled: true }, failure: { ...metadataFailure, paused: false, retryAt: AT } }),
+  );
+  assert.match(retrying.alert ?? '', /重试/);
+  assert.match(retrying.alert ?? '', /同步详情/);
+
+  // A legacy record without a stage keeps the neutral wording and never invents a half.
+  const legacy = luoguCompactSummary(
+    status({ failure: { code: 'timeout', at: AT, retryAt: null, paused: false } }),
+  );
+  assert.match(legacy.alert ?? '', /^最近一次同步失败/);
+  assert.doesNotMatch(legacy.alert ?? '', /在读取提交记录时|在补齐题目资料时/);
+});
+
+void test('there is one credential trigger: connect first, update the saved session later', () => {
+  assert.equal(luoguCredentialActionLabel(null), '连接洛谷');
+  assert.equal(luoguCredentialActionLabel(status({ connection: null })), '连接洛谷');
+  assert.equal(luoguCredentialActionLabel(status()), '更新登录凭据');
+  assert.equal(
+    luoguCredentialActionLabel(status({ connection: { ...status().connection!, status: 'session_expired' } })),
+    '更新登录凭据',
+  );
+  // The revealed form stays short: one exact instruction line and one local-only note are its copy.
+  assert.match(LUOGU_CLIENT_ID_INSTRUCTION, /F12/);
+  assert.match(LUOGU_CLIENT_ID_INSTRUCTION, /Application/);
+  assert.match(LUOGU_CLIENT_ID_INSTRUCTION, /Value/);
+  assert.match(LUOGU_SECRET_LOCAL_ONLY_NOTE, /Windows 凭据管理器/);
+  assert.match(LUOGU_SECRET_LOCAL_ONLY_NOTE, /AI 请求/);
+});
+
+void test('unchanged automatic-sync settings stay editable while saving still needs a change', () => {
+  const view = status();
+  const draft = luoguSettingsDraft(view.settings);
+  // The regression this fixes: `configure` is enabled only *by* a dirty draft, so gating the fields
+  // on it (the old `!controls.configure.enabled && !settingsDirty`) disabled every toggle before the
+  // user could make the first change.
+  assert.equal(controls(view).configure.enabled, false, 'an unchanged draft cannot be saved');
+  assert.equal(luoguSettingsDirty(view, draft), false);
+  assert.equal(
+    !controls(view).configure.enabled && !luoguSettingsDirty(view, draft),
+    true,
+    'the old gate locked an untouched form',
+  );
+  assert.equal(luoguSettingsEditable(view, false), true, 'an untouched form is editable');
+
+  // Only a real host lock disables the fields, and editing is what enables saving.
+  assert.equal(luoguSettingsEditable(view, true), false);
+  assert.equal(luoguSettingsEditable(status({ closing: true }), false), false);
+  assert.equal(luoguSettingsEditable(null, false), false);
+  assert.equal(controls(view, { settingsDirty: true }).configure.enabled, true);
+});
+
+void test('the primary action repeats a reason only when the user can act on it', () => {
+  const unconnected = status({ connection: null });
+  const unconnectedControls = controls(unconnected);
+  assert.equal(
+    luoguPrimaryActionReason(unconnected, unconnectedControls.start, false),
+    unconnectedControls.start.reason,
+  );
+  assert.match(luoguPrimaryActionReason(unconnected, unconnectedControls.start, false) ?? '', /尚未连接/);
+
+  const closing = status({ closing: true });
+  assert.match(luoguPrimaryActionReason(closing, controls(closing).start, false) ?? '', /关闭/);
+
+  // While this instance runs,「暂停本轮」next to it is the action: no repeated "running" reason.
+  const running = status({ running: true, leaseActive: true, pagesInPass: 2 });
+  assert.equal(controls(running).start.enabled, false);
+  assert.equal(luoguPrimaryActionReason(running, controls(running).start, false), null);
+  // While an action is in flight every control is denied anyway, so nothing is printed either.
+  assert.equal(luoguPrimaryActionReason(status(), controls(null).start, true), null);
+  assert.equal(luoguPrimaryActionReason(status(), controls(status()).start, false), null);
+  assert.equal(luoguPrimaryActionReason(null, controls(null).connect, false), null);
+});
+
+void test('disabled automation keeps a failed sync visible without promising a scheduled retry', () => {
+  for (const paused of [false, true]) {
+    const summary = luoguCompactSummary(status({
+      settings: { ...status().settings, automaticEnabled: false },
+      failure: { code: 'timeout', at: AT, retryAt: paused ? null : AT, paused },
+    }));
+    assert.equal(summary.automation, '自动同步：未开启');
+    assert.match(summary.alert ?? '', /失败.*手动继续/);
+    assert.doesNotMatch(summary.alert ?? '', /自动同步已暂停|计划.*重试/);
+  }
 });

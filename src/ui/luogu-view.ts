@@ -626,6 +626,149 @@ function denyAll(reason: string): Readonly<Record<LuoguAction, LuoguControl>> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Compact default view (Sprint 20b)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Label of the single credential trigger.
+ *
+ * Before any connection record exists the control's whole job is to connect, so it says so; once a
+ * record exists (connected or failed) the same control re-opens the saved session, and calling that
+ * "连接" would suggest the account is not connected when it is. There is exactly one such control, so
+ * the two labels are the only two states of one disclosure.
+ */
+export function luoguCredentialActionLabel(status: ApiLuoguStatusView | null): string {
+  return status !== null && status.connection !== null ? '更新登录凭据' : '连接洛谷';
+}
+
+/**
+ * One compact answer of the collapsed Luogu card.
+ *
+ * The card is the default view of the panel, so every field is a *short* claim that stays true while
+ * the card is closed: the connection state, the last login check, the history-coverage label, the
+ * metadata backlog, the automation state and — separately — one sentence about a failed or paused
+ * latest attempt. The long stage-aware advice is deliberately absent: {@link LuoguCompactSummary.alert}
+ * says what happened and points at「同步详情」, where each long sentence is rendered exactly once.
+ */
+export interface LuoguCompactSummary {
+  /** Connection-state label of the stored connection, or the fixed "not connected" sentence. */
+  readonly connection: string;
+  /** Local rendering of the last completed login check; `null` when there is no stored connection. */
+  readonly checkedAt: string | null;
+  /** History-coverage label: the only claim of a covered window, otherwise an honest "not yet". */
+  readonly history: string;
+  /** Short metadata-backlog claim, including the full-backlog backpressure state. */
+  readonly backlog: string;
+  /** Short automation claim, including the next planned run when one is known. */
+  readonly automation: string;
+  /** One short failure sentence, or `null` when the latest attempt is not a failure. */
+  readonly alert: string | null;
+}
+
+/**
+ * Project one read status into the collapsed card's claims.
+ *
+ * A `null` status answers 尚未读取 everywhere instead of zero-filled claims, exactly like the long
+ * projections it summarises. Nothing here invents a state: the strings come from the same helpers the
+ * expanded sections use ({@link luoguConnectionText}, {@link luoguHistoryCoverageLabel},
+ * {@link luoguTime}), so the compact and the detailed view can never disagree.
+ */
+export function luoguCompactSummary(status: ApiLuoguStatusView | null): LuoguCompactSummary {
+  if (status === null) {
+    return {
+      connection: luoguConnectionText(null),
+      checkedAt: null,
+      history: '尚未读取',
+      backlog: '尚未读取',
+      automation: '尚未读取',
+      alert: null,
+    };
+  }
+  const failure = status.failure;
+  return {
+    connection: luoguConnectionText(status),
+    checkedAt: status.connection === null ? null : luoguTime(status.connection.checkedAt),
+    history: luoguHistoryCoverageLabel(status),
+    backlog: compactBacklog(status),
+    automation: compactAutomation(status),
+    alert: failure === null ? null : compactAlert(failure, status.settings.automaticEnabled),
+  };
+}
+
+/** Short backlog claim; the full-backlog case names the backpressure instead of a bare number. */
+function compactBacklog(status: ApiLuoguStatusView): string {
+  if (status.metadataBacklog === 0) {
+    return '资料无积压';
+  }
+  return status.metadataBacklogFull
+    ? `资料积压 ${status.metadataBacklog} 题（已达上限）`
+    : `资料积压 ${status.metadataBacklog} 题`;
+}
+
+/** Short automation claim; "已开启" without a known instant says so instead of inventing one. */
+function compactAutomation(status: ApiLuoguStatusView): string {
+  if (status.closing) {
+    return '自动同步：关闭中';
+  }
+  if (!status.settings.automaticEnabled) {
+    return '自动同步：未开启';
+  }
+  if (status.failure !== null && status.failure.paused) {
+    return '自动同步：已暂停';
+  }
+  if (status.failure !== null && status.failure.retryAt !== null) {
+    return `自动同步：已开启，约 ${luoguTime(status.failure.retryAt)} 重试`;
+  }
+  if (status.nextRunAt !== null) {
+    return `自动同步：已开启，下次 ${luoguTime(status.nextRunAt)}`;
+  }
+  return '自动同步：已开启';
+}
+
+/**
+ * One short failure sentence of the collapsed card.
+ *
+ * It names the half of the pass that failed when the durable record carries a stage (the same
+ * {@link LUOGU_FAILURE_STAGE_LABELS} the expanded summary uses), says whether automation is paused or
+ * when the next retry is planned, and points at「同步详情」for the full next-action sentence. The
+ * existence of the failure is therefore never hidden, and the long guidance is not repeated here.
+ */
+function compactAlert(failure: LuoguSyncFailure, automaticEnabled: boolean): string {
+  const where =
+    failure.stage === undefined
+      ? '最近一次同步失败'
+      : `最近一次同步在${LUOGU_FAILURE_STAGE_LABELS[failure.stage]}时失败`;
+  const next = !automaticEnabled
+    ? '；展开「同步详情」查看处理办法后手动继续。'
+    : failure.paused
+    ? '，自动同步已暂停；展开「同步详情」查看处理办法。'
+    : failure.retryAt !== null
+      ? `，计划 ${luoguTime(failure.retryAt)} 重试；详情见「同步详情」。`
+      : '；展开「同步详情」查看处理办法。';
+  return where + next;
+}
+
+/**
+ * Reason to render under the primary sync action, or `null` when rendering one would be noise.
+ *
+ * The primary control keeps its actionable reason — no connection, plugin closing, status unread —
+ * because the user can do something about it. Nothing is printed while an action is in flight (every
+ * control is denied by {@link luoguControls} anyway) and nothing is printed while this instance is
+ * running, because then「暂停本轮」next to it *is* the action, so repeating "本轮正在运行" only adds
+ * noise. The reason is never invented here: it is the one {@link luoguControls} already gives.
+ */
+export function luoguPrimaryActionReason(
+  status: ApiLuoguStatusView | null,
+  control: LuoguControl,
+  busy: boolean,
+): string | null {
+  if (busy || control.enabled || control.reason === null || status === null || status.running) {
+    return null;
+  }
+  return control.reason;
+}
+
+// ---------------------------------------------------------------------------------------
 // Automatic-sync settings
 // ---------------------------------------------------------------------------------------
 
@@ -656,6 +799,20 @@ export function luoguSettingsDirty(status: ApiLuoguStatusView | null, draft: Luo
     draft.runOnStartup !== status.settings.runOnStartup ||
     (interval !== null && interval !== status.settings.intervalMinutes)
   );
+}
+
+/**
+ * Whether the automatic-sync inputs may be edited at all (Sprint 20b).
+ *
+ * Editing is gated on the host being able to accept a change — nothing in flight and the plugin not
+ * closing — and never on whether the draft is already dirty. The earlier gate
+ * (`!controls.configure.enabled && !settingsDirty`) disabled every field exactly while the user still
+ * had to make the first change, because `configure` is only enabled *by* a dirty draft: untouched
+ * toggles could never be turned on. The save button is the control that requires a change, so saving
+ * still happens only from a dirty draft, and merely opening the section edits and saves nothing.
+ */
+export function luoguSettingsEditable(status: ApiLuoguStatusView | null, busy: boolean): boolean {
+  return status !== null && !busy && !status.closing;
 }
 
 /** Outcome of turning a draft into a `luogu.configure` request. */
@@ -836,6 +993,20 @@ export const LUOGU_UID_DISPLAY_NOTE =
 /** Exactly which column of the developer tools the default field wants. */
 export const LUOGU_CLIENT_ID_HELP =
   '默认只需要 __client_id 的 Value（值）：在 F12 → Application（应用）→ Cookies → https://www.luogu.com.cn 里找到 __client_id 一行，只复制 Value 一列，不要复制 Name、Domain、Path 等列。';
+
+/**
+ * The one-line instruction under the default field (Sprint 20b).
+ *
+ * The revealed credential form stays short: it names the exact screen and the exact column, and the
+ * longer {@link LUOGU_CLIENT_ID_HELP}, {@link LUOGU_FULL_COOKIE_HELP} and {@link LUOGU_COOKIE_GUIDE}
+ * explanations live once inside the single「如何获取 Cookie」expansion.
+ */
+export const LUOGU_CLIENT_ID_INSTRUCTION =
+  'F12 → Application（应用）→ Cookies → https://www.luogu.com.cn：复制 __client_id 一行的 Value（值）。';
+
+/** One brief local-only note under the credential fields; the full storage promise is in the help. */
+export const LUOGU_SECRET_LOCAL_ONLY_NOTE =
+  '只在本机使用：凭据保存在 Windows 凭据管理器，不会写入日志、备份或 AI 请求。';
 
 /** What the advanced mode accepts, and what it still discards. */
 export const LUOGU_FULL_COOKIE_HELP =

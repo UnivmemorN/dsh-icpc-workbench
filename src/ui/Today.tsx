@@ -7,7 +7,7 @@ export function Today(){
  const today=localDay(new Date());
  const tasks=(plans.data?.plans??[]).filter(p=>p.status==='adopted'&&p.adoptedAt!==null).flatMap(p=>p.tasks.filter(t=>t.day===today-localDay(p.adoptedAt!)+1).map(t=>({plan:p,task:t})));
  return <><div className="icpc-page-heading"><div><p className="icpc-eyebrow">TODAY</p><h1>把训练落到每一道题</h1><p>从真实记录出发，记下你实际使用的解法。</p></div><span className="icpc-date">{new Date().toLocaleDateString('zh-CN',{month:'long',day:'numeric',weekday:'long'})}</span></div>
- {!accountId?<Empty>先在上方添加或选择账号，即可查看训练统计和今日计划。题库和手工材料导入可以独立使用。</Empty>:<>
+ {!accountId?<Empty>先在顶部选择账号，或到「账号与同步」添加账号，即可查看训练统计和今日计划；公开目录同步与手工材料导入也在该页。</Empty>:<>
  <ErrorNotice error={weakness.error??plans.error??action.error}/>
  {weakness.pending&&<Notice>正在读取训练记录…</Notice>}
  {weakness.data&&<Stats items={[{label:'不同题目',value:weakness.data.report.attemptedDistinctTotal},{label:'已通过题目',value:weakness.data.report.solvedDistinctTotal},{label:'已复核标签覆盖',value:weakness.data.report.taggedAttemptedDistinct+' / '+weakness.data.report.attemptedDistinctTotal},{label:'今日待完成',value:plans.data?tasks.filter(t=>t.task.status==='planned').length:'读取中'}]}/>}

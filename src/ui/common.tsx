@@ -2,8 +2,14 @@ import {createContext,useContext,useEffect,useRef,useState,type ReactNode} from 
 import type {ApiRequest,ApiResponse,WorkbenchApiOperation} from '../application/workbench-api.js';
 import type {BootstrapResult} from '../application/bootstrap-types.js';
 import {api,ApiClientError} from './api.js';
-export type PageName='today'|'bank'|'review'|'weakness'|'plans'|'settings';
-export interface WorkbenchContextValue{boot:BootstrapResult;accountId:string|null;refresh:()=>void;navigate:(page:PageName,problemKey?:string)=>void;problemKey:string|null;selectedKeys:string[];setSelectedKeys:(keys:string[])=>void;}
+export type PageName='today'|'bank'|'accounts'|'review'|'weakness'|'plans'|'settings';
+/**
+ * Shared workbench state.
+ *
+ * `selectAccount` is the one account switch: it also clears the open problem detail and the
+ * candidate selection, whether it is called from the header selector or from the accounts page.
+ */
+export interface WorkbenchContextValue{boot:BootstrapResult;accountId:string|null;selectAccount:(accountId:string|null)=>void;refresh:()=>void;navigate:(page:PageName,problemKey?:string)=>void;problemKey:string|null;selectedKeys:string[];setSelectedKeys:(keys:string[])=>void;}
 export const WorkbenchContext=createContext<WorkbenchContextValue|null>(null);
 export function useWorkbench():WorkbenchContextValue{const value=useContext(WorkbenchContext);if(!value)throw Error('Workbench context missing');return value;}
 const messages:Record<string,string>={settings_changed:'设置已变化，请刷新后重新确认。',conflict:'数据已变化或任务状态冲突，请刷新后重试。',model_busy:'模型任务仍在运行，请等待或取消后再修改。',model_invalid:'模型配置暂不可用，请在设置页查看原因。',invalid_input:'输入不符合要求，请检查填写内容。',cancelled:'请求已取消。',internal:'操作失败，请查看本地 dsh 日志。',unauthorized:'登录已失效，请从 dsh 启动地址重新打开。'};

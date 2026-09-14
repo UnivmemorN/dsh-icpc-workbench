@@ -134,7 +134,7 @@ export function abilityCoverageLines(ability: AbilityViewData): readonly string[
     `已排除未来时间戳的提交 ${coverage.futureSubmissionsExcluded} 条、其他账号的提交 ${coverage.foreignSubmissionsExcluded} 条、未来复盘 ${coverage.futureRetrospectivesExcluded} 条。`,
   ];
   if (coverage.metadataMissing > 0 || coverage.solvedWithoutNativeValue > 0) {
-    lines.push('缺少的元数据或难度数值可以到题库 > 导入与同步补齐后再评估。');
+    lines.push('缺少的元数据或难度数值可以到「账号与同步」补齐后再评估。');
   }
   return lines;
 }

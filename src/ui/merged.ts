@@ -71,7 +71,7 @@ export const MERGED_DIFFICULTY_HINT =
   '不同平台的难度不可直接比较：难度排序需要先在“来源”里选择一个具体平台，并且只比较该平台的原始难度维度；没有该维度、空值或非数值的题目在升序和降序中都排在最后。';
 
 /** Shown beside a source that has no stored account. */
-export const NO_ACCOUNT_FOR_SOURCE = '尚未添加账号，可从页面上方添加';
+export const NO_ACCOUNT_FOR_SOURCE = '尚未添加账号，可到「账号与同步」添加';
 
 /** The one account-per-source option that means "this platform contributes nothing". */
 export const NOT_PARTICIPATING = '不参与统计';

@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Panel, Empty, Notice, ErrorNotice, useWorkbench, useRequest, tagName } from './common.js';
-import { ImportPanel } from './Imports.js';
 import { MergedBank } from './MergedBank.js';
 import { jumpHint, pageNumbers, pagerDisplay, parseJumpPage } from './pager.js';
 import { ProblemView } from './Problem.js';
@@ -487,7 +486,15 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
           </small>
         </div>
       )}
-      <ImportPanel sourceId={sourceId} onChange={read.refresh} />
+      {/* Import and synchronization moved to the accounts page (Sprint 20a); the bank only links there. */}
+      <div className="icpc-sync-link">
+        <button type="button" onClick={() => navigate('accounts')}>
+          导入与同步 →
+        </button>
+        <span className="icpc-muted">
+          前往「账号与同步」管理数据来源。
+        </span>
+      </div>
       <Panel
         title={reviewOnly ? '当前快照待审核题目' : '本地题库'}
         tools={
@@ -504,7 +511,7 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
           </p>
         )}
         {read.error === null && data !== null && data.items.length === 0 && (
-          <Empty>当前筛选下没有题目。可以同步公开目录，或使用手工导入。</Empty>
+          <Empty>当前筛选下没有题目。可以到「账号与同步」同步公开目录或手工导入。</Empty>
         )}
         <div
           className="icpc-table-wrap icpc-bank-table"

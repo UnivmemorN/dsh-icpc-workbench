@@ -40,7 +40,7 @@ export function Weakness() {
   const diagnosis: string[] = [];
   if (data) {
     if (data.coverage.submissionRows === 0) {
-      diagnosis.push('该账号还没有提交记录：任何统计都无法开始，请先到题库 > 导入与同步导入提交。');
+      diagnosis.push('该账号还没有提交记录：任何统计都无法开始，请先到「账号与同步」导入提交。');
     } else {
       if (data.coverage.metadataMissing > 0) {
         diagnosis.push(
@@ -158,13 +158,13 @@ export function Weakness() {
                   </ul>
                 )}
                 <p>
-                  缺少的本地题目元数据可以在 <strong>题库 &gt; 导入与同步 &gt; 题目目录</strong> 补齐；部分题目仍然需要手工材料。
+                  缺少的本地题目元数据可以在 <strong>账号与同步 &gt; 导入与同步 &gt; 题目目录</strong> 补齐；部分题目仍然需要手工材料。
                 </p>
                 <p>
                   先在题库选择候选题，再到 <strong>标签审核</strong> 准备和复核标签。本页只做跳转，不会自动准备标签，也不会自动运行模型。
                 </p>
                 <div className="icpc-actions">
-                  <button onClick={() => navigate('bank')}>去题库导入与同步</button>
+                  <button onClick={() => navigate('accounts')}>去账号与同步</button>
                   <button onClick={() => navigate('review')}>去标签审核</button>
                 </div>
               </details>
@@ -179,7 +179,7 @@ export function Weakness() {
                   </Notice>
                   {platformTags.length === 0 ? (
                     <Empty>
-                      该账号的尝试题还没有平台原始标签。可以到题库导入与同步补齐题目目录；平台本身缺标签的题目只能等平台或手工材料补充。
+                      该账号的尝试题还没有平台原始标签。可以到账号与同步补齐题目目录；平台本身缺标签的题目只能等平台或手工材料补充。
                     </Empty>
                   ) : (
                     <div className="icpc-table-wrap">

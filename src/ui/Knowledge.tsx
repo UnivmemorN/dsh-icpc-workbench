@@ -550,7 +550,7 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
           </div>
         )}
         <p className="icpc-muted">
-          缺少的本地题目元数据仍计入分母，但带不上标签或难度，可以在 题库 &gt; 导入与同步 &gt; 题目目录 补齐。
+          缺少的本地题目元数据仍计入分母，但带不上标签或难度，可以在 账号与同步 &gt; 导入与同步 &gt; 题目目录 补齐。
         </p>
       </details>
 
