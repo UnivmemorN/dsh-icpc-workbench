@@ -18,9 +18,12 @@
  *   the single, documented exception;
  * - an injected {@link LuoguSessionProvider} seam. The provider returns a session for exactly the
  *   selected account; the reader validates the account's canonical UID against `session.uid` and
- *   against the **required** `_uid` cookie. `__client_id` is an opaque session identifier, not a
- *   UID: it only has to be present and syntactically safe, and it is never compared with the UID.
- *   Real OS credential storage is Sprint 17b; this module never touches a credential store.
+ *   against the **required** `_uid` cookie, and normalizes whatever the provider holds (a minimal
+ *   pair, a stored legacy whole-Cookie value, an optional `Cookie:` prefix) to the canonical
+ *   `__client_id=…; _uid=…` pair through the pure domain rule, so unrelated cookies never travel.
+ *   `__client_id` is an opaque session identifier, not a UID: it only has to be present and
+ *   syntactically safe, and it is never compared with the UID. Real OS credential storage is Sprint
+ *   17b; this module never touches a credential store.
  *
  * ## Secret handling
  *
@@ -75,8 +78,10 @@ import {
   DomainError,
   assertIsoTimestamp,
   createSubmission,
+  normalizeLuoguSessionCookie,
   type Account,
   type CancellationToken,
+  type LuoguCookieProblem,
   type SourceInstance,
   type Submission,
 } from '../../domain/index.js';
@@ -115,20 +120,9 @@ const LENTILLE_VALUE = 'content-only';
 /** Paths that mean "the session is gone" rather than "the shape changed". */
 const LOGIN_PATHS: ReadonlySet<string> = new Set(['/auth/login', '/login']);
 const MAX_LIMITS_VALUE = 600_000;
-const MAX_COOKIE_CHARS = 4_096;
 const MAX_CONCURRENCY = 64;
-/** Cookie-name token characters (RFC 6265 `token`); a name is never secret material. */
-const COOKIE_NAME_PATTERN = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
-/**
- * A syntactically safe opaque `__client_id`: printable, bounded, and free of `;`, `=`, whitespace
- * and control characters, so it can be a cookie value without changing the header's structure.
- * Its *content* is deliberately unconstrained — Luogu's `__client_id` is a session identifier.
- */
-const OPAQUE_CLIENT_ID_PATTERN = /^[A-Za-z0-9._~+/:-]{1,256}$/u;
 /** Canonical server page number of the internally built `/record/list?user=…&page=N` request. */
 const CANONICAL_PAGE_PATTERN = /^[1-9][0-9]{0,6}$/u;
-/** Control characters (including CR/LF) may never enter a header value. */
-const UNSAFE_HEADER_VALUE = /[\u0000-\u001f\u007f]/u;
 
 /**
  * Fixed, secret-free text for every authenticated failure code.
@@ -158,7 +152,11 @@ const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set<string>(PLATFORM_ERROR_
 export interface LuoguSession {
   /** Canonical Luogu UID this session authenticates. */
   readonly uid: string;
-  /** Raw `Cookie` header value; never logged, echoed, persisted in a cursor or put in an error. */
+  /**
+   * Session cookie text of this one call: a minimal pair, a stored legacy whole-Cookie value or an
+   * optional `Cookie:` header line. The reader normalizes it to the canonical two-cookie pair before
+   * it can travel; it is never logged, echoed, persisted in a cursor or put in an error.
+   */
   readonly cookie: string;
 }
 
@@ -362,38 +360,28 @@ function normalizeSince(value: string | null | undefined, operation: PlatformOpe
 }
 
 /**
- * Parse a raw `Cookie` header value into a name→value map.
+ * Fixed, secret-free text for every way a supplied session can be unusable.
  *
- * Strict by design: every non-empty segment must be `name=value` with a valid cookie-name token,
- * and a repeated name is refused as ambiguous — a header that names `_uid` or `__client_id` twice
- * must not let either value silently win. Every failure names no cookie *value*.
+ * The pure domain normalizer answers a stable `problem` discriminant; the reader maps it onto its own
+ * fixed sentence, so no branch can quote a cookie value, a provider detail or a parser message.
  */
-function parseCookieHeader(cookie: string): Map<string, string> {
-  const operation: PlatformOperation = 'submissions';
-  const parsed = new Map<string, string>();
-  for (const part of cookie.split(';')) {
-    const segment = part.trim();
-    if (segment.length === 0) {
-      continue;
-    }
-    const separator = segment.indexOf('=');
-    if (separator <= 0) {
-      throw invalidInput(operation, 'the Luogu session cookie header is malformed');
-    }
-    const name = segment.slice(0, separator).trim();
-    if (!COOKIE_NAME_PATTERN.test(name)) {
-      throw invalidInput(operation, 'the Luogu session cookie header has an invalid cookie name');
-    }
-    if (parsed.has(name)) {
-      throw invalidInput(operation, `the Luogu session cookie header repeats ${name}`);
-    }
-    parsed.set(name, segment.slice(separator + 1).trim());
-  }
-  return parsed;
-}
+const AUTHENTICATED_COOKIE_FAILURES: Readonly<Record<LuoguCookieProblem, string>> = {
+  not_text: 'the Luogu session carries no usable cookie header value',
+  empty: 'the Luogu session carries no usable cookie header value',
+  too_long: 'the Luogu session cookie header is too long',
+  unsafe_characters: 'the Luogu session cookie header contains control characters',
+  missing_client_id: 'the Luogu session cookie carries no __client_id',
+  missing_uid: 'the Luogu session cookie carries no _uid',
+  duplicate_client_id: 'the Luogu session cookie header repeats __client_id',
+  duplicate_uid: 'the Luogu session cookie header repeats _uid',
+  unusable_client_id: 'the Luogu session cookie __client_id is not a syntactically safe opaque value',
+  unusable_uid: 'the Luogu session cookie _uid is not a canonical Luogu UID',
+  uid_not_canonical: 'the requested account UID is not canonical',
+  foreign_uid: 'the Luogu session cookie uid does not match the selected account',
+};
 
 /**
- * Validate an injected session against the selected account and return its cookie header value.
+ * Validate an injected session against the selected account and return its canonical cookie value.
  *
  * `__client_id` is Luogu's **opaque session identifier**, not a UID. It is required to be present,
  * non-empty and syntactically safe, and it is deliberately never compared with the account UID:
@@ -401,11 +389,13 @@ function parseCookieHeader(cookie: string): Map<string, string> {
  * The account binding comes from the required `_uid` cookie, which must be the canonical UID of
  * both the selected account and `session.uid`.
  *
- * Refused: no session at all, an account UID that is not canonical, a session UID that is not that
- * UID, a missing or oversized cookie, a cookie containing control characters or surrounding
- * whitespace (header injection), a malformed or ambiguous cookie header (a segment without `=`,
- * an invalid name, a repeated name), a missing/empty/unusable `__client_id`, and a missing, empty
- * or foreign `_uid`. Every failure is an `invalid_input` whose detail names no cookie value.
+ * The returned value is always the canonical two-cookie pair: an optional `Cookie:` prefix, outer
+ * spaces, unrelated cookies and a stored legacy whole-Cookie value are accepted and reduced here, so
+ * exactly `__client_id` and `_uid` can ever travel. Refused: no session at all, an account UID that
+ * is not canonical, a session UID that is not that UID, input beyond the bounded raw size, text
+ * containing control characters (header injection), a missing/empty/repeated/unusable
+ * `__client_id`, and a missing, empty, unusable or foreign `_uid`. Every failure is an
+ * `invalid_input` whose detail names no cookie value.
  */
 export function requireLuoguSessionCookie(
   session: LuoguSession | null | undefined,
@@ -422,31 +412,14 @@ export function requireLuoguSessionCookie(
   if (sessionUid !== expectedUid) {
     throw invalidInput(operation, 'the Luogu session belongs to another account');
   }
-  const cookie = typeof session.cookie === 'string' ? session.cookie : '';
-  if (
-    cookie.length === 0 ||
-    cookie.length > MAX_COOKIE_CHARS ||
-    cookie !== cookie.trim() ||
-    UNSAFE_HEADER_VALUE.test(cookie)
-  ) {
-    throw invalidInput(operation, 'the Luogu session carries no usable cookie header value');
+  const normalized = normalizeLuoguSessionCookie(
+    typeof session.cookie === 'string' ? session.cookie : null,
+    expectedUid,
+  );
+  if (!normalized.ok) {
+    throw invalidInput(operation, AUTHENTICATED_COOKIE_FAILURES[normalized.problem]);
   }
-  const values = parseCookieHeader(cookie);
-  const clientId = values.get('__client_id');
-  if (clientId === undefined || clientId.length === 0) {
-    throw invalidInput(operation, 'the Luogu session cookie carries no __client_id');
-  }
-  if (!OPAQUE_CLIENT_ID_PATTERN.test(clientId)) {
-    throw invalidInput(operation, 'the Luogu session cookie __client_id is not a syntactically safe opaque value');
-  }
-  const uidCookie = values.get('_uid');
-  if (uidCookie === undefined || uidCookie.length === 0) {
-    throw invalidInput(operation, 'the Luogu session cookie carries no _uid');
-  }
-  if (uidCookie !== expectedUid) {
-    throw invalidInput(operation, 'the Luogu session cookie uid does not match the selected account');
-  }
-  return cookie;
+  return normalized.cookie;
 }
 
 const defaultFetchImpl: FetchLike = async (url, init) => {

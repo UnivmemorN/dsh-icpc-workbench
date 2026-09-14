@@ -316,6 +316,11 @@ export function cookieFor(uid: string, marker = 'opaque-client-id'): string {
   return `_uid=${uid}; __client_id=${marker}`;
 }
 
+/** The canonical form {@link cookieFor} normalizes to: `__client_id` first, then `_uid`. */
+export function canonicalCookieFor(uid: string, marker = 'opaque-client-id'): string {
+  return `__client_id=${marker}; _uid=${uid}`;
+}
+
 /** Canonical stored problem key of one external id of `instance`. */
 export function problemKeyOf(instance: SourceInstance, externalKey: string): string {
   return problemKey({ sourceInstanceId: instance.id, domain: null, externalKey });

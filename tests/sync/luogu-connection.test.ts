@@ -25,12 +25,14 @@ import { createCancellationSource, DomainError, type Account, type CancellationT
 import * as fx from '../storage/fixtures.js';
 import {
   buildRecords,
+  canonicalCookieFor,
   cookieFor,
   createClock,
   createMemoryVault,
   createRecordFeed,
   createWait,
   htmlResponse,
+  jsonResponse,
   neverFireTimer,
   officialInstance,
   toPages,
@@ -128,11 +130,10 @@ void test('connect tests the session through a real reader page, stores a fresh 
     assert.equal(first.state.failureCode, null);
     assert.equal(first.state.staleReference, null);
     assert.ok(first.state.reference.startsWith('luogu.session.'));
-    assert.equal(world.vault.secrets.get(first.state.reference), cookieFor('100001', 'first-client'));
-    // The validation page really travelled with the supplied cookie.
+    assert.equal(world.vault.secrets.get(first.state.reference), canonicalCookieFor('100001', 'first-client'));
+    // The validation page really travelled with the supplied cookie, normalized to the two cookies.
     assert.ok(world.feed.calls.length >= 1);
-    assert.match(world.feed.calls[0]?.cookie ?? '', /_uid=100001/);
-    assert.match(world.feed.calls[0]?.cookie ?? '', /__client_id=first-client/);
+    assert.equal(world.feed.calls[0]?.cookie, canonicalCookieFor('100001', 'first-client'));
 
     const second = await world.connections.connect({
       accountId: world.alice.id,
@@ -174,18 +175,34 @@ void test('a rejected session leaves the previous connection and its credential 
       token: world.token,
     });
     const writesBefore = world.vault.writes.length;
+    const callsBefore = world.feed.calls.length;
     await assert.rejects(
       world.connections.connect({
         accountId: world.alice.id,
-        // A cookie of another account must never replace this account's session.
+        // A cookie of another account must never replace this account's session, and the mismatch is
+        // caught by the `_uid` binding before any request is dispatched.
         sessionCookie: cookieFor('100002'),
+        token: world.token,
+      }),
+      isConnectionError('invalid_input'),
+    );
+    assert.equal(world.feed.calls.length, callsBefore, 'a foreign session is refused before any request');
+
+    // A session the platform itself rejects is refused by the validation page, and the previous
+    // connection and its credential stay untouched as well.
+    world.feed.override = () => jsonResponse({}, 401);
+    await assert.rejects(
+      world.connections.connect({
+        accountId: world.alice.id,
+        sessionCookie: cookieFor('100001', 'rejected-client'),
         token: world.token,
       }),
       (error: unknown) =>
         error instanceof LuoguConnectionError &&
         error.code === 'not_connected' &&
-        error.details['failureCode'] === 'invalid_input',
+        error.details['failureCode'] === 'auth_required',
     );
+    world.feed.override = null;
     assert.equal((await world.store.getLuoguConnection(world.alice.id))?.value.reference, good.state.reference);
     assert.equal(world.vault.writes.length, writesBefore, 'nothing was written to the vault');
     assert.equal(world.vault.secrets.size, 1);
@@ -386,12 +403,26 @@ void test('the stored-session provider re-reads the current connection and vault
     const provider = createStoredLuoguSessionProvider({ store: world.store, vault: world.vault });
     assert.deepEqual(await provider.sessionFor(world.alice, world.token), {
       uid: '100001',
-      cookie: cookieFor('100001'),
+      cookie: canonicalCookieFor('100001'),
     });
 
-    // A rotation outside this provider is observed on the next call.
+    // A rotation outside this provider — a legacy whole-Cookie value included — is observed and
+    // normalized on the next call.
+    world.vault.secrets.set(
+      connected.state.reference,
+      '__cf_bm=abc; _uid=100001; __client_id=rotated; __session=SECRETMARKER',
+    );
+    assert.deepEqual(await provider.sessionFor(world.alice, world.token), {
+      uid: '100001',
+      cookie: canonicalCookieFor('100001', 'rotated'),
+    });
+
+    // A stored value that cannot yield the two required cookies is an authentication wall.
     world.vault.secrets.set(connected.state.reference, 'rotated-cookie');
-    assert.deepEqual(await provider.sessionFor(world.alice, world.token), { uid: '100001', cookie: 'rotated-cookie' });
+    await assert.rejects(
+      provider.sessionFor(world.alice, world.token),
+      (error: unknown) => error instanceof PlatformError && error.code === 'auth_required',
+    );
 
     // A vanished secret is an authentication wall.
     world.vault.secrets.delete(connected.state.reference);
@@ -411,6 +442,64 @@ void test('the stored-session provider re-reads the current connection and vault
       provider.sessionFor(world.alice, world.token),
       (error: unknown) => error instanceof PlatformError && error.code === 'auth_required',
     );
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a stored legacy whole-Cookie credential is normalized to the two cookies before the fetch', async () => {
+  const world = await createWorld();
+  try {
+    const connected = await world.connections.connect({
+      accountId: world.alice.id,
+      sessionCookie: cookieFor('100001', 'first-client'),
+      token: world.token,
+    });
+    // Exactly what an earlier build stored: a whole browser Cookie header with unrelated cookies.
+    const legacy = '__cf_bm=abc; _uid=100001; theme=dark; __client_id=legacy-client; __session=SECRETMARKER';
+    world.vault.secrets.set(connected.state.reference, legacy);
+    const callsBefore = world.feed.calls.length;
+
+    const probed = await world.connections.probe(world.alice.id, world.token);
+    assert.equal(probed.state.status, 'connected');
+    assert.equal(world.feed.calls.length, callsBefore + 1);
+    const call = world.feed.calls[world.feed.calls.length - 1]!;
+    assert.equal(call.cookie, canonicalCookieFor('100001', 'legacy-client'));
+    assert.equal(call.cookie?.includes('SECRETMARKER'), false, 'the unrelated secret never travels');
+    assert.equal(call.cookie?.includes('__cf_bm'), false, 'an unrelated cookie is discarded');
+    // The shape of a legacy entry is not rewritten: it is normalized on every read instead.
+    assert.equal(world.vault.secrets.get(connected.state.reference), legacy);
+    assert.equal(world.vault.writes.length, 1);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a session inside a raw header larger than the credential blob connects, and an abusive paste is refused', async () => {
+  const world = await createWorld();
+  try {
+    const bulky = `_uid=100001; __client_id=bulky-client; __unrelated=${'x'.repeat(3_000)}`;
+    assert.ok(Buffer.byteLength(bulky, 'utf8') > 2_560, 'the raw header exceeds the blob limit on purpose');
+    const connected = await world.connections.connect({
+      accountId: world.alice.id,
+      sessionCookie: bulky,
+      token: world.token,
+    });
+    assert.equal(connected.state.status, 'connected');
+    assert.equal(world.vault.secrets.get(connected.state.reference), canonicalCookieFor('100001', 'bulky-client'));
+    assert.equal(world.feed.calls[0]?.cookie, canonicalCookieFor('100001', 'bulky-client'));
+
+    // The hard raw-input bound still refuses an abusive paste, before any vault write.
+    const writesBefore = world.vault.writes.length;
+    await assert.rejects(
+      world.connections.connect({
+        accountId: world.alice.id,
+        sessionCookie: `_uid=100001; __client_id=x; __unrelated=${'y'.repeat(17 * 1024)}`,
+        token: world.token,
+      }),
+      isConnectionError('invalid_input'),
+    );
+    assert.equal(world.vault.writes.length, writesBefore, 'a refused session never reaches the vault');
   } finally {
     await world.dispose();
   }

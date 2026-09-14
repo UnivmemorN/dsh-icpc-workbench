@@ -51,7 +51,10 @@
  * deleting stored rows, and the whole-scan start instant is preserved across resumed passes so a
  * multi-day interruption cannot skip records. Failures are recorded as one of the fixed
  * {@link LuoguSyncFailureCode} values with a durable retry instant (or a pause that waits for the
- * user) — never as a raw provider message, and never as a silent success.
+ * user) — never as a raw provider message, and never as a silent success. A failure also records
+ * which half of the pass produced it ({@link LuoguSyncFailureStage}): the authenticated history read
+ * and the anonymous metadata repair can both answer `auth_required`, and only the recorded stage
+ * keeps those two answers apart for the caller.
  *
  * ## Backpressure, not dropping
  *
@@ -95,6 +98,7 @@ import {
   type LuoguConnectionState,
   type LuoguSyncFailure,
   type LuoguSyncFailureCode,
+  type LuoguSyncFailureStage,
   type LuoguSyncPhase,
   type LuoguSyncSettings,
   type LuoguSyncState,
@@ -656,6 +660,11 @@ export class LuoguSyncService {
    * A session-level refusal is *data*: the adapter records it and this method reports it through
    * `status().connection`. Only a missing account, a missing connection or an unsupported platform
    * rejects.
+   *
+   * A successful probe never clears a stored synchronization failure. It only proves that the
+   * session works *now*, so a paused account stays paused (and its failure stays visible) until the
+   * user explicitly reconnects or continues; the probe releases the lease with
+   * `clearPausingFailure: false` for exactly that reason.
    */
   async probe(accountId: string, token: CancellationToken): Promise<LuoguSyncStatus> {
     this.assertUsable(token);
@@ -1163,9 +1172,19 @@ export class LuoguSyncService {
     }
   }
 
-  /** One bounded pass: at most 20 history pages, then at most 10 metadata repairs. */
+  /**
+   * One bounded pass: at most 20 history pages, then at most 10 metadata repairs.
+   *
+   * The two halves are described separately. A failure of the authenticated history read (or of the
+   * page commit under it) carries `stage: 'history'`; a failure of the anonymous metadata repair —
+   * including an exception thrown while that work runs — carries `stage: 'metadata'`. A history
+   * failure skips the metadata phase exactly as before, and neither half may clear the other's
+   * evidence: history coverage, the backlog and the committed submissions are independent of
+   * `failure`.
+   */
   private async runPass(account: Account, claim: Claim, token: CancellationToken): Promise<void> {
     let failure: LuoguSyncFailure | null = null;
+    let historyThrew = false;
     try {
       let mode: SyncMode = claim.pageMode;
       let since = claim.since;
@@ -1198,9 +1217,20 @@ export class LuoguSyncService {
           break;
         }
       }
-      failure = await this.repairMetadata(account, token);
     } catch (error) {
-      failure = await this.describeFailure(account.id, error);
+      historyThrew = true;
+      failure = await this.describeFailure(account.id, error, 'history');
+    }
+    // The metadata phase runs exactly when the history phase did not throw — the same rule as
+    // before — so a cancelled or refused history pass still performs no metadata work at all.
+    if (!historyThrew) {
+      try {
+        failure = await this.repairMetadata(account, token);
+      } catch (error) {
+        // The pages this phase follows are already committed; an exception raised here is a metadata
+        // failure and must never be recorded as a history failure, nor clear history coverage.
+        failure = await this.describeFailure(account.id, error, 'metadata');
+      }
     }
     try {
       await this.settleState(account.id, failure);
@@ -1326,7 +1356,13 @@ export class LuoguSyncService {
       backlog.push(key);
       const at = this.nowIso();
       const code: LuoguSyncFailureCode = report.error === null ? 'internal' : failureCodeOf(report.error.code);
-      failure = this.buildFailure(code, at, report.error === null ? null : report.error.retryAfterMs, failure);
+      failure = this.buildFailure(
+        code,
+        at,
+        report.error === null ? null : report.error.retryAfterMs,
+        failure,
+        'metadata',
+      );
       if (failure.paused || code === 'rate_limited') {
         break;
       }
@@ -1397,25 +1433,40 @@ export class LuoguSyncService {
     }
   }
 
-  /** Build one durable failure, honoring Retry-After and growing the exponential backoff. */
+  /**
+   * Build one durable failure, honoring Retry-After and growing the exponential backoff.
+   *
+   * `stage` names the half of the pass that produced it and is always recorded for a new failure;
+   * only records written before the field existed lack it.
+   */
   private buildFailure(
     code: LuoguSyncFailureCode,
     at: string,
     retryAfterMs: number | null,
     previous: LuoguSyncFailure | null,
+    stage: LuoguSyncFailureStage,
   ): LuoguSyncFailure {
     if (luoguSyncFailurePauses(code)) {
-      return { code, at, retryAt: null, paused: true };
+      return { code, at, retryAt: null, paused: true, stage };
     }
     const delay =
       retryAfterMs !== null && Number.isFinite(retryAfterMs) && retryAfterMs > 0
         ? Math.round(retryAfterMs)
         : exponentialBackoff(previous);
-    return { code, at, retryAt: new Date(Date.parse(at) + delay).toISOString(), paused: false };
+    return { code, at, retryAt: new Date(Date.parse(at) + delay).toISOString(), paused: false, stage };
   }
 
-  /** Map any pass failure onto the durable vocabulary; cancellation is not a failure. */
-  private async describeFailure(accountId: string, error: unknown): Promise<LuoguSyncFailure | null> {
+  /**
+   * Map any pass failure onto the durable vocabulary; cancellation is not a failure.
+   *
+   * `stage` is passed through to {@link buildFailure} so the persisted record says which half of the
+   * pass raised it instead of leaving the caller to guess from a code two halves share.
+   */
+  private async describeFailure(
+    accountId: string,
+    error: unknown,
+    stage: LuoguSyncFailureStage,
+  ): Promise<LuoguSyncFailure | null> {
     const at = this.nowIso();
     let code: LuoguSyncFailureCode = 'internal';
     let retryAfterMs: number | null = null;
@@ -1450,7 +1501,7 @@ export class LuoguSyncService {
       code = reason === 'lease_lost' ? 'lease_lost' : error.code === 'invalid_input' ? 'invalid_input' : 'internal';
     }
     const record = await this.store.getLuoguSyncState(accountId);
-    return this.buildFailure(code, at, retryAfterMs, record?.value.failure ?? null);
+    return this.buildFailure(code, at, retryAfterMs, record?.value.failure ?? null, stage);
   }
 
   // -------------------------------------------------------------------------------------

@@ -9,7 +9,8 @@
  * The state carries only non-secret, account-scoped facts: the current phase, whether the first
  * full backfill ever completed, when the last scan started and succeeded, page/submission counters,
  * the durable missing-metadata backlog, the cross-instance owner/lease of the running pass and a
- * **safe** failure code with an optional retry instant. A session cookie, a credential reference or
+ * **safe** failure code with an optional retry instant and an optional
+ * {@link LuoguSyncFailureStage}. A session cookie, a credential reference or
  * a raw provider message has no field here; the connection record holds only the *opaque* vault
  * reference of an account's session, which is not secret material.
  *
@@ -24,7 +25,8 @@
  *
  * Every persisted body is re-validated on the way in *and* on the way out. The validators are
  * closed: an unknown or credential-shaped key (`cookie`, `session`, `secret`, …) is a hard
- * `invalid_input` instead of being stored, the failure code comes from a fixed allowlist, and the
+ * `invalid_input` instead of being stored, the failure code comes from a fixed allowlist, an
+ * optional failure `stage` must be one of the two known halves, and the
  * backlog may only hold canonical problem keys of the state's own source instance.
  */
 import {
@@ -158,6 +160,19 @@ export function luoguSyncFailurePauses(code: LuoguSyncFailureCode): boolean {
   return LUOGU_SYNC_PAUSING_FAILURES.includes(code);
 }
 
+/**
+ * Which half of one pass produced a failure.
+ *
+ * A pass reads the authenticated submission history first and then repairs the **anonymous**
+ * problem-metadata backlog. Both halves can answer `auth_required`, but the two answers do not mean
+ * the same thing: a metadata refusal is an anonymous read being denied, so it is not evidence that
+ * the stored session expired. `stage` exists to keep that distinction durable instead of inferring
+ * it from a code that two different operations share.
+ */
+export type LuoguSyncFailureStage = 'history' | 'metadata';
+
+export const LUOGU_SYNC_FAILURE_STAGES: readonly LuoguSyncFailureStage[] = ['history', 'metadata'];
+
 /** One sanitized failure of the last synchronization attempt. */
 export interface LuoguSyncFailure {
   readonly code: LuoguSyncFailureCode;
@@ -167,6 +182,14 @@ export interface LuoguSyncFailure {
   readonly retryAt: string | null;
   /** True when automatic attempts are paused until the user acts, independent of `retryAt`. */
   readonly paused: boolean;
+  /**
+   * Which half of the pass failed, on every failure this build records.
+   *
+   * The field is optional because records written before it existed carry exactly four fields:
+   * reading one never invents a stage. A missing stage therefore means "this record predates the
+   * distinction", not `history`.
+   */
+  readonly stage?: LuoguSyncFailureStage;
 }
 
 /**
@@ -479,6 +502,14 @@ const STATE_KEYS = [
 ] as const;
 
 const FAILURE_KEYS = ['code', 'at', 'retryAt', 'paused'] as const;
+/**
+ * Keys a failure may carry *in addition to* {@link FAILURE_KEYS}.
+ *
+ * `stage` was added after the first durable failures existed, so it is accepted but never required:
+ * a pre-existing four-field row stays valid and is never rewritten just to gain a stage, while an
+ * unknown value (or any other undeclared key) is still a hard refusal.
+ */
+const FAILURE_OPTIONAL_KEYS = ['stage'] as const;
 const SETTINGS_KEYS = ['accountId', 'automaticEnabled', 'runOnStartup', 'intervalMinutes', 'updatedAt'] as const;
 const CONNECTION_KEYS = [
   'accountId',
@@ -496,7 +527,8 @@ const JOURNAL_ENTRY_KEYS = ['accountId', 'reference', 'recordedAt'] as const;
  * Validate one sync state and return a detached copy.
  *
  * Rejected: an undeclared key (which is how a credential-shaped field would arrive), a missing
- * declared key, a non-canonical or foreign backlog key, an unknown phase or failure code, a
+ * declared key, a non-canonical or foreign backlog key, an unknown phase, failure code or failure
+ * stage, a
  * `historyComplete` flag without its completion instant, a half lease (`owner` without a deadline or
  * the reverse), a retry instant before the failure, and a paused failure that also carries a retry
  * instant (the two are contradictory claims).
@@ -598,10 +630,10 @@ export function validateLuoguSyncState(value: unknown): LuoguSyncState {
   };
 }
 
-/** Validate one sanitized failure record. */
+/** Validate one sanitized failure record; `stage` is validated when present and never required. */
 export function validateLuoguSyncFailure(value: unknown): LuoguSyncFailure {
   const record = requireObject('sync failure', value);
-  requireExactKeys('sync failure', record, FAILURE_KEYS);
+  requireExactKeys('sync failure', record, FAILURE_KEYS, FAILURE_OPTIONAL_KEYS);
   const code = record['code'];
   invariant(
     LUOGU_SYNC_FAILURE_CODES.includes(code as LuoguSyncFailureCode),
@@ -612,6 +644,13 @@ export function validateLuoguSyncFailure(value: unknown): LuoguSyncFailure {
   const at = requireTimestamp('sync failure at', record['at']);
   const retryAt = requireNullableTimestamp('sync failure retryAt', record['retryAt']);
   const paused = requireBoolean('sync failure paused', record['paused']);
+  const stage = record['stage'];
+  invariant(
+    !Object.prototype.hasOwnProperty.call(record, 'stage') || LUOGU_SYNC_FAILURE_STAGES.includes(stage as LuoguSyncFailureStage),
+    'invalid_input',
+    `unknown sync failure stage ${String(stage)}`,
+    { stage },
+  );
   invariant(
     !paused || retryAt === null,
     'invalid_input',
@@ -626,7 +665,10 @@ export function validateLuoguSyncFailure(value: unknown): LuoguSyncFailure {
       { at, retryAt },
     );
   }
-  return { code: code as LuoguSyncFailureCode, at, retryAt, paused };
+  // A legacy four-field record is returned exactly as stored: no stage is invented for it.
+  return stage === undefined
+    ? { code: code as LuoguSyncFailureCode, at, retryAt, paused }
+    : { code: code as LuoguSyncFailureCode, at, retryAt, paused, stage: stage as LuoguSyncFailureStage };
 }
 
 /** Validate sync settings of one account, enforcing the documented interval bounds. */
@@ -723,8 +765,18 @@ function requireObject(label: string, value: unknown): JsonObject {
   return value as JsonObject;
 }
 
-function requireExactKeys(label: string, value: JsonObject, keys: readonly string[]): void {
-  const unknown = Object.keys(value).filter((key) => !keys.includes(key));
+/**
+ * Enforce a closed key set: `keys` must all be present, `optional` may be present, and anything
+ * else is an unknown key. The `optional` half exists for a field added after the first durable rows
+ * were written ({@link LuoguSyncFailure.stage}); it is never required and never defaulted.
+ */
+function requireExactKeys(
+  label: string,
+  value: JsonObject,
+  keys: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const unknown = Object.keys(value).filter((key) => !keys.includes(key) && !optional.includes(key));
   invariant(
     unknown.length === 0,
     'invalid_input',

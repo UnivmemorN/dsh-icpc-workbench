@@ -1165,3 +1165,102 @@ void test('a failed lease release still retires the refused pass and keeps the l
     await world.dispose();
   }
 });
+
+void test('a metadata auth refusal is recorded as metadata, keeps history coverage and the backlog, and survives a successful probe', async () => {
+  const world = await createWorld({ alice: { total: 3, pids: ['P1000', 'P1001'] } });
+  try {
+    const service = world.makeService('svc-stage-metadata');
+    await service.connect(world.alice.id, cookieFor('100001'), world.token);
+    await service.configure(world.alice.id, null, { automaticEnabled: true });
+    // The anonymous problem-metadata read answers `auth_required`, the same code an authenticated
+    // history read uses. The stage is what keeps the two apart.
+    world.metadata.fail.set(
+      'P1001',
+      new PlatformError({
+        code: 'auth_required',
+        operation: 'problem',
+        retryable: false,
+        detail: 'the anonymous metadata read was asked to log in',
+      }),
+    );
+
+    await service.start(world.alice.id, 'resume');
+    await service.settle();
+    const afterMetadata = await service.status(world.alice.id);
+    assert.equal(afterMetadata.historyComplete, true, 'the metadata refusal never clears history coverage');
+    assert.equal(afterMetadata.phase, 'incremental');
+    assert.equal(afterMetadata.totalPages, 1);
+    assert.equal(afterMetadata.submissionsSeen, 3);
+    assert.equal(afterMetadata.metadataBacklog, 1, 'the failing key stays queued');
+    assert.equal(afterMetadata.metadataFailed, 1);
+    assert.equal(afterMetadata.paused, true);
+    assert.equal(afterMetadata.failure?.code, 'auth_required');
+    assert.equal(afterMetadata.failure?.stage, 'metadata');
+    assert.equal(await countSubmissions(world.store, world.alice.id), 3, 'metadata failures discard no submissions');
+
+    // A probe only proves the session works right now; it must not clear the sync failure or unpause.
+    await service.probe(world.alice.id, world.token);
+    const probed = await service.status(world.alice.id);
+    assert.equal(probed.connection?.status, 'connected', 'the probe really succeeded');
+    assert.equal(probed.failure?.code, 'auth_required');
+    assert.equal(probed.failure?.stage, 'metadata', 'the recorded stage is untouched by the probe');
+    assert.equal(probed.failure?.at, afterMetadata.failure?.at, 'the same durable failure is still reported');
+    assert.equal(probed.paused, true);
+    const blocked = await service.tick(world.token);
+    assert.deepEqual(blocked.started, []);
+    assert.ok(blocked.skipped.some((entry) => entry.accountId === world.alice.id && entry.reason === 'paused'));
+
+    // A genuine history refusal is recorded as a history failure and erases neither coverage nor keys.
+    world.metadata.fail.clear();
+    world.feed.override = () => {
+      throw new PlatformError({
+        code: 'auth_required',
+        operation: 'submissions',
+        retryable: false,
+        detail: 'the session is gone',
+      });
+    };
+    assert.equal((await service.start(world.alice.id, 'resume')).outcome, 'started');
+    await service.settle();
+    const afterHistory = await service.status(world.alice.id);
+    assert.equal(afterHistory.failure?.code, 'auth_required');
+    assert.equal(afterHistory.failure?.stage, 'history');
+    assert.equal(afterHistory.paused, true);
+    assert.equal(afterHistory.historyComplete, true, 'a failed incremental scan never clears coverage');
+    assert.equal(afterHistory.metadataBacklog, 1, 'the metadata backlog is preserved');
+    assert.equal(await countSubmissions(world.store, world.alice.id), 3);
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('an exception thrown while repairing metadata is recorded as a metadata failure', async () => {
+  const world = await createWorld({ alice: { total: 3, pids: ['P1000'] } });
+  try {
+    const service = world.makeService('svc-stage-metadata-throw');
+    await service.connect(world.alice.id, cookieFor('100001'), world.token);
+    // `invalid_input` from the metadata adapter is re-thrown by the import service instead of being
+    // returned as a report, so the pass observes a real exception raised while doing metadata work.
+    world.metadata.fail.set(
+      'P1000',
+      new PlatformError({
+        code: 'invalid_input',
+        operation: 'problem',
+        retryable: false,
+        detail: 'the metadata request was rejected',
+      }),
+    );
+
+    await service.start(world.alice.id, 'resume');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.equal(status.historyComplete, true, 'the history half already completed and stays complete');
+    assert.equal(status.failure?.code, 'invalid_input');
+    assert.equal(status.failure?.stage, 'metadata');
+    assert.equal(status.paused, true);
+    assert.equal(status.metadataBacklog, 1);
+    assert.equal(await countSubmissions(world.store, world.alice.id), 3);
+  } finally {
+    await world.dispose();
+  }
+});

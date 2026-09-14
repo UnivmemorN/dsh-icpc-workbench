@@ -6,14 +6,18 @@
  * three kinds of rule:
  *
  * 1. **Secret handling.** {@link checkLuoguSessionCookie} validates the ephemeral session draft
- *    locally (non-blank, no control characters, at most the credential store's 2560 UTF-8 bytes) and
- *    only ever answers a fixed sentence: the draft is never repeated in a message, and nothing here
- *    reads or writes `localStorage`, `sessionStorage`, a URL, a log or a model input.
+ *    locally through the same pure domain normalizer the server uses (bounded raw input, control
+ *    characters refused, `_uid` bound to the selected account, unrelated cookies discarded) and only
+ *    ever answers a fixed sentence plus the canonical two-cookie value to submit: the draft is never
+ *    repeated in a message, and nothing here reads or writes `localStorage`, `sessionStorage`, a URL,
+ *    a log or a model input.
  * 2. **Honest status projection.** History coverage, the latest attempt's result and the metadata
  *    backlog are three *separate* answers ({@link luoguHistoryCoverage}, {@link luoguAttemptSummary},
  *    {@link luoguBacklogSummary}), so an unread, empty or failed status can never be rendered as
  *    "0 records synced successfully". Processed rows are always labelled as *including* duplicate
- *    checks and rejudge replays, never as new submissions.
+ *    checks and rejudge replays, never as new submissions. A failure is explained by the half of the
+ *    pass that produced it ({@link luoguSyncFailureGuidance}): a metadata refusal is never described
+ *    as an expired session, and a legacy record without a stage keeps neutral wording.
  * 3. **Status-driven controls.** {@link luoguControls} derives every control's enabled state — and
  *    the exact reason it is disabled — from the durable status the service returned, never from a
  *    local guess. A remount therefore re-derives the same controls instead of recreating, clearing
@@ -30,16 +34,21 @@ import type {
 } from '../application/workbench-api.js';
 import type {
   LuoguConnectionStatus,
+  LuoguSyncFailure,
   LuoguSyncFailureCode,
+  LuoguSyncFailureStage,
   LuoguSyncSettings,
 } from '../application/luogu-sync-types.js';
+import {
+  MAX_LUOGU_COOKIE_INPUT_BYTES,
+  luoguSessionCookieFromClientId,
+  normalizeLuoguSessionCookie,
+  type LuoguCookieProblem,
+} from '../domain/luogu-session-cookie.js';
 
 // ---------------------------------------------------------------------------------------
-// Mirrored bounds
+// Bounds
 // ---------------------------------------------------------------------------------------
-
-/** Longest session cookie the OS credential store accepts (the 17d1 route bound). */
-export const LUOGU_SECRET_MAX_BYTES = 2560;
 
 /** Minimum automatic-sync interval in minutes; mirrors `LUOGU_SYNC_INTERVAL_MIN_MINUTES`. */
 export const LUOGU_INTERVAL_MIN_MINUTES = 5;
@@ -79,37 +88,75 @@ export function luoguPanelState(hasAccount: boolean, accountPlatform: string | n
 // Session draft
 // ---------------------------------------------------------------------------------------
 
+/** Which field of the panel the session material is entered in. */
+export type LuoguSecretMode = 'client_id' | 'full_cookie';
+
+/**
+ * The complete in-memory session draft of one connect action.
+ *
+ * `selectedUid` is the canonical UID of the selected account — the readonly `_uid` the panel shows —
+ * and is never something the user can type: the account is the only source of that binding.
+ * `clientId` is the `__client_id` **value** of the default mode; `fullCookie` is the optional
+ * whole-Cookie paste of the advanced mode.
+ */
+export interface LuoguSecretDraft {
+  readonly mode: LuoguSecretMode;
+  readonly selectedUid: string | null;
+  readonly clientId: string;
+  readonly fullCookie: string;
+}
+
 /** Local verdict on the session draft; `invalid` always carries a fixed explanation. */
 export interface LuoguSecretCheck {
   readonly state: 'empty' | 'invalid' | 'valid';
   readonly message: string | null;
+  /** Canonical `__client_id=…; _uid=…` value to submit; `null` unless `state === 'valid'`. */
+  readonly cookie: string | null;
 }
 
-/** Control characters a pasted cookie can never contain; a space is legitimate. */
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+/**
+ * Fixed Chinese sentence per refusal of the pure normalizer.
+ *
+ * Each sentence says which part is unusable and what to copy instead; none of them can echo the
+ * draft, and none of them claims that copying other cookies would solve a platform challenge.
+ */
+const LUOGU_SECRET_MESSAGES: Readonly<Record<LuoguCookieProblem, string>> = {
+  not_text: '登录凭据必须是文本：请粘贴 __client_id 的值，或整段 Cookie 值。',
+  empty: '请先填写登录凭据。',
+  too_long: `粘贴的内容太长（上限 ${MAX_LUOGU_COOKIE_INPUT_BYTES} 字节）：请只复制 Cookie 的值。`,
+  unsafe_characters: '登录凭据里含有换行或控制字符：请只粘贴单行的 Cookie 值。',
+  missing_client_id: '没有找到 __client_id：请在 F12 → Application（应用）→ Cookies 里复制这一项的 Value（值）。',
+  missing_uid: '没有找到 _uid：整段 Cookie 里必须包含 _uid，或改用默认的 __client_id 值方式。',
+  duplicate_client_id: '出现了多次 __client_id：请只保留这个账号的一个值。',
+  duplicate_uid: '出现了多次 _uid：请只粘贴这个账号的 Cookie。',
+  unusable_client_id: '__client_id 的值不可用：请只复制 Value（值）一列，不要带 Name、Domain、Path 等列、引号或空格。',
+  unusable_uid: '_uid 不是规范的数字 UID：请粘贴这个账号自己的 Cookie。',
+  uid_not_canonical: '请先选择一个洛谷账号：_uid 由当前账号决定，不能手工填写。',
+  foreign_uid: 'Cookie 里的 _uid 与当前账号不一致：请确认复制的是这个账号的 Cookie。',
+};
 
 /**
  * Validate one ephemeral session draft before it is submitted to `luogu.connect`.
  *
- * This is a local courtesy check only — the authenticated route revalidates and is the authority.
- * No branch of it can echo the draft: the three possible answers are `empty` (no message), `invalid`
- * (one fixed sentence) and `valid`. The draft is measured in UTF-8 bytes, because that is what the
- * OS credential blob bounds.
+ * This is a local courtesy check only — the authenticated route normalizes, revalidates and is the
+ * authority. The draft is normalized with the **same pure domain rule** the server uses, so the
+ * canonical value that is sent is exactly what the server would compute. No branch of it can echo
+ * the draft: the answers are `empty` (no message), `invalid` (one fixed sentence) and `valid` (plus
+ * the canonical value to submit). The `_uid` always comes from `selectedUid`, never from user input.
  */
-export function checkLuoguSessionCookie(draft: string): LuoguSecretCheck {
-  if (draft.trim().length === 0) {
-    return { state: 'empty', message: null };
+export function checkLuoguSessionCookie(draft: LuoguSecretDraft): LuoguSecretCheck {
+  const source = draft.mode === 'full_cookie' ? draft.fullCookie : draft.clientId;
+  if (source.trim().length === 0) {
+    return { state: 'empty', message: null, cookie: null };
   }
-  if (CONTROL_CHARACTERS.test(draft)) {
-    return { state: 'invalid', message: '登录凭据里含有换行或控制字符：请只粘贴浏览器请求中 Cookie 的一行值。' };
+  const normalized =
+    draft.mode === 'full_cookie'
+      ? normalizeLuoguSessionCookie(draft.fullCookie, draft.selectedUid)
+      : luoguSessionCookieFromClientId(draft.clientId, draft.selectedUid);
+  if (!normalized.ok) {
+    return { state: 'invalid', message: LUOGU_SECRET_MESSAGES[normalized.problem], cookie: null };
   }
-  if (new TextEncoder().encode(draft).length > LUOGU_SECRET_MAX_BYTES) {
-    return {
-      state: 'invalid',
-      message: `登录凭据超过 ${LUOGU_SECRET_MAX_BYTES} 字节上限：请只粘贴浏览器请求中 Cookie 的值，不要连同请求头一起复制。`,
-    };
-  }
-  return { state: 'valid', message: null };
+  return { state: 'valid', message: null, cookie: normalized.cookie };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -238,20 +285,24 @@ export function luoguHistoryCoverage(status: ApiLuoguStatusView | null): string 
 /**
  * Result of the **latest attempt**, separate from history coverage and from the backlog.
  *
- * A paused failure says so explicitly, because those codes wait for a user action instead of
- * retrying on their own.
+ * The failure names the half of the pass that failed (when the record carries a stage) and uses the
+ * stage-aware guidance of {@link luoguSyncFailureGuidance}, so a metadata refusal is never rendered
+ * as an expired cookie. A paused failure says so explicitly, because those codes wait for a user
+ * action instead of retrying on their own.
  */
 export function luoguAttemptSummary(status: ApiLuoguStatusView | null): string {
   if (status === null) {
     return '最近一次同步：尚未读取。';
   }
-  if (status.failure !== null) {
-    const wait = status.failure.paused
+  const failure = status.failure;
+  if (failure !== null) {
+    const wait = failure.paused
       ? '自动同步已暂停，需要你处理后手动继续。'
-      : status.failure.retryAt !== null
-        ? `计划重试：${luoguTime(status.failure.retryAt)}。`
+      : failure.retryAt !== null
+        ? `计划重试：${luoguTime(failure.retryAt)}。`
         : '';
-    return `最近一次同步：${luoguTime(status.failure.at)} 失败 — ${LUOGU_FAILURE_GUIDANCE[status.failure.code]}${wait}`;
+    const where = failure.stage === undefined ? '' : `在${LUOGU_FAILURE_STAGE_LABELS[failure.stage]}时`;
+    return `最近一次同步：${luoguTime(failure.at)} ${where}失败 — ${luoguSyncFailureGuidance(failure)}${wait}`;
   }
   if (status.lastSuccessAt !== null) {
     return `最近一次同步：${luoguTime(status.lastSuccessAt)} 成功完成。`;
@@ -315,7 +366,7 @@ export function luoguNextRunSummary(status: ApiLuoguStatusView | null): string {
     return '自动同步：未开启。只有在这里为这个账号开启后，dsh 打开期间才会按间隔自动同步。';
   }
   if (status.failure !== null && status.failure.paused) {
-    return `自动同步：已暂停 — ${LUOGU_FAILURE_GUIDANCE[status.failure.code]}`;
+    return `自动同步：已暂停 — ${luoguSyncFailureGuidance(status.failure)}`;
   }
   if (status.failure !== null && status.failure.retryAt !== null) {
     return `自动同步：已开启，上次失败后计划在 ${luoguTime(status.failure.retryAt)} 重试。`;
@@ -326,9 +377,29 @@ export function luoguNextRunSummary(status: ApiLuoguStatusView | null): string {
   return '自动同步：已开启，下一次计划时间尚未确定（只在 dsh 打开时运行）。';
 }
 
-/** Fixed next-action sentence per failure code; never provider text and never a silent retry claim. */
+/**
+ * Human label of the half of a pass a failure came from.
+ *
+ * Absent from a legacy failure record, which carries no stage; the label is only ever rendered when
+ * the durable record actually named the half.
+ */
+export const LUOGU_FAILURE_STAGE_LABELS: Readonly<Record<LuoguSyncFailureStage, string>> = {
+  history: '读取提交记录',
+  metadata: '补齐题目资料',
+};
+
+/**
+ * Fixed next-action sentence per failure code for a **stage-less** failure: a record written before
+ * the stage existed, or the standalone connection probe (which is a different operation from a sync
+ * pass). Never provider text and never a silent retry claim.
+ *
+ * `auth_required` is deliberately neutral here: the code alone cannot prove that the saved session
+ * expired, because the anonymous metadata read answers it too, so the sentence asks the user to check
+ * the login instead of asserting an expiry.
+ */
 export const LUOGU_FAILURE_GUIDANCE: Readonly<Record<LuoguSyncFailureCode, string>> = {
-  auth_required: '登录凭据已失效：请在普通浏览器登录洛谷后重新复制 Cookie 值并重新连接。',
+  auth_required:
+    '这次请求被平台要求登录：请在普通浏览器里确认这个账号仍能正常登录，再点「检查登录」核对当前登录；若检查也失败，再重新复制 Cookie 值并重新连接。已同步的记录、进度与待补资料都会保留。',
   forbidden: '平台拒绝了这次访问：请确认账号在普通浏览器里可用，然后重新连接或手动继续。',
   rate_limited: '平台限流：进度已保留，会在计划的重试时间后继续，请不要连续手动点击。',
   timeout: '请求超时：多为网络或平台繁忙，进度已保留，可稍后手动继续。',
@@ -344,9 +415,93 @@ export const LUOGU_FAILURE_GUIDANCE: Readonly<Record<LuoguSyncFailureCode, strin
   internal: '本地同步出现未预期错误：自动重试不会修复，请查看 dsh 本地日志并重启 dsh 后重试。',
 };
 
-/** Fixed guidance of one failure code, or `null` when there is no failure to explain. */
+/**
+ * Stage-specific sentences of the **anonymous metadata repair** (`stage: 'metadata'`).
+ *
+ * This half reads public problem data, so a refusal here is a problem-data completion failure, not
+ * evidence that the saved login expired: every sentence says so instead of sending the user to
+ * reconnect for something a reconnect cannot fix. Codes without an entry keep the stage-less
+ * sentence, which is already accurate for them (a rate limit or an outage preserves progress).
+ */
+export const LUOGU_METADATA_FAILURE_GUIDANCE: Readonly<Partial<Record<LuoguSyncFailureCode, string>>> = {
+  auth_required:
+    '上一轮在补齐题目资料（公开题目数据）时被平台要求登录：这不代表保存的登录凭据已过期，也不能靠重新连接解决。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队。请先在普通浏览器里确认账号与网络可用，并点「检查登录」查看当前登录；若登录检查成功，可以稍后手动继续同步来补资料。',
+  forbidden:
+    '上一轮在补齐题目资料时被平台拒绝访问：题目资料是公开数据，这不代表登录凭据失效。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队；请稍后在普通浏览器里确认能正常访问洛谷，再手动继续。',
+  changed_response:
+    '上一轮在补齐题目资料时平台返回与预期不符：可能是人工验证或页面结构变化；此错误不表示本地记录损坏。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队，可稍后手动继续；不要为此做「全历史完整核对」。',
+};
+
+/**
+ * Stage-specific sentences of the **authenticated history read** (`stage: 'history'`).
+ *
+ * A refusal here is a real authentication wall for the record request, but even then the sentence
+ * asks the user to verify the login instead of asserting that the stored session expired.
+ */
+export const LUOGU_HISTORY_FAILURE_GUIDANCE: Readonly<Partial<Record<LuoguSyncFailureCode, string>>> = {
+  auth_required:
+    '上一轮在读取提交记录（需要登录的步骤）时被平台要求重新登录：已经提交的页面、历史覆盖与检查点都会保留。请先在普通浏览器里确认账号能正常登录，并点「检查登录」核对当前登录，然后手动继续同步；若登录检查也失败，再重新复制 Cookie 值并重新连接。',
+};
+
+/**
+ * Fixed stage-aware guidance of one synchronization failure.
+ *
+ * The recorded stage decides which half's sentences apply, so the latest-attempt summary, the
+ * automatic-pause summary and the panel's failure advice can never disagree about what failed; a
+ * metadata refusal is explained as a problem-data completion failure and never as an expired cookie.
+ * A record without a stage (written before the field existed) keeps the neutral sentence.
+ */
+export function luoguSyncFailureGuidance(failure: LuoguSyncFailure): string;
+export function luoguSyncFailureGuidance(failure: null): null;
+export function luoguSyncFailureGuidance(failure: LuoguSyncFailure | null): string | null;
+export function luoguSyncFailureGuidance(failure: LuoguSyncFailure | null): string | null {
+  if (failure === null) {
+    return null;
+  }
+  const stageSpecific =
+    failure.stage === 'metadata'
+      ? LUOGU_METADATA_FAILURE_GUIDANCE[failure.code]
+      : failure.stage === 'history'
+        ? LUOGU_HISTORY_FAILURE_GUIDANCE[failure.code]
+        : undefined;
+  return stageSpecific ?? LUOGU_FAILURE_GUIDANCE[failure.code];
+}
+
+/**
+ * Fixed guidance of one **connection-record** failure code, or `null` when there is none.
+ *
+ * The stored connection record carries no pass stage: it is written by the standalone connection
+ * probe (or a connect), which is a different operation from a synchronization pass, so this
+ * stage-free sentence is the honest one for it.
+ */
 export function luoguFailureGuidance(code: LuoguSyncFailureCode | null): string | null {
   return code === null ? null : LUOGU_FAILURE_GUIDANCE[code];
+}
+
+/**
+ * Honest relation between a **newer successful login check** and a still-standing sync failure.
+ *
+ * A connection probe that ran after the failed pass proves the saved session works *now*; it does
+ * not retract the failure and it is never evidence that synchronization succeeded. Returns the
+ * sentence to show in that situation, or `null` when there is nothing to add: no failure, no stored
+ * connection, a connection that is not `connected`, or a check that is not newer than the failure
+ * it would be compared with.
+ */
+export function luoguLoginCheckSummary(status: ApiLuoguStatusView | null): string | null {
+  if (status === null) {
+    return null;
+  }
+  const failure = status.failure;
+  const connection = status.connection;
+  if (failure === null || connection === null || connection.status !== 'connected') {
+    return null;
+  }
+  const checked = Date.parse(connection.checkedAt);
+  const failed = Date.parse(failure.at);
+  if (!Number.isFinite(checked) || !Number.isFinite(failed) || checked <= failed) {
+    return null;
+  }
+  return `当前登录检查：${luoguTime(connection.checkedAt)} 检查成功，保存的登录凭据现在可用；但这只说明现在能登录，最近一次同步（${luoguTime(failure.at)}）仍然失败，需要按上面的说明处理，并不代表同步成功。`;
 }
 
 /** Text of a `luogu.start` answer; every outcome is stated as committed, never as completed. */
@@ -432,7 +587,7 @@ export function luoguControls(input: LuoguControlInput): Readonly<Record<LuoguAc
     connect: status.connectionAvailable
       ? secretReady
         ? ALLOWED
-        : { enabled: false, reason: '请先粘贴登录凭据（浏览器请求里 Cookie 的值）。' }
+        : { enabled: false, reason: '请先粘贴登录凭据：默认填写 __client_id 的 Value（值），也可以改用整段 Cookie。' }
       : { enabled: false, reason: connectionReason },
     probe: status.connectionAvailable
       ? status.connection === null
@@ -659,23 +814,43 @@ export function luoguPollDelayMs(status: ApiLuoguStatusView | null, startPending
 // ---------------------------------------------------------------------------------------
 
 /**
- * How to obtain the Cookie **value** from the user's own logged-in Luogu session.
+ * How to obtain the session material from the user's own logged-in Luogu session.
  *
- * The wording prefers copying the whole Cookie value over handcrafting one: `_uid` is the numeric
- * account UID and `__client_id` is the opaque session identifier, and they are not interchangeable
- * or guessable.
+ * The default path is the `__client_id` **value**: it is the only field the user has to copy, because
+ * `_uid` is the numeric account UID and the panel fills it from the selected account. The advanced
+ * whole-Cookie path stays available for users who already copy the request header, and both paths are
+ * normalized to the same two cookies before anything is stored or sent.
  */
 export const LUOGU_COOKIE_GUIDE: readonly string[] = [
-  '在你平时使用的浏览器里登录洛谷，打开任意一个已登录页面（例如自己的提交记录页）。',
-  '按 F12 打开开发者工具，切到「网络 / Network」，刷新页面，点开任意一个发往 www.luogu.com.cn 的请求。',
-  '在「请求标头 / Request Headers」里找到 Cookie 一行，复制它的完整值（整段 Cookie 值最稳妥，不要只挑一段拼）。',
-  '其中 _uid 是你的数字 UID（和账号 UID 相同），__client_id 是不透明的会话标识；两者含义不同、不能互相替代或手工编造。',
-  '把这段值粘贴到下面的「登录凭据（Cookie 值，只在本机使用）」输入框，然后点「连接」。提交后输入框会立即清空。',
+  '在你平时使用的浏览器里登录洛谷，按 F12 打开开发者工具，切到「Application / 应用」→ 左侧 Storage 里的 Cookies → 选中 https://www.luogu.com.cn。',
+  '找到 __client_id 这一行，只复制它的「Value / 值」一列：不要复制 Name、Domain、Path、Expires 等其他列，也不要带引号或多余空格。',
+  '把复制的值粘贴到下面的「__client_id 的值」输入框；上方的 _uid 会使用当前账号的数字 UID（两者含义不同，不能互相替代，也不能手工编造）。',
+  '若你更习惯整段复制：勾选「高级：粘贴整段 Cookie」，再把浏览器请求标头里 Cookie 的完整值粘进去；提交前也只会保留 __client_id 与 _uid 两项。',
+  '点「连接」。提交后输入框会立即清空，切换账号或离开本页也会清空。',
 ];
+
+/** Why the `_uid` field is readonly: it is the selected account's numeric UID, not a user choice. */
+export const LUOGU_UID_DISPLAY_NOTE =
+  '_uid 就是你的数字 UID，与「当前账号」的洛谷 UID 完全相同：它由所选账号决定，这里只读显示，不能手工修改；切换账号时它会跟着变，同时清空正在填写的登录凭据。';
+
+/** Exactly which column of the developer tools the default field wants. */
+export const LUOGU_CLIENT_ID_HELP =
+  '默认只需要 __client_id 的 Value（值）：在 F12 → Application（应用）→ Cookies → https://www.luogu.com.cn 里找到 __client_id 一行，只复制 Value 一列，不要复制 Name、Domain、Path 等列。';
+
+/** What the advanced mode accepts, and what it still discards. */
+export const LUOGU_FULL_COOKIE_HELP =
+  '高级模式可以粘贴整段 Cookie 值（浏览器请求标头里 Cookie 的完整内容，可带 Cookie: 前缀）：提交前会只保留 __client_id 与 _uid 两项，其余 Cookie 一律丢弃，不会保存也不会发送。复制其他 Cookie 并不能代替登录，也不能保证通过平台的人工验证。';
+
+/** Label of the advanced-mode checkbox. */
+export const LUOGU_FULL_COOKIE_TOGGLE = '高级：粘贴整段 Cookie（兼容旧用法）';
+
+/** Memory-only promise of both inputs. */
+export const LUOGU_SECRET_MEMORY_NOTE =
+  '这些输入框只存在于当前页面内存：提交尝试、切换账号、切换方式或离开本页后都会清空，出错信息也不会回显内容。';
 
 /** Where the login material goes, and where it must never go. */
 export const LUOGU_SECRET_STORAGE_NOTE =
-  '登录凭据只发送给本机 dsh 的洛谷连接操作，保存在 Windows 凭据管理器（随工作台数据目录隔离）。它不会写入 localStorage、备份、日志或 AI 请求。';
+  '登录凭据只发送给本机 dsh 的洛谷连接操作；保存前会只保留 __client_id 与 _uid 两项，其余 Cookie 一律丢弃。凭据保存在 Windows 凭据管理器（随工作台数据目录隔离），不会写入 localStorage、备份、日志或 AI 请求。';
 
 /** Explicit warning about pasting the same material into a chat or an online service. */
 export const LUOGU_AI_CHAT_WARNING =

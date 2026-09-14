@@ -12,9 +12,9 @@
  * - **The map is the contract.** Each route's request and response types are the shared
  *   {@link WorkbenchApiMap} entries, so the browser half and this boundary cannot drift.
  * - **Validation precedes every side effect.** Unknown fields, malformed revisions, an out-of-range
- *   interval, an empty settings patch and an oversized or control-character cookie are refused in
- *   the route's `validate` step, before the handler reads the store. Account identity is proved next
- *   — the account id itself must name this configured Luogu instance — and only then does the
+ *   interval, an empty settings patch and an unbounded or control-character session input are refused
+ *   in the route's `validate` step, before the handler reads the store. Account identity is proved
+ *   next — the account id itself must name this configured Luogu instance — and only then does the
  *   handler reach the service, which performs credential or platform work.
  * - **Answers are sanitized projections, never internal records.** The `LuoguSyncStatus` this module
  *   receives carries the stored connection record (an opaque vault reference, its `staleReference`
@@ -27,10 +27,14 @@
 import type { HostConnectionFetch } from '@deepseek-ai/dsh-client-connection';
 import {
   DomainError,
+  MAX_LUOGU_COOKIE_INPUT_BYTES,
   createCancellationSource,
+  inspectLuoguSessionCookie,
+  normalizeLuoguSessionCookie,
   parseAccountId,
   type Account,
   type CancellationToken,
+  type LuoguCookieProblem,
   type SourceInstance,
 } from '../domain/index.js';
 import { MAX_CREDENTIAL_SECRET_BYTES } from '../application/local-credential-vault.js';
@@ -251,21 +255,49 @@ function requireAccountId(instance: SourceInstance, value: unknown): string {
 }
 
 /**
- * Validate one session cookie for exactly one connect action.
+ * Fixed Chinese sentence per refusal of a supplied session.
  *
- * Bounded by the OS credential store's own 2560-byte capacity (actual UTF-8 bytes, not character
- * count), non-empty and free of control characters. The value is never stored by this module, never
- * echoed and never compared here; the connection adapter validates and stores it.
+ * A route answer may say *which* part of the supplied session is unusable, but never quote it: every
+ * sentence below is a constant, so no cookie value, client id or uid can travel through an error.
+ */
+const LUOGU_COOKIE_MESSAGES: Readonly<Record<LuoguCookieProblem, string>> = {
+  not_text: 'sessionCookie 必须是洛谷会话 Cookie 的文本。',
+  empty: 'sessionCookie 不能为空：请粘贴 __client_id 的值，或整段 Cookie 值。',
+  too_long: `sessionCookie 过长（上限 ${MAX_LUOGU_COOKIE_INPUT_BYTES} 字节）：请只粘贴 Cookie 的值，不要连同其他内容一起复制。`,
+  unsafe_characters: 'sessionCookie 含有换行或控制字符：请只粘贴单行的 Cookie 值。',
+  missing_client_id: 'sessionCookie 里没有 __client_id：请复制这一项的 Value（值）。',
+  missing_uid: 'sessionCookie 里没有 _uid：Cookie 必须包含 _uid。',
+  duplicate_client_id: 'sessionCookie 里出现了多次 __client_id：请只保留这个账号的一个值。',
+  duplicate_uid: 'sessionCookie 里出现了多次 _uid：请只保留这个账号的一个值。',
+  unusable_client_id:
+    '__client_id 的值不是可用的会话标识：请只复制 Value（值）一列，不要带 Name、Domain、Path 等列、引号或空格。',
+  unusable_uid: '_uid 的值不是规范的数字 UID：请使用所选账号自己的 Cookie。',
+  uid_not_canonical: '所选账号的 UID 不是规范的洛谷 UID。',
+  foreign_uid: 'Cookie 里的 _uid 与所选账号不一致：请确认复制的是这个账号的 Cookie。',
+};
+
+/**
+ * Validate one session input for exactly one connect action.
+ *
+ * The raw text is bounded and parsed by the shared pure normalizer: a minimal `__client_id`/`_uid`
+ * pair, an optional `Cookie:` prefix and a whole browser Cookie header are all accepted, and the
+ * unrelated cookies are discarded. What is measured against the OS credential store's capacity is
+ * the **normalized** pair, so a safe session inside a header that is larger than the blob limit
+ * because of unrelated cookies is not refused for cookies that would never be stored or sent. The
+ * `_uid` binding is not checked here — it names the selected account, which the handler resolves —
+ * so the handler normalizes again against the stored account and refuses a foreign uid before any
+ * credential work.
  */
 function requireSessionCookie(value: unknown): string {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    refuse('sessionCookie 必须是非空的洛谷会话 Cookie。');
+  if (typeof value !== 'string') {
+    refuse(LUOGU_COOKIE_MESSAGES.not_text);
   }
-  if (UNSAFE_TEXT.test(value)) {
-    refuse('sessionCookie 含有控制字符。');
+  const inspected = inspectLuoguSessionCookie(value);
+  if (!inspected.ok) {
+    refuse(LUOGU_COOKIE_MESSAGES[inspected.problem]);
   }
-  if (new TextEncoder().encode(value).length > MAX_CREDENTIAL_SECRET_BYTES) {
-    refuse(`sessionCookie 超过 ${MAX_CREDENTIAL_SECRET_BYTES} 字节的凭据存储上限。`);
+  if (new TextEncoder().encode(inspected.cookie).length > MAX_CREDENTIAL_SECRET_BYTES) {
+    refuse(`sessionCookie 规范化后仍超过 ${MAX_CREDENTIAL_SECRET_BYTES} 字节的凭据存储上限。`);
   }
   return value;
 }
@@ -600,7 +632,13 @@ export async function registerLuoguApi(options: RegisterLuoguApiOptions): Promis
       async (input, token) => {
         requireConnectionBackend(context);
         const account = await requireStoredAccount(context, input.accountId);
-        await context.service.connect(account.id, input.sessionCookie, token);
+        // The account is known now, so the required `_uid` can be bound to it; only the canonical
+        // two-cookie pair crosses into the service, the vault and the authenticated reader.
+        const session = normalizeLuoguSessionCookie(input.sessionCookie, account.handle);
+        if (!session.ok) {
+          throw new ApiTransportError('invalid_input', LUOGU_COOKIE_MESSAGES[session.problem]);
+        }
+        await context.service.connect(account.id, session.cookie, token);
         return projectStatus(context, account);
       },
     );

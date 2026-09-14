@@ -248,6 +248,7 @@ void test('the Luogu route map is exact and every answer uses the versioned enve
 void test('connect stores the session in the vault without echoing it or any reference', async () => {
   await withBench({}, async (bench) => {
     const cookie = sfx.cookieFor('800001', 'client-marker-17d1');
+    const canonical = sfx.canonicalCookieFor('800001', 'client-marker-17d1');
     const connected = await bench.ok('luogu.connect', { accountId: bench.account.id, sessionCookie: cookie });
     assert.equal(connected.connection.status, 'connected');
     assert.equal(connected.connection.failureCode, null);
@@ -256,14 +257,14 @@ void test('connect stores the session in the vault without echoing it or any ref
 
     const status = await bench.ok('luogu.status', { accountId: bench.account.id });
     const serialized = `${JSON.stringify(connected)}${JSON.stringify(status)}`;
-    for (const marker of [cookie, 'client-marker-17d1', 'sessionCookie', 'reference', 'staleReference', 'leaseOwner', 'cookie', '_uid']) {
+    for (const marker of [cookie, canonical, 'client-marker-17d1', 'sessionCookie', 'reference', 'staleReference', 'leaseOwner', 'cookie', '_uid']) {
       assert.equal(serialized.includes(marker), false, `the answer must not carry ${marker}`);
     }
     assert.equal(bench.vault.writes.length, 1);
     const reference = bench.vault.writes[0]!;
-    assert.equal(bench.vault.secrets.get(reference), cookie);
+    assert.equal(bench.vault.secrets.get(reference), canonical, 'only the normalized pair is stored');
     assert.ok(bench.feed.calls.length >= 1, 'the session is validated through a real reader call');
-    assert.equal(bench.feed.calls[0]?.cookie, cookie);
+    assert.equal(bench.feed.calls[0]?.cookie, canonical, 'only the normalized pair is sent');
     assert.equal(bench.feed.calls[0]?.uid, '800001');
 
     const forgotten = await bench.ok('luogu.disconnect', { accountId: bench.account.id });
@@ -271,6 +272,40 @@ void test('connect stores the session in the vault without echoing it or any ref
     assert.equal((await bench.store.getLuoguConnection(bench.account.id)), null);
     assert.equal(bench.vault.secrets.size, 0);
     assert.equal(forgotten.settings.automaticEnabled, false, 'disconnect only disables that account');
+  });
+});
+
+void test('a whole-Cookie paste is normalized to the two required cookies before storage or dispatch', async () => {
+  await withBench({}, async (bench) => {
+    const bulky = `__cf_bm=abc; _uid=800001; theme=dark; __client_id=bulky-marker; __session=${'x'.repeat(3_000)}`;
+    assert.ok(new TextEncoder().encode(bulky).length > 2_560, 'the raw header exceeds the blob limit on purpose');
+    const connected = await bench.ok('luogu.connect', { accountId: bench.account.id, sessionCookie: bulky });
+    assert.equal(connected.connection.status, 'connected');
+
+    const canonical = sfx.canonicalCookieFor('800001', 'bulky-marker');
+    assert.equal(bench.vault.writes.length, 1);
+    assert.equal(bench.vault.secrets.get(bench.vault.writes[0]!), canonical, 'only the two cookies are stored');
+    assert.equal(bench.feed.calls.length, 1);
+    assert.equal(bench.feed.calls[0]?.cookie, canonical, 'only the two cookies are sent');
+    const serialized = JSON.stringify(connected);
+    for (const marker of ['bulky-marker', '__cf_bm', 'theme', 'x'.repeat(64)]) {
+      assert.equal(serialized.includes(marker), false, `the answer must not carry ${marker}`);
+    }
+  });
+});
+
+void test('a session of another account is refused with a fixed sentence and no side effect', async () => {
+  await withBench({}, async (bench) => {
+    const error = await bench.refused(
+      'luogu.connect',
+      { accountId: bench.account.id, sessionCookie: `__client_id=abc; _uid=${bench.other.handle}` },
+      400,
+    );
+    assert.equal(error.code, 'invalid_input');
+    assert.match(error.message, /_uid/);
+    assert.equal(error.message.includes(bench.other.handle), false, 'the refusal must not echo the uid');
+    assert.equal(bench.vault.writes.length, 0);
+    assert.equal(bench.feed.calls.length, 0, 'a foreign session never reaches the platform');
   });
 });
 
@@ -286,8 +321,14 @@ void test('malformed input is refused before any store, vault or platform side e
       ['luogu.connect', { accountId, sessionCookie: cookie, extra: true }],
       ['luogu.connect', { accountId }],
       ['luogu.connect', { accountId, sessionCookie: '   ' }],
-      ['luogu.connect', { accountId, sessionCookie: 'x'.repeat(2561) }],
+      ['luogu.connect', { accountId, sessionCookie: 'x'.repeat(16 * 1024 + 1) }],
       ['luogu.connect', { accountId, sessionCookie: 'a\u0000b' }],
+      ['luogu.connect', { accountId, sessionCookie: '_uid=800001; __session=abc' }],
+      ['luogu.connect', { accountId, sessionCookie: '__client_id=; _uid=800001' }],
+      ['luogu.connect', { accountId, sessionCookie: '__client_id=abc; __client_id=def; _uid=800001' }],
+      ['luogu.connect', { accountId, sessionCookie: '__client_id=abc; _uid=800001\r\nx-injected: 1' }],
+      ['luogu.connect', { accountId, sessionCookie: '__client_id=has space; _uid=800001' }],
+      ['luogu.connect', { accountId, sessionCookie: '__client_id=abc; _uid=not-a-uid' }],
       ['luogu.configure', { accountId, expectedRevision: null }],
       ['luogu.configure', { accountId, expectedRevision: 0, automaticEnabled: true }],
       ['luogu.configure', { accountId, expectedRevision: null, automaticEnabled: 'yes' }],

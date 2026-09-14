@@ -584,11 +584,13 @@ export interface ApiLuoguAccountRequest {
 }
 
 /**
- * Request of `luogu.connect`: the account plus the ephemeral session cookie of this one user action.
+ * Request of `luogu.connect`: the account plus the ephemeral session material of this one user action.
  *
- * The cookie is the **only** request field of the whole API that carries secret material. It is
- * bounded by the OS credential store's own 2560-byte capacity, is stored only inside that store
- * under a fresh opaque reference, and is never echoed by a response, a status, an error or a log.
+ * The session material is the **only** request field of the whole API that carries secret material.
+ * It may be the `__client_id` value pair, a full browser Cookie header or an `__client_id=…; _uid=…`
+ * pair; it is bounded (16 KiB of raw input), normalized to exactly those two cookies, bound to the
+ * selected account's `_uid`, stored only inside the OS credential store under a fresh opaque
+ * reference, and never echoed by a response, a status, an error or a log.
  */
 export interface ApiLuoguConnectRequest {
   readonly accountId: string;

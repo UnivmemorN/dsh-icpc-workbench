@@ -38,8 +38,10 @@ import {
   validateLuoguConnectionJournalEntry,
   validateLuoguConnectionState,
   validateLuoguSyncSettings,
+  validateLuoguSyncFailure,
   validateLuoguSyncState,
   type LuoguConnectionState,
+  type LuoguSyncFailure,
   type LuoguSyncState,
 } from '../../src/application/luogu-sync-types.js';
 import { DomainError, canonicalJson, type Account } from '../../src/domain/index.js';
@@ -765,6 +767,66 @@ void test('unlinked credential references are journaled durably, per account, an
     await assert.rejects(corrupted.listLuoguConnectionJournal(alice.account.id), isStorage('corrupt_row'));
   } finally {
     await corrupted.close();
+    fx.removeDirectory(paths.dir);
+  }
+});
+
+void test('a failure stage round-trips, a legacy four-field failure stays stage-free and an unknown stage is refused', async () => {
+  const paths = fx.tempDatabase();
+  let store = new SqliteTrainingStore({ path: paths.path, now: () => fx.AT });
+  try {
+    const alice = luoguScope('900001');
+    await store.upsertSourceInstances([alice.instance]);
+    await store.upsertAccounts([alice.account]);
+    const base = emptyLuoguSyncState(alice.account.id, alice.instance.id, fx.AT);
+
+    // A failure records which half of the pass produced it, and both halves round-trip exactly.
+    const staged: LuoguSyncFailure = {
+      code: 'auth_required',
+      at: fx.AT,
+      retryAt: null,
+      paused: true,
+      stage: 'metadata',
+    };
+    assert.equal(await store.saveLuoguSyncState({ ...base, failure: staged }, null), 1);
+    assert.deepEqual((await store.getLuoguSyncState(alice.account.id))?.value.failure, staged);
+
+    const historyStage: LuoguSyncFailure = { ...staged, stage: 'history' };
+    assert.equal(await store.saveLuoguSyncState({ ...base, failure: historyStage }, 1), 2);
+    assert.deepEqual((await store.getLuoguSyncState(alice.account.id))?.value.failure, historyStage);
+
+    // A record written before the field existed keeps exactly its four fields: no stage is invented.
+    const legacy: LuoguSyncFailure = { code: 'auth_required', at: fx.LATER, retryAt: null, paused: true };
+    assert.equal(await store.saveLuoguSyncState({ ...base, failure: legacy, updatedAt: fx.LATER }, 2), 3);
+    const stored = await store.getLuoguSyncState(alice.account.id);
+    assert.deepEqual(stored?.value.failure, legacy);
+    assert.equal(Object.keys(stored?.value.failure ?? {}).length, 4, 'a legacy failure stays four-field');
+    assert.equal('stage' in (stored?.value.failure ?? {}), false);
+    assert.deepEqual(validateLuoguSyncFailure(legacy), legacy, 'an optional stage is not required');
+
+    // An unknown, empty, wrongly cased or wrongly typed stage is refused before any write.
+    for (const stage of ['guess', 'HISTORY', '', 42, null, undefined]) {
+      assert.throws(() => validateLuoguSyncFailure({ ...legacy, stage }), isDomain('invalid_input'));
+      const invalid = { ...base, failure: { ...legacy, stage }, updatedAt: fx.LATER } as unknown as LuoguSyncState;
+      await assert.rejects(store.saveLuoguSyncState(invalid, 3), isDomain('invalid_input'));
+    }
+    assert.deepEqual((await store.getLuoguSyncState(alice.account.id))?.value.failure, legacy);
+
+    // `stage` is a closed extra key, not a hole: any other undeclared key stays refused.
+    assert.throws(
+      () => validateLuoguSyncFailure({ ...legacy, cookie: 'sessionid=secret' }),
+      isDomain('invalid_input'),
+    );
+
+    await store.close();
+    store = new SqliteTrainingStore({ path: paths.path });
+    assert.deepEqual(
+      (await store.getLuoguSyncState(alice.account.id))?.value.failure,
+      legacy,
+      'the reopened store still reports the legacy four-field failure without a stage',
+    );
+  } finally {
+    await store.close();
     fx.removeDirectory(paths.dir);
   }
 });

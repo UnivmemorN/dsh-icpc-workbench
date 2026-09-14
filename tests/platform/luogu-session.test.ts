@@ -4,7 +4,9 @@
  * Everything here is synthetic and in-process: a fake HTTP harness, synthetic session strings and
  * original fixture records. No network, no real credential, no download. The synthetic
  * `__client_id` is an opaque session identifier deliberately unequal to any account UID, because
- * that is what the real cookie is. The tests pin down the properties the contract promises: exact
+ * that is what the real cookie is, and the fixture also carries an unrelated `__session` secret so
+ * every dispatch assertion proves a whole-Cookie input is normalized to the two required cookies.
+ * The tests pin down the properties the contract promises: exact
  * row limits and cursor continuation without loss or duplication, inclusive `since`, scope-bound
  * and drift-checked cursors, rejudge tolerance, account and record identity rejection, the exact
  * authenticated target (login redirects classified without a dispatch, alternate path/UID/page
@@ -17,6 +19,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   LUOGU_MAX_SUBMISSION_LIMIT,
+  LUOGU_UID_PATTERN,
   LuoguAdapter,
   createAuthenticatedLuoguFetch,
   createLuoguAccount,
@@ -44,9 +47,13 @@ import { PlatformError } from '../../src/application/platform-errors.js';
 import type { PlatformLimits } from '../../src/application/ports.js';
 import {
   DomainError,
+  LUOGU_SESSION_UID_PATTERN,
   createAccount,
   createCancellationSource,
   createSourceInstance,
+  inspectLuoguSessionCookie,
+  luoguSessionCookieFromClientId,
+  normalizeLuoguSessionCookie,
   type Submission,
 } from '../../src/domain/index.js';
 import {
@@ -71,6 +78,8 @@ const SESSION_SECRET = 'synthetic-session-secret-0123456789abcdef';
 const CLIENT_ID = 'b7f1c0a94e2d4f6a8c1b3d5e7f901234';
 const OTHER_CLIENT_ID = 'c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6';
 const COOKIE = `__client_id=${CLIENT_ID}; _uid=${UID}; __session=${SESSION_SECRET}`;
+/** The canonical pair every accepted session is reduced to before it can travel. */
+const CANONICAL_COOKIE = `__client_id=${CLIENT_ID}; _uid=${UID}`;
 const SESSION: LuoguSession = { uid: UID, cookie: COOKIE };
 const SOURCE = luoguSourceInstance();
 const ACCOUNT = createLuoguAccount(SOURCE, UID, 'Synthetic User');
@@ -324,7 +333,10 @@ test('an exact limit pages across server pages without loss or duplication and k
   assert.deepEqual(h.waits, [2000, 2000, 2000, 2000, 2000]);
   for (const request of h.requests) {
     assert.equal(new URL(request.url).searchParams.get('user'), UID);
-    assert.equal(request.init.headers.cookie, COOKIE);
+    // The session is normalized: exactly the two required cookies travel, and the unrelated
+    // `__session` secret never leaves the process.
+    assert.equal(request.init.headers.cookie, CANONICAL_COOKIE);
+    assert.equal(request.init.headers.cookie?.includes(SESSION_SECRET), false);
     assert.equal(request.init.headers['x-lentille-request'], 'content-only');
     assert.equal(request.init.credentials, 'omit');
     assert.equal(request.init.redirect, 'manual');
@@ -664,8 +676,14 @@ test('the session must belong to the selected account and never leaks into an er
     { uid: UID, cookie: `__client_id=${OTHER_CLIENT_ID}; _uid=${OTHER_UID}; __session=${SESSION_SECRET}` },
     { uid: UID, cookie: `_uid=${UID}; __session=${SESSION_SECRET}` },
     { uid: UID, cookie: `${COOKIE}\r\nx-injected: 1` },
-    { uid: UID, cookie: ` ${COOKIE}` },
+    // The raw control check runs before trimming: a leading or trailing CR/LF/TAB is refused too.
+    { uid: UID, cookie: `${COOKIE}\r\n` },
+    { uid: UID, cookie: `\n${COOKIE}` },
+    { uid: UID, cookie: `\t${COOKIE}` },
     { uid: UID, cookie: `__client_id=${CLIENT_ID}; _uid=${OTHER_UID}` },
+    { uid: UID, cookie: `${COOKIE}; __client_id=${OTHER_CLIENT_ID}` },
+    { uid: UID, cookie: `__client_id=${CLIENT_ID}; _uid=` },
+    { uid: UID, cookie: `__client_id=${CLIENT_ID}; _uid=00123` },
   ];
   for (const session of cases) {
     const reader = readerFor(h, sessionProvider(session));
@@ -677,30 +695,54 @@ test('the session must belong to the selected account and never leaks into an er
   }
   assert.equal(h.requests.length, 0, 'a foreign or unusable session is refused before any request');
 
+  // Copying the whole request-header line is accepted: an outer space or a `Cookie:` name is
+  // unwrapped, never pasted into the outgoing header.
+  for (const cookie of [` ${COOKIE} `, `Cookie: ${COOKIE}`, `cookie:${COOKIE}`]) {
+    const page = await readerFor(h, sessionProvider({ uid: UID, cookie })).listSubmissions({
+      account: ACCOUNT,
+      cursor: null,
+      limit: 2,
+      token,
+      limits: LIMITS,
+    });
+    assert.equal(page.items.length, 2);
+  }
+  assert.ok(h.requests.every((request) => request.init.headers.cookie === CANONICAL_COOKIE));
+
   const failedProvider: LuoguSessionProvider = {
     sessionFor: async () => {
       throw new Error(`credential read failed for ${COOKIE}`);
     },
   };
+  const requestsBefore = h.requests.length;
   const providerError = await rejectsWithCode(
     readerFor(h, failedProvider).listSubmissions({ account: ACCOUNT, cursor: null, limit: 2, token, limits: LIMITS }),
     'unavailable',
   );
   assertNoSecret(providerError);
-  assert.equal(h.requests.length, 0);
+  assert.equal(h.requests.length, requestsBefore, 'a failing provider dispatches nothing');
 });
 
-test('__client_id is opaque: the account binds through the required _uid cookie', () => {
+test('__client_id is opaque: normalization keeps exactly two cookies and binds through _uid', () => {
   assert.notEqual(CLIENT_ID, UID, 'the fixture client id must not be the UID');
-  const accepted: readonly string[] = [
-    `__client_id=${CLIENT_ID}; _uid=${UID}; __session=${SESSION_SECRET}`,
-    `_uid=${UID}; __client_id=${CLIENT_ID}`,
-    `__client_id=${'f'.repeat(64)}; _uid=${UID}`,
+  // The domain normalizer mirrors the adapter's canonical UID pattern; keep the two identical.
+  assert.equal(LUOGU_SESSION_UID_PATTERN.source, LUOGU_UID_PATTERN.source);
+
+  const accepted: readonly (readonly [string, string])[] = [
+    [COOKIE, CANONICAL_COOKIE],
+    [`_uid=${UID}; __client_id=${CLIENT_ID}`, CANONICAL_COOKIE],
+    [`__client_id=${'f'.repeat(64)}; _uid=${UID}`, `__client_id=${'f'.repeat(64)}; _uid=${UID}`],
+    [`Cookie: ${COOKIE}`, CANONICAL_COOKIE],
+    [`  ${COOKIE}  `, CANONICAL_COOKIE],
+    // An unrelated segment without `=` is not a required name, so it is discarded like any other
+    // unrelated cookie instead of making a whole-header paste unusable.
+    [`__client_id=${CLIENT_ID}; _uid=${UID}; not-a-pair`, CANONICAL_COOKIE],
+    [`__client_id=${CLIENT_ID}; _uid=${UID}; theme=dark; __cf_bm=abc`, CANONICAL_COOKIE],
   ];
-  for (const cookie of accepted) {
+  for (const [cookie, canonical] of accepted) {
     assert.equal(
       requireLuoguSessionCookie({ uid: UID, cookie }, UID),
-      cookie,
+      canonical,
       'an opaque __client_id different from the UID is a valid session',
     );
   }
@@ -714,9 +756,10 @@ test('__client_id is opaque: the account binds through the required _uid cookie'
     `__client_id=${CLIENT_ID}; _uid=`,
     `__client_id=${CLIENT_ID}; _uid=${OTHER_UID}`,
     `__client_id=${CLIENT_ID}; _uid=00123`,
-    `__client_id=${CLIENT_ID}; _uid=${UID}; not-a-pair`,
     `__client_id=has space; _uid=${UID}`,
+    `__client_id=${'a'.repeat(257)}; _uid=${UID}`,
     `__client_id=${CLIENT_ID}\r\nx-injected: 1; _uid=${UID}`,
+    `__client_id=${CLIENT_ID}; _uid=${UID};${'x'.repeat(16 * 1024)}`,
   ];
   for (const cookie of rejected) {
     let error: unknown = null;
@@ -725,7 +768,7 @@ test('__client_id is opaque: the account binds through the required _uid cookie'
     } catch (cause) {
       error = cause;
     }
-    assert.notEqual(error, null, `the ambiguous or unusable cookie must be refused: ${cookie}`);
+    assert.notEqual(error, null, `the ambiguous or unusable cookie must be refused: ${cookie.slice(0, 40)}`);
     assert.equal(codeOf(error), 'invalid_input');
     assertNoSecret(error);
   }
@@ -733,6 +776,57 @@ test('__client_id is opaque: the account binds through the required _uid cookie'
     () => requireLuoguSessionCookie({ uid: OTHER_UID, cookie: `__client_id=${CLIENT_ID}; _uid=${UID}` }, UID),
     (error: unknown) => codeOf(error) === 'invalid_input',
   );
+});
+
+test('a leading or trailing CR/LF/TAB is refused before trimming, while outer spaces still unwrap', () => {
+  const canonical = `__client_id=${CLIENT_ID}; _uid=${UID}`;
+  // The control check runs on the ORIGINAL raw text, before `trim()`: a pasted header line that
+  // starts or ends with a control character is injection-shaped input and must be refused instead
+  // of being silently trimmed into a valid pair.
+  for (const control of ['\n', '\r', '\r\n', '\t', '\u000b', '\u0000']) {
+    for (const raw of [`${control}${canonical}`, `${canonical}${control}`, `${control}${canonical}${control}`]) {
+      const normalized = normalizeLuoguSessionCookie(raw, UID);
+      assert.equal(normalized.ok, false, `a ${JSON.stringify(control)} edge must be refused`);
+      assert.equal(normalized.ok ? null : normalized.problem, 'unsafe_characters');
+      const inspected = inspectLuoguSessionCookie(raw);
+      assert.equal(inspected.ok, false);
+      assert.equal(inspected.ok ? null : inspected.problem, 'unsafe_characters');
+      assert.ok(!(normalized.ok ? '' : normalized.detail).includes(CLIENT_ID), 'a refusal never echoes the value');
+    }
+  }
+  // A control character *inside* the pair stays refused exactly as before.
+  const inside = normalizeLuoguSessionCookie(`__client_id=${CLIENT_ID};\n_uid=${UID}`, UID);
+  assert.equal(inside.ok, false);
+  assert.equal(inside.ok ? null : inside.problem, 'unsafe_characters');
+
+  // Outer spaces and a `Cookie:` prefix remain accepted, and are still unwrapped to the pair.
+  assert.equal(normalizeLuoguSessionCookie(`  ${canonical}  `, UID).ok, true);
+  assert.equal(normalizeLuoguSessionCookie(`Cookie: ${canonical}`, UID).ok, true);
+  assert.equal(normalizeLuoguSessionCookie(`  Cookie:  ${canonical}  `, UID).ok, true);
+
+  // The two-field mode takes the client id verbatim, so a control character was never trimmed there.
+  const fromValue = luoguSessionCookieFromClientId(`\t${CLIENT_ID}`, UID);
+  assert.equal(fromValue.ok, false);
+  assert.equal(fromValue.ok ? null : fromValue.problem, 'unsafe_characters');
+});
+
+test('a dispatched session carries exactly the two cookies of the record request', async () => {
+  const h = harness({ '/record/list': pagedRoute(history(2), 2) });
+  const cookie = `Cookie: __cf_bm=abc; _uid=${UID}; theme=dark; __client_id=${CLIENT_ID}; __session=${SESSION_SECRET}`;
+  const page = await readerFor(h, sessionProvider({ uid: UID, cookie })).listSubmissions({
+    account: ACCOUNT,
+    cursor: null,
+    limit: 2,
+    token: createCancellationSource().token,
+    limits: LIMITS,
+  });
+  assert.equal(page.items.length, 2);
+  assert.equal(h.requests.length, 1, 'one server page answers the two requested rows');
+  assert.equal(h.requests[0]!.init.headers.cookie, CANONICAL_COOKIE);
+  const sent = h.requests[0]!.init.headers.cookie ?? '';
+  assert.equal(sent.includes(SESSION_SECRET), false, 'the unrelated secret never travels');
+  assert.equal(sent.includes('__cf_bm'), false, 'an unrelated cookie is discarded');
+  assert.equal(sent.includes('theme'), false, 'an unrelated cookie is discarded');
 });
 
 test('account, limit, since and record-identity validation all happen before or atomically with a page', async () => {
@@ -1158,7 +1252,7 @@ test('a transient fetch rejection is retried under the configured budget and sta
   assert.equal(transient.requests.length, 2, 'the transient rejection was retried exactly once');
   assert.deepEqual(transient.waits, [2000], 'the authenticated pacing floor spaces the retry');
   for (const request of transient.requests) {
-    assert.equal(request.init.headers.cookie, COOKIE, 'the retry re-attaches the session');
+    assert.equal(request.init.headers.cookie, CANONICAL_COOKIE, 'the retry re-attaches the normalized session');
     assert.equal(request.url.includes(SESSION_SECRET), false, 'the session never enters the target');
   }
 
@@ -1463,7 +1557,7 @@ test('an overlapping same-account scan is refused before credentials and cannot 
   );
   assert.equal(page.nextCursor, null);
   assert.ok(h.requests.length >= 3, 'the owning scan continued past the rejected overlap');
-  assert.ok(h.requests.every((request) => request.init.headers.cookie === COOKIE));
+  assert.ok(h.requests.every((request) => request.init.headers.cookie === CANONICAL_COOKIE));
 });
 
 test('a cancelled and a failed scan both release the account slot and their session', async () => {
@@ -1498,8 +1592,8 @@ test('a cancelled and a failed scan both release the account slot and their sess
   source.cancel('stop mid scan');
   await rejectsWithCode(pending, 'cancelled');
 
-  const fresh = `__client_id=${CLIENT_ID}; _uid=${UID}; __session=fresh-${SESSION_SECRET}`;
-  cookieValue = fresh;
+  const freshClientId = 'fresh-client-id-0123456789';
+  cookieValue = `__client_id=${freshClientId}; _uid=${UID}; __session=fresh-${SESSION_SECRET}`;
   const resumed = await reader.listSubmissions({
     account: ACCOUNT,
     cursor: null,
@@ -1511,7 +1605,11 @@ test('a cancelled and a failed scan both release the account slot and their sess
     resumed.items.map((submission) => submission.externalId),
     ['9000', '8999'],
   );
-  assert.equal(h.requests[h.requests.length - 1]!.init.headers.cookie, fresh, 'the next call binds its own session');
+  assert.equal(
+    h.requests[h.requests.length - 1]!.init.headers.cookie,
+    `__client_id=${freshClientId}; _uid=${UID}`,
+    'the next call binds its own session',
+  );
 
   // An error path releases the slot too: the later identical call is not mistaken for an overlap.
   const failing = harness({ '/record/list': () => jsonResponse({}, 403) });

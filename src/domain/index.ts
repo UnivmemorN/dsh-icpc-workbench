@@ -430,3 +430,6 @@ export * from './virtual-performance.js';
 // AI-inferred ability assessment reports (Sprint 18d1): the strictly bounded answer shape, its
 // evidence-reference/anchor rules and the labelled, hash-checked stored record.
 export * from './assessment.js';
+// Two-cookie Luogu session normalization (Stage 19a): the single pure rule shared by the browser
+// half, the connect route, the connection adapter and the authenticated reader.
+export * from './luogu-session-cookie.js';

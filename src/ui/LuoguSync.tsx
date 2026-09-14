@@ -14,16 +14,21 @@ import {
   LUOGU_AC_EVIDENCE_NOTE,
   LUOGU_AI_CHAT_WARNING,
   LUOGU_AUTOMATION_NOTE,
+  LUOGU_CLIENT_ID_HELP,
   LUOGU_COOKIE_GUIDE,
   LUOGU_DISCONNECT_NOTE,
+  LUOGU_FULL_COOKIE_HELP,
+  LUOGU_FULL_COOKIE_TOGGLE,
   LUOGU_INTERVAL_MAX_MINUTES,
   LUOGU_INTERVAL_MIN_MINUTES,
   LUOGU_MANUAL_STILL_AVAILABLE,
   LUOGU_PHASE_LABELS,
   LUOGU_POLL_IDLE_MS,
   LUOGU_RECENT_WINDOW_NOTE,
+  LUOGU_SECRET_MEMORY_NOTE,
   LUOGU_SECRET_STORAGE_NOTE,
   LUOGU_START_OUTCOMES,
+  LUOGU_UID_DISPLAY_NOTE,
   checkLuoguSessionCookie,
   luoguAttemptSummary,
   luoguBacklogSummary,
@@ -32,6 +37,7 @@ import {
   luoguFailureGuidance,
   luoguHistoryCoverage,
   luoguHistoryCoverageLabel,
+  luoguLoginCheckSummary,
   luoguNextRunSummary,
   luoguPanelState,
   luoguPollDelayMs,
@@ -44,6 +50,7 @@ import {
   luoguUnsupportedOsNote,
   type LuoguAction,
   type LuoguControl,
+  type LuoguSecretMode,
   type LuoguSettingsDraft,
   type LuoguSyncProgressState,
 } from './luogu-view.js';
@@ -61,9 +68,12 @@ import {
  * - **The durable status is the only state.** Every control's availability is derived from the last
  *   status answer ({@link luoguControls}), so remounting the page re-derives the same controls, and a
  *   running pass that the host owns is neither cleared nor restarted by navigation.
- * - **The session draft is memory-only.** It lives in this component, is submitted only to
- *   `luogu.connect`, is cleared before that request settles (and again on account switch or unmount),
- *   is never written to `localStorage`/`sessionStorage` and is never echoed in a message or an error.
+ * - **The session draft is memory-only.** It lives in this component in one of two modes — the
+ *   `__client_id` **value** (default) or an optional whole-Cookie paste — and the `_uid` is never
+ *   typed: it is the readonly UID of the selected account. The draft is submitted only to
+ *   `luogu.connect`, is cleared before that request settles (and again on account switch, mode switch
+ *   or unmount), is never written to `localStorage`/`sessionStorage` and is never echoed in a message
+ *   or an error.
  * - **Safe polling.** `luogu.status` is polled only while this panel is mounted, only while something
  *   can actually change (a reserved/running pass, or automation that may start one), and each read is
  *   aborted by `useRequest` when the account changes or the panel unmounts, so a stale answer cannot
@@ -91,7 +101,9 @@ export function LuoguSyncPanel({
   const value = status.data;
   const hostAction = useAction();
   const [pending, setPending] = useState<LuoguAction | null>(null);
-  const [cookie, setCookie] = useState('');
+  const [secretMode, setSecretMode] = useState<LuoguSecretMode>('client_id');
+  const [clientId, setClientId] = useState('');
+  const [fullCookie, setFullCookie] = useState('');
   const [fullConfirm, setFullConfirm] = useState(false);
   const [draft, setDraft] = useState<LuoguSettingsDraft | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -99,7 +111,9 @@ export function LuoguSyncPanel({
   // A draft is never carried into another account: switching accounts clears the secret immediately,
   // and unmount clears it by dropping the only copy that exists.
   useEffect(() => {
-    setCookie('');
+    setSecretMode('client_id');
+    setClientId('');
+    setFullCookie('');
     setFullConfirm(false);
     setMessage(null);
   }, [accountId]);
@@ -147,7 +161,14 @@ export function LuoguSyncPanel({
   const pollDelay = luoguPollDelayMs(value, pending === 'start' || pending === 'reconcile');
   usePollAfterSettle(pollDelay !== null, status.pending, status.refresh, pollDelay ?? LUOGU_POLL_IDLE_MS);
 
-  const secret = checkLuoguSessionCookie(cookie);
+  // The draft is checked against the same pure rule the server uses; `secret.cookie` is the canonical
+  // pair to submit and `value.uid` is the only source of the `_uid` binding.
+  const secret = checkLuoguSessionCookie({
+    mode: secretMode,
+    selectedUid: value?.uid ?? null,
+    clientId,
+    fullCookie,
+  });
   const settingsDirty = draft !== null && luoguSettingsDirty(value, draft);
   const controls = luoguControls({
     status: value,
@@ -174,13 +195,14 @@ export function LuoguSyncPanel({
 
   function connect(): void {
     const target = accountId;
-    if (target === null) {
+    const submitted = secret.cookie;
+    if (target === null || submitted === null) {
       return;
     }
-    const submitted = cookie;
     // Cleared before the request settles: the draft must not survive an attempted submission, and it
     // is never rendered again — not in the success message, not in an error, not in a title.
-    setCookie('');
+    setClientId('');
+    setFullCookie('');
     void submit('connect', async (signal) => {
       await api.request('luogu.connect', { accountId: target, sessionCookie: submitted }, signal);
       setMessage('登录凭据已保存在本机凭据管理器，并用一次真实读取检查过登录。');
@@ -203,7 +225,8 @@ export function LuoguSyncPanel({
     if (target === null) {
       return;
     }
-    setCookie('');
+    setClientId('');
+    setFullCookie('');
     void submit('disconnect', async (signal) => {
       await api.request('luogu.disconnect', { accountId: target }, signal);
       setMessage(LUOGU_DISCONNECT_NOTE);
@@ -299,6 +322,9 @@ export function LuoguSyncPanel({
   } else {
     const connectionReason = disabledReason(controls.connect, controls.probe, controls.disconnect);
     const syncReason = disabledReason(controls.start, controls.reconcile, controls.cancel);
+    // A login check newer than the failure is shown as a successful check *now*; it never retracts
+    // the failure and is never rendered as a successful synchronization.
+    const loginCheck = luoguLoginCheckSummary(value);
     body = (
       <>
         <p className="icpc-muted">
@@ -337,21 +363,69 @@ export function LuoguSyncPanel({
               <Notice>{luoguUnsupportedOsNote(value.connectionPlatform)}</Notice>
             ) : (
               <>
-                <label htmlFor="icpc-luogu-cookie">登录凭据（Cookie 值，只在本机使用）</label>
+                <label htmlFor="icpc-luogu-uid">洛谷 UID（_uid，只读）</label>
                 <input
-                  id="icpc-luogu-cookie"
-                  type="password"
-                  value={cookie}
-                  autoComplete="off"
-                  spellCheck={false}
-                  placeholder="粘贴浏览器请求里 Cookie 的完整值"
-                  aria-invalid={secret.message === null ? undefined : true}
-                  aria-describedby="icpc-luogu-cookie-help"
-                  onChange={(event) => setCookie(event.target.value)}
+                  id="icpc-luogu-uid"
+                  type="text"
+                  value={value.uid}
+                  readOnly
+                  aria-describedby="icpc-luogu-uid-help"
                 />
-                <small className="icpc-muted" id="icpc-luogu-cookie-help">
-                  这个输入框只存在于当前页面内存：提交尝试、切换账号或离开本页后都会清空，出错信息也不会回显它。
+                <small className="icpc-muted" id="icpc-luogu-uid-help">
+                  {LUOGU_UID_DISPLAY_NOTE}
                 </small>
+                {secretMode === 'client_id' ? (
+                  <>
+                    <label htmlFor="icpc-luogu-client-id">__client_id 的值（只在本机使用）</label>
+                    <input
+                      id="icpc-luogu-client-id"
+                      type="password"
+                      value={clientId}
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder="只粘贴 Value（值）一列"
+                      aria-invalid={secret.message === null ? undefined : true}
+                      aria-describedby="icpc-luogu-client-id-help"
+                      onChange={(event) => setClientId(event.target.value)}
+                    />
+                    <small className="icpc-muted" id="icpc-luogu-client-id-help">
+                      {LUOGU_CLIENT_ID_HELP}
+                    </small>
+                  </>
+                ) : (
+                  <>
+                    <label htmlFor="icpc-luogu-cookie">整段 Cookie 值（高级，只在本机使用）</label>
+                    <input
+                      id="icpc-luogu-cookie"
+                      type="password"
+                      value={fullCookie}
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder="粘贴浏览器请求里 Cookie 的完整值"
+                      aria-invalid={secret.message === null ? undefined : true}
+                      aria-describedby="icpc-luogu-cookie-help"
+                      onChange={(event) => setFullCookie(event.target.value)}
+                    />
+                    <small className="icpc-muted" id="icpc-luogu-cookie-help">
+                      {LUOGU_FULL_COOKIE_HELP}
+                    </small>
+                  </>
+                )}
+                <label className="icpc-check">
+                  <input
+                    type="checkbox"
+                    checked={secretMode === 'full_cookie'}
+                    onChange={(event) => {
+                      // Switching the input mode drops whatever was typed: the two shapes are not
+                      // interchangeable, and neither draft may survive the switch.
+                      setSecretMode(event.target.checked ? 'full_cookie' : 'client_id');
+                      setClientId('');
+                      setFullCookie('');
+                    }}
+                  />
+                  {LUOGU_FULL_COOKIE_TOGGLE}
+                </label>
+                <small className="icpc-muted">{LUOGU_SECRET_MEMORY_NOTE}</small>
                 {secret.message !== null && (
                   <small className="icpc-field-error" role="alert">
                     {secret.message}
@@ -408,7 +482,15 @@ export function LuoguSyncPanel({
             <h3>同步</h3>
             <p>{luoguProgressSummary(value)}</p>
             <p>{luoguHistoryCoverage(value)}</p>
+            {/* This line is the panel's failure advice: it is rendered from the stage-aware helper,
+                so a metadata failure can never be described here as an expired cookie, and a legacy
+                record without a stage keeps the neutral wording. */}
             <p>{luoguAttemptSummary(value)}</p>
+            {loginCheck !== null && (
+              <p className="icpc-muted" role="status">
+                {loginCheck}
+              </p>
+            )}
             <p>{luoguBacklogSummary(value)}</p>
             <p>{luoguNextRunSummary(value)}</p>
             {value.closing && (

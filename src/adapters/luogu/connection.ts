@@ -56,9 +56,11 @@ import { randomUUID } from 'node:crypto';
 import {
   DomainError,
   invariant,
+  normalizeLuoguSessionCookie,
   throwIfCancelled,
   type Account,
   type CancellationToken,
+  type LuoguCookieProblem,
   type SourceInstance,
 } from '../../domain/index.js';
 import type { SyncPageSource } from '../../application/import-types.js';
@@ -193,8 +195,10 @@ function missingSession(accountId: string): PlatformError {
  * Credential provider over the **current** connection row and vault entry.
  *
  * Every call re-reads both, so a reconnect, a probe or a forget performed between two reader calls
- * is observed immediately; a cached cookie would let a removed session keep working. The returned
- * secret is handed to the reader only.
+ * is observed immediately; a cached cookie would let a removed session keep working. The stored
+ * value is normalized to the canonical `__client_id=…; _uid=…` pair on every read — a legacy
+ * whole-Cookie entry therefore keeps working without being rewritten — and only that pair is handed
+ * to the reader. A stored value that cannot yield a usable session is an authentication wall.
  */
 export function createStoredLuoguSessionProvider(
   options: StoredLuoguSessionProviderOptions,
@@ -215,11 +219,17 @@ export function createStoredLuoguSessionProvider(
       if (requireConnected && record.value.status !== 'connected') {
         throw missingSession(account.id);
       }
-      const cookie = await options.vault.read(record.value.reference, token);
-      if (typeof cookie !== 'string' || cookie.length === 0) {
+      const stored = await options.vault.read(record.value.reference, token);
+      if (typeof stored !== 'string' || stored.length === 0) {
         throw missingSession(account.id);
       }
-      return { uid: account.handle, cookie };
+      // Normalized on every read: the vault is never rewritten just to change the shape of a legacy
+      // whole-Cookie entry, and only the two required cookies reach the authenticated reader.
+      const normalized = normalizeLuoguSessionCookie(stored, account.handle);
+      if (!normalized.ok) {
+        throw missingSession(account.id);
+      }
+      return { uid: account.handle, cookie: normalized.cookie };
     },
   };
 }
@@ -305,20 +315,44 @@ function mapConnectionSaveFailure(error: unknown): LuoguConnectionError {
   return new LuoguConnectionError('busy', 'the connection could not be persisted', { reason: 'persistence' });
 }
 
-/** Validate the supplied cookie value and its credential-store capacity before any write. */
-function requireCookieText(value: unknown): string {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new LuoguConnectionError('invalid_input', 'a non-empty Luogu session cookie value is required');
+/** Fixed, secret-free reason text per unusable supplied session; it never quotes the supplied value. */
+const COOKIE_FAILURES: Readonly<Record<LuoguCookieProblem, string>> = {
+  not_text: 'a non-empty Luogu session cookie value is required',
+  empty: 'a non-empty Luogu session cookie value is required',
+  too_long: 'the supplied Luogu session cookie value is too long',
+  unsafe_characters: 'the supplied Luogu session cookie value contains control characters',
+  missing_client_id: 'the supplied Luogu session carries no __client_id',
+  missing_uid: 'the supplied Luogu session carries no _uid',
+  duplicate_client_id: 'the supplied Luogu session repeats __client_id',
+  duplicate_uid: 'the supplied Luogu session repeats _uid',
+  unusable_client_id: 'the supplied Luogu session __client_id is not a syntactically safe opaque value',
+  unusable_uid: 'the supplied Luogu session _uid is not a canonical Luogu UID',
+  uid_not_canonical: 'the selected account has no canonical Luogu UID',
+  foreign_uid: 'the supplied Luogu session belongs to another account',
+};
+
+/**
+ * Normalize and validate the supplied session value before any credential work.
+ *
+ * A whole browser Cookie header is accepted, but only the two required cookies survive: what reaches
+ * the vault is the canonical pair, so an unrelated cookie can neither be stored nor make the value
+ * exceed the credential store's capacity. The **normalized** size is what is checked against
+ * {@link MAX_CREDENTIAL_SECRET_BYTES}; the raw input is bounded by the pure domain normalizer.
+ */
+function requireCookieText(value: unknown, uid: string): string {
+  const normalized = normalizeLuoguSessionCookie(value, uid);
+  if (!normalized.ok) {
+    throw new LuoguConnectionError('invalid_input', COOKIE_FAILURES[normalized.problem]);
   }
   try {
-    requireCredentialSecret(value);
+    requireCredentialSecret(normalized.cookie);
   } catch {
     throw new LuoguConnectionError(
       'invalid_input',
-      `the Luogu session cookie exceeds the ${MAX_CREDENTIAL_SECRET_BYTES} byte credential capacity`,
+      `the normalized Luogu session cookie exceeds the ${MAX_CREDENTIAL_SECRET_BYTES} byte credential capacity`,
     );
   }
-  return value;
+  return normalized.cookie;
 }
 
 /**
@@ -392,7 +426,7 @@ export class LuoguConnectionAdapter implements LuoguConnectionManager {
     throwIfCancelled(token);
     this.requireSupported();
     const account = await this.requireAccount(request.accountId);
-    const cookie = requireCookieText(request.sessionCookie);
+    const cookie = requireCookieText(request.sessionCookie, account.handle);
 
     const previous = await this.store.getLuoguConnection(account.id);
     // Recover what an interrupted connect left behind before a new credential is created. The

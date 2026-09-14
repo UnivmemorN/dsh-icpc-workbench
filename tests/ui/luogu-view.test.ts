@@ -15,25 +15,34 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   LUOGU_FAILURE_GUIDANCE,
+  LUOGU_FAILURE_STAGE_LABELS,
+  LUOGU_HISTORY_FAILURE_GUIDANCE,
   LUOGU_HISTORY_STATE_LABELS,
   LUOGU_INTERVAL_MAX_MINUTES,
   LUOGU_INTERVAL_MIN_MINUTES,
   LUOGU_MANUAL_STILL_AVAILABLE,
+  LUOGU_METADATA_FAILURE_GUIDANCE,
   LUOGU_POLL_ACTIVE_MS,
   LUOGU_POLL_IDLE_MS,
   LUOGU_RECENT_WINDOW_NOTE,
-  LUOGU_SECRET_MAX_BYTES,
   LUOGU_START_OUTCOMES,
   LUOGU_AI_CHAT_WARNING,
+  LUOGU_CLIENT_ID_HELP,
   LUOGU_COOKIE_GUIDE,
+  LUOGU_FULL_COOKIE_HELP,
+  LUOGU_FULL_COOKIE_TOGGLE,
+  LUOGU_SECRET_MEMORY_NOTE,
   LUOGU_SECRET_STORAGE_NOTE,
+  LUOGU_UID_DISPLAY_NOTE,
   checkLuoguSessionCookie,
   luoguAttemptSummary,
   luoguBacklogSummary,
   luoguControls,
+  luoguFailureGuidance,
   luoguHistoryCoverage,
   luoguHistoryCoverageLabel,
   luoguHistoryState,
+  luoguLoginCheckSummary,
   luoguNextRunSummary,
   luoguPanelState,
   luoguPollDelayMs,
@@ -41,14 +50,19 @@ import {
   luoguSettingsDirty,
   luoguSettingsDraft,
   luoguSettingsPatch,
+  luoguSyncFailureGuidance,
   luoguTime,
   luoguUnsupportedOsNote,
+  type LuoguSecretDraft,
 } from '../../src/ui/luogu-view.js';
 import {
   LUOGU_SYNC_FAILURE_CODES,
   LUOGU_SYNC_INTERVAL_MAX_MINUTES,
   LUOGU_SYNC_INTERVAL_MIN_MINUTES,
+  type LuoguSyncFailure,
 } from '../../src/application/luogu-sync-types.js';
+import { MAX_CREDENTIAL_SECRET_BYTES } from '../../src/application/local-credential-vault.js';
+import { MAX_LUOGU_COOKIE_INPUT_BYTES } from '../../src/domain/luogu-session-cookie.js';
 import type { ApiLuoguStatusView } from '../../src/application/workbench-api.js';
 
 const AT = '2026-03-01T10:00:00.000Z';
@@ -121,7 +135,11 @@ function controls(
 void test('the mirrored interval bounds still match the application module', () => {
   assert.equal(LUOGU_INTERVAL_MIN_MINUTES, LUOGU_SYNC_INTERVAL_MIN_MINUTES);
   assert.equal(LUOGU_INTERVAL_MAX_MINUTES, LUOGU_SYNC_INTERVAL_MAX_MINUTES);
-  assert.equal(LUOGU_SECRET_MAX_BYTES, 2560, 'the OS credential blob bound is the documented one');
+  assert.equal(MAX_LUOGU_COOKIE_INPUT_BYTES, 16 * 1024, 'the bounded raw paste is the documented 16 KiB');
+  // What storage sees is the *normalized* pair, so even the largest possible one — a 256-character
+  // client id and a 20-digit uid — is far below the OS credential blob bound.
+  const maximal = `__client_id=${'a'.repeat(256)}; _uid=${'9'.repeat(20)}`;
+  assert.ok(new TextEncoder().encode(maximal).length < MAX_CREDENTIAL_SECRET_BYTES);
 });
 
 void test('every failure code has its own fixed next-action sentence', () => {
@@ -141,27 +159,74 @@ void test('the panel only reads a status for a selected Luogu account', () => {
   assert.equal(luoguPanelState(true, 'luogu'), 'ready');
 });
 
-void test('the session draft stays memory-only and is refused with a fixed sentence', () => {
-  assert.deepEqual(checkLuoguSessionCookie(''), { state: 'empty', message: null });
-  assert.deepEqual(checkLuoguSessionCookie('   '), { state: 'empty', message: null });
-  assert.equal(checkLuoguSessionCookie('_uid=800001; __client_id=abc').state, 'valid');
-  assert.equal(checkLuoguSessionCookie('x'.repeat(LUOGU_SECRET_MAX_BYTES)).state, 'valid');
+/** One session draft in the default two-field mode, so each case states only what it is about. */
+function secretDraft(overrides: Partial<LuoguSecretDraft> = {}): LuoguSecretDraft {
+  return { mode: 'client_id', selectedUid: '800001', clientId: '', fullCookie: '', ...overrides };
+}
 
-  const draft = '_uid=800001; __client_id=SECRET-MARKER';
-  const tooManyBytes = draft + 'x'.repeat(LUOGU_SECRET_MAX_BYTES);
+void test('the session draft normalizes to the two required cookies and is refused with a fixed sentence', () => {
+  assert.deepEqual(checkLuoguSessionCookie(secretDraft()), { state: 'empty', message: null, cookie: null });
+  assert.deepEqual(checkLuoguSessionCookie(secretDraft({ mode: 'full_cookie', fullCookie: '   ' })), {
+    state: 'empty',
+    message: null,
+    cookie: null,
+  });
+
+  // The default mode takes the __client_id VALUE; the _uid is filled from the selected account.
+  const value = checkLuoguSessionCookie(secretDraft({ clientId: 'b7f1c0a94e2d4f6a8c1b3d5e7f901234' }));
+  assert.equal(value.state, 'valid');
+  assert.equal(value.message, null);
+  assert.equal(value.cookie, '__client_id=b7f1c0a94e2d4f6a8c1b3d5e7f901234; _uid=800001');
+
+  // The advanced mode accepts a whole `Cookie:` header line and keeps only the two session cookies.
+  const full = checkLuoguSessionCookie(
+    secretDraft({ mode: 'full_cookie', fullCookie: 'Cookie: _uid=800001; __client_id=abc; __session=SECRET-MARKER' }),
+  );
+  assert.equal(full.state, 'valid');
+  assert.equal(full.cookie, '__client_id=abc; _uid=800001');
+
+  // A stored/whole header far above the credential blob limit still normalizes to a pair that fits.
+  const huge = checkLuoguSessionCookie(
+    secretDraft({ mode: 'full_cookie', fullCookie: `_uid=800001; __client_id=abc; __unrelated=${'y'.repeat(3_000)}` }),
+  );
+  assert.equal(huge.state, 'valid');
+  assert.ok(new TextEncoder().encode(huge.cookie ?? '').length < MAX_CREDENTIAL_SECRET_BYTES);
+
+  // The readonly selected account is the only source of the binding: another uid is refused, and so
+  // is a draft checked before an account is selected.
+  assert.equal(
+    checkLuoguSessionCookie(secretDraft({ mode: 'full_cookie', fullCookie: '_uid=800002; __client_id=abc' })).state,
+    'invalid',
+  );
+  assert.equal(checkLuoguSessionCookie(secretDraft({ selectedUid: null, clientId: 'abc' })).state, 'invalid');
+
   const refused = [
-    checkLuoguSessionCookie(tooManyBytes),
-    checkLuoguSessionCookie('_uid=800001;\n__client_id=secret'),
-    checkLuoguSessionCookie('_uid=800001;\u0000__client_id=secret'),
+    checkLuoguSessionCookie(secretDraft({ selectedUid: null, clientId: 'abc' })),
+    checkLuoguSessionCookie(secretDraft({ clientId: 'SECRET-MARKER;x' })),
+    checkLuoguSessionCookie(secretDraft({ clientId: '洛'.repeat(900) })),
+    checkLuoguSessionCookie(secretDraft({ clientId: '__client_id=SECRET-MARKER' })),
+    checkLuoguSessionCookie(secretDraft({ clientId: 'abc def' })),
+    checkLuoguSessionCookie(
+      secretDraft({
+        mode: 'full_cookie',
+        fullCookie: `_uid=800001; __client_id=${'x'.repeat(MAX_LUOGU_COOKIE_INPUT_BYTES)}`,
+      }),
+    ),
+    checkLuoguSessionCookie(secretDraft({ mode: 'full_cookie', fullCookie: '_uid=800001;\n__client_id=SECRET-MARKER' })),
+    checkLuoguSessionCookie(secretDraft({ mode: 'full_cookie', fullCookie: '_uid=800001; __session=SECRET-MARKER' })),
+    checkLuoguSessionCookie(
+      secretDraft({ mode: 'full_cookie', fullCookie: '__client_id=abc; __client_id=def; _uid=800001' }),
+    ),
+    checkLuoguSessionCookie(secretDraft({ mode: 'full_cookie', fullCookie: '_uid=800001; __client_id=; ' })),
   ];
   for (const check of refused) {
     assert.equal(check.state, 'invalid');
     assert.ok(check.message !== null && check.message.length > 0);
+    assert.equal(check.cookie, null, 'an invalid draft never yields a value to submit');
     assert.ok(!check.message.includes('SECRET-MARKER'), 'a refusal never echoes the draft');
-    assert.ok(!check.message.includes('800001'), 'a refusal never echoes the draft');
+    assert.ok(!check.message.includes('800001'), 'a refusal never echoes the uid either');
+    assert.ok(!check.message.includes('client_id='), 'a refusal never echoes a pasted pair');
   }
-  // Bytes, not characters: a 900-character multibyte value exceeds the 2560-byte blob cap.
-  assert.equal(checkLuoguSessionCookie('洛'.repeat(900)).state, 'invalid');
 });
 
 void test('the connection controls follow availability, the secret draft and the OS', () => {
@@ -406,15 +471,131 @@ void test('the panel guides the user without teaching them to handcraft a sessio
   const guide = LUOGU_COOKIE_GUIDE.join('\n');
   assert.match(guide, /_uid/);
   assert.match(guide, /__client_id/);
-  assert.match(guide, /完整值/);
-  // The guide names the label the panel actually renders, suffix included.
-  assert.match(guide, /登录凭据（Cookie 值，只在本机使用）/);
+  // The default path names the exact column and the exact screen it is on.
+  assert.match(guide, /Value/);
+  assert.match(guide, /Application/);
+  assert.match(guide, /Cookies/);
+  assert.match(LUOGU_CLIENT_ID_HELP, /Value（值）/);
+  assert.match(LUOGU_CLIENT_ID_HELP, /不要复制 Name/);
+  // The readonly `_uid` is explained as the account's own numeric UID, not as a field to fill in.
+  assert.match(LUOGU_UID_DISPLAY_NOTE, /数字 UID/);
+  assert.match(LUOGU_UID_DISPLAY_NOTE, /只读/);
+  assert.match(LUOGU_UID_DISPLAY_NOTE, /不能手工修改/);
+  // The advanced whole-Cookie paste is offered as compatibility, not as a way to pass a challenge.
+  assert.match(LUOGU_FULL_COOKIE_TOGGLE, /高级/);
+  assert.match(LUOGU_FULL_COOKIE_HELP, /整段 Cookie/);
+  assert.match(LUOGU_FULL_COOKIE_HELP, /只保留 __client_id 与 _uid 两项/);
+  assert.doesNotMatch(LUOGU_FULL_COOKIE_HELP, /就能通过|一定能|可以解决/);
+  assert.match(LUOGU_SECRET_MEMORY_NOTE, /内存/);
   assert.match(LUOGU_AI_CHAT_WARNING, /AI 对话/);
   assert.match(LUOGU_SECRET_STORAGE_NOTE, /Windows 凭据管理器/);
   assert.match(LUOGU_SECRET_STORAGE_NOTE, /localStorage/);
+  assert.match(LUOGU_SECRET_STORAGE_NOTE, /只保留 __client_id 与 _uid 两项/);
   // 「开始 / 继续同步」is described as backfill-first, not as an always-incremental scan.
   assert.match(LUOGU_RECENT_WINDOW_NOTE, /先补齐历史/);
   assert.match(LUOGU_RECENT_WINDOW_NOTE, /全历史扫描完成后才转入最近窗口增量/);
   assert.match(LUOGU_MANUAL_STILL_AVAILABLE, /本页的 JSON \/ CSV/);
   assert.doesNotMatch(LUOGU_MANUAL_STILL_AVAILABLE, /上面/);
+});
+
+void test('a failure is explained by the half of the pass that failed, and a legacy record stays neutral', () => {
+  const metadataFailure: LuoguSyncFailure = {
+    code: 'auth_required',
+    at: AT,
+    retryAt: null,
+    paused: true,
+    stage: 'metadata',
+  };
+  const metadata = status({ failure: metadataFailure });
+  const metadataAdvice = luoguSyncFailureGuidance(metadataFailure);
+  assert.equal(metadataAdvice, LUOGU_METADATA_FAILURE_GUIDANCE.auth_required);
+  assert.match(metadataAdvice, /补齐题目资料/);
+  assert.match(metadataAdvice, /不代表保存的登录凭据已过期/);
+  assert.doesNotMatch(metadataAdvice, /登录凭据已失效/);
+  assert.match(luoguAttemptSummary(metadata), /在补齐题目资料时失败/);
+  assert.match(luoguAttemptSummary(metadata), /待补题目资料|继续排队/);
+  assert.doesNotMatch(luoguAttemptSummary(metadata), /成功完成/);
+  const automatedMetadata = {
+    ...metadata,
+    settings: { ...metadata.settings, automaticEnabled: true },
+  };
+  assert.match(luoguNextRunSummary(automatedMetadata), /已暂停/);
+  assert.match(luoguNextRunSummary(automatedMetadata), /补齐题目资料/);
+
+  const historyFailure: LuoguSyncFailure = { ...metadataFailure, stage: 'history' };
+  const history = status({ failure: historyFailure });
+  assert.equal(luoguSyncFailureGuidance(historyFailure), LUOGU_HISTORY_FAILURE_GUIDANCE.auth_required);
+  assert.match(luoguSyncFailureGuidance(historyFailure), /读取提交记录/);
+  assert.match(luoguSyncFailureGuidance(historyFailure), /检查登录/);
+  assert.match(luoguAttemptSummary(history), /在读取提交记录时失败/);
+  assert.match(
+    luoguNextRunSummary({ ...history, settings: { ...history.settings, automaticEnabled: true } }),
+    /读取提交记录/,
+  );
+
+  // A record from before the stage existed: neutral wording, a login check suggested, no expiry
+  // claim, and no stage invented in the rendered summary.
+  const legacyFailure: LuoguSyncFailure = { code: 'auth_required', at: AT, retryAt: null, paused: true };
+  const legacy = status({ failure: legacyFailure });
+  const legacyAdvice = luoguSyncFailureGuidance(legacyFailure);
+  assert.equal(legacyAdvice, LUOGU_FAILURE_GUIDANCE.auth_required);
+  assert.match(legacyAdvice, /检查登录/);
+  assert.doesNotMatch(legacyAdvice, /失效|过期/);
+  assert.match(luoguAttemptSummary(legacy), /失败/);
+  assert.match(luoguAttemptSummary(legacy), /检查登录/);
+  assert.doesNotMatch(
+    luoguAttemptSummary(legacy),
+    /在读取提交记录时|在补齐题目资料时/,
+    'no stage is invented for a legacy record',
+  );
+  assert.match(
+    luoguNextRunSummary({ ...legacy, settings: { ...legacy.settings, automaticEnabled: true } }),
+    /检查登录/,
+  );
+
+  // The stage-aware helper covers every code: a stage-specific sentence wins where one exists, and
+  // anything else falls back to the stage-free sentence that is already accurate for it.
+  assert.equal(
+    luoguSyncFailureGuidance({ ...metadataFailure, code: 'rate_limited', paused: false, retryAt: AT }),
+    LUOGU_FAILURE_GUIDANCE.rate_limited,
+  );
+  assert.equal(luoguSyncFailureGuidance(null), null);
+  assert.equal(luoguFailureGuidance(null), null);
+  assert.deepEqual(LUOGU_FAILURE_STAGE_LABELS, { history: '读取提交记录', metadata: '补齐题目资料' });
+});
+
+void test('a successful probe after a sync failure is a current login check, never a successful sync', () => {
+  const failure: LuoguSyncFailure = {
+    code: 'auth_required',
+    at: AT,
+    retryAt: null,
+    paused: true,
+    stage: 'metadata',
+  };
+  const later = '2026-03-01T11:00:00.000Z';
+  const afterProbe = status({
+    failure,
+    connection: { status: 'connected', connectedAt: AT, checkedAt: later, failureCode: null, cleanupPending: false },
+  });
+  const check = luoguLoginCheckSummary(afterProbe);
+  assert.ok(check !== null);
+  assert.match(check, /检查成功/);
+  assert.match(check, /最近一次同步/);
+  assert.match(check, /仍然失败/);
+  assert.match(check, /不代表同步成功/);
+  assert.match(luoguAttemptSummary(afterProbe), /失败/);
+  assert.doesNotMatch(luoguAttemptSummary(afterProbe), /成功完成/);
+
+  // Nothing honest to add: no failure, no connection, a failing connection or an older check.
+  assert.equal(luoguLoginCheckSummary(status({ connection: { ...status().connection!, checkedAt: later } })), null);
+  assert.equal(luoguLoginCheckSummary(status({ failure, connection: null })), null);
+  assert.equal(
+    luoguLoginCheckSummary(status({ failure, connection: { ...status().connection!, status: 'session_expired' } })),
+    null,
+  );
+  assert.equal(
+    luoguLoginCheckSummary(status({ failure, connection: { ...status().connection!, checkedAt: AT } })),
+    null,
+  );
+  assert.equal(luoguLoginCheckSummary(null), null);
 });
