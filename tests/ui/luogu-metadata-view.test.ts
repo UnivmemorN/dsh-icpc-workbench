@@ -17,6 +17,7 @@ import { test } from 'node:test';
 import {
   LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE,
   LUOGU_METADATA_BACKLOG_PAGE_SIZE,
+  LUOGU_METADATA_CODE_TEXT,
   LUOGU_METADATA_ISSUE_UNKNOWN_LABEL,
   LUOGU_METADATA_MANUAL_NOTE,
   LUOGU_METADATA_PAGE_SIZE_OPTIONS,
@@ -28,6 +29,7 @@ import {
   luoguMetadataBacklogRequest,
   luoguMetadataCounts,
   luoguMetadataDisclosureLabel,
+  luoguMetadataFailureText,
   luoguMetadataHostFailureLine,
   luoguMetadataIssueText,
   luoguMetadataMutationReason,
@@ -50,6 +52,7 @@ import {
   LUOGU_METADATA_BACKLOG_DEFAULT_PAGE_SIZE,
   LUOGU_METADATA_BACKLOG_MAX_PAGE_SIZE as APPLICATION_MAX_PAGE_SIZE,
   LUOGU_METADATA_UNKNOWN_ISSUE_LABEL,
+  LUOGU_SYNC_FAILURE_CODES,
   type LuoguMetadataIssue,
 } from '../../src/application/luogu-sync-types.js';
 import { PLATFORM_ERROR_REASONS } from '../../src/application/platform-errors.js';
@@ -280,9 +283,13 @@ void test('paging reads one bounded page and clamps an out-of-range page before 
 });
 
 void test('the three item-scoped retry outcomes stay distinguishable and never claim a whole pass', () => {
-  const resolved = luoguMetadataRetryText({ outcome: 'resolved', reason: null });
-  const deferred = luoguMetadataRetryText({ outcome: 'deferred', reason: 'missing_statement' });
-  const failed = luoguMetadataRetryText({ outcome: 'failed', reason: null });
+  const resolved = luoguMetadataRetryText({ outcome: 'resolved', failureCode: null, reason: null });
+  const deferred = luoguMetadataRetryText({
+    outcome: 'deferred',
+    failureCode: 'changed_response',
+    reason: 'missing_statement',
+  });
+  const failed = luoguMetadataRetryText({ outcome: 'failed', failureCode: 'auth_required', reason: null });
   assert.match(resolved, /已从待补列表移除/);
   assert.match(deferred, /仍留在待补列表/);
   assert.match(deferred, /缺少题面/);
@@ -291,6 +298,64 @@ void test('the three item-scoped retry outcomes stay distinguishable and never c
   assert.doesNotMatch(deferred, /成功|完成同步/);
   assert.doesNotMatch(failed, /成功|完成同步/);
   assert.doesNotMatch(resolved, /同步成功|平台抓取/);
+});
+
+void test('a code-only issue or retry result is explained by its failure code, never by "no reason"', () => {
+  // Sprint 30b: records and retry answers written before/without a reason must still be readable.
+  const authIssue: LuoguMetadataIssue = {
+    problemKey: KEY,
+    code: 'auth_required',
+    reason: null,
+    at: EARLIER,
+    attempts: 2,
+  };
+  const auth = luoguMetadataIssueText(authIssue);
+  assert.match(auth, /登录/);
+  assert.match(auth, /检查登录/);
+  assert.match(auth, /累计失败 2 次/);
+  assert.doesNotMatch(auth, /已经用|再试过一次/, 'a legacy diagnosis cannot prove an authenticated attempt occurred');
+  assert.doesNotMatch(auth, /没有可用的原因分类/, 'a known code is not rendered as "no reason"');
+  assert.match(auth, /这不等于保存的登录凭据一定过期/, 'the copy states the honest negation, never a claim');
+  assert.doesNotMatch(auth, /登录凭据已过期|凭据已失效|一定私有/);
+
+  const forbidden: LuoguMetadataIssue = { problemKey: KEY, code: 'forbidden', reason: null, at: EARLIER, attempts: 1 };
+  const refused = luoguMetadataIssueText(forbidden);
+  assert.match(refused, /拒绝|访问/);
+  assert.doesNotMatch(refused, /登录凭据失效|一定过期/);
+
+  const rateLimited: LuoguMetadataIssue = {
+    problemKey: KEY,
+    code: 'rate_limited',
+    reason: null,
+    at: EARLIER,
+    attempts: 5,
+  };
+  assert.match(luoguMetadataIssueText(rateLimited), /限流/);
+
+  // The code+reason pair keeps the reason-specific wording, and `missing_statement` is untouched.
+  assert.equal(
+    luoguMetadataFailureText('changed_response', 'missing_statement'),
+    LUOGU_METADATA_REASON_TEXT.missing_statement,
+  );
+  assert.equal(luoguMetadataFailureText('auth_required', null), LUOGU_METADATA_CODE_TEXT.auth_required);
+  assert.equal(luoguMetadataFailureText(null, null), LUOGU_METADATA_REASON_UNKNOWN_TEXT);
+  for (const code of LUOGU_SYNC_FAILURE_CODES) {
+    assert.ok(LUOGU_METADATA_CODE_TEXT[code].length > 10, `${code} needs its own actionable sentence`);
+  }
+
+  // Retry answers carry the API's `failureCode`: a code-only refusal is still explained.
+  const codeOnly = luoguMetadataRetryText({ outcome: 'failed', failureCode: 'auth_required', reason: null });
+  assert.match(codeOnly, /登录/);
+  assert.match(codeOnly, /仍留在待补列表/);
+  const deferred403 = luoguMetadataRetryText({ outcome: 'deferred', failureCode: 'forbidden', reason: null });
+  assert.match(deferred403, /访问/);
+  assert.doesNotMatch(deferred403, /登录凭据失效/);
+  const reasonSpecific = luoguMetadataRetryText({
+    outcome: 'deferred',
+    failureCode: 'changed_response',
+    reason: 'missing_statement',
+  });
+  assert.match(reasonSpecific, /缺少题面/);
 });
 
 void test('the supplement form validates into the exact request payload', () => {

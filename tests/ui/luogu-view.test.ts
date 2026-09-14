@@ -323,6 +323,10 @@ void test('the backlog drain copy states the batch, pacing, background and no-AI
   assert.match(LUOGU_METADATA_DRAIN_NOTE, /保持运行/);
   assert.match(LUOGU_METADATA_DRAIN_NOTE, /不读取提交历史/);
   assert.match(LUOGU_METADATA_DRAIN_NOTE, /每题只尝试一次/);
+  // Sprint 30b: a login-required problem is retried once with the account's own session, so the copy
+  // must not claim the whole step is anonymous-only.
+  assert.match(LUOGU_METADATA_DRAIN_NOTE, /登录凭据再尝试一次/);
+  assert.doesNotMatch(LUOGU_METADATA_DRAIN_NOTE, /无法匿名读取|始终是匿名/);
   assert.deepEqual(Object.keys(LUOGU_METADATA_START_OUTCOMES).sort(), ['coalesced', 'queued', 'started']);
 });
 
@@ -553,8 +557,11 @@ void test('a failure is explained by the half of the pass that failed, and a leg
   const metadataAdvice = luoguSyncFailureGuidance(metadataFailure);
   assert.equal(metadataAdvice, LUOGU_METADATA_FAILURE_GUIDANCE.auth_required);
   assert.match(metadataAdvice, /补齐题目资料/);
-  assert.match(metadataAdvice, /不代表保存的登录凭据已过期/);
+  assert.match(metadataAdvice, /当前版本/);
+  assert.doesNotMatch(metadataAdvice, /已经用|再试过一次/);
+  assert.match(metadataAdvice, /这不等于保存的登录凭据一定过期/);
   assert.doesNotMatch(metadataAdvice, /登录凭据已失效/);
+  assert.doesNotMatch(metadataAdvice, /始终是匿名读取|不使用登录凭据/);
   assert.match(luoguAttemptSummary(metadata), /在补齐题目资料时失败/);
   assert.match(luoguAttemptSummary(metadata), /待补题目资料|继续排队/);
   assert.doesNotMatch(luoguAttemptSummary(metadata), /成功完成/);

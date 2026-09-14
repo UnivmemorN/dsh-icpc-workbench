@@ -2248,20 +2248,22 @@ void test('refreshProfile refuses a foreign or unknown account before touching t
 });
 
 // ---------------------------------------------------------------------------------------
-// Sprint 22c: a private (U-prefixed) problem refusal is an item failure, not a session stop
+// Sprint 22c/30b: a 403 of a private (U/T) key defers that item; an auth wall pauses the source
 // ---------------------------------------------------------------------------------------
 
-for (const [pid, code] of [['U700001', 'auth_required'], ['U700001', 'forbidden'], ['T700001', 'auth_required'], ['T700001', 'forbidden']] as const) {
-  void test(`a ${code} refusal of ${pid} is remembered per item and the drain continues`, async () => {
+// Sprint 30b: only a `forbidden` refusal is an item-level "private problem" diagnosis. It stays
+// deferred, so the keys behind it are still attempted in the same pass.
+for (const pid of ['U700001', 'T700001'] as const) {
+  void test(`a forbidden refusal of ${pid} is remembered per item and the drain continues`, async () => {
     const world = await createWorld();
     try {
-      const service = world.makeService(`svc-meta-private-${code}`);
+      const service = world.makeService(`svc-meta-private-${pid}`);
       await seedBacklog(world, world.alice.id, [pid, 'P1001']);
       const feedCallsBefore = world.feed.calls.length;
       world.metadata.fail.set(
         pid,
         new PlatformError({
-          code,
+          code: 'forbidden',
           operation: 'problem',
           retryable: false,
           detail: 'synthetic private refusal',
@@ -2278,7 +2280,7 @@ for (const [pid, code] of [['U700001', 'auth_required'], ['U700001', 'forbidden'
       );
       assert.equal(status.metadataResolved, 1, 'the public key after the refusal was still fetched');
       assert.equal(status.metadataFailed, 1, 'the refused key counts as one failed item');
-      assert.equal(status.failure?.code, code, 'the item refusal is remembered as the durable failure');
+      assert.equal(status.failure?.code, 'forbidden', 'the item refusal is remembered as the durable failure');
       assert.equal(status.failure?.stage, 'metadata');
       assert.equal(status.metadataBacklog, 1, 'the refused key stays queued instead of being dropped');
       assert.equal(world.feed.calls.length, feedCallsBefore, 'a metadata drain never reads a history page');
@@ -2295,6 +2297,52 @@ for (const [pid, code] of [['U700001', 'auth_required'], ['U700001', 'forbidden'
   });
 }
 
+// Sprint 30b: an `auth_required` answer is not an item-level "private problem" diagnosis. With no
+// authenticated fallback configured on this world, the refusal is a source-level failure: the key
+// stays queued with its diagnostic, the pass stops, and automatic attempts pause as the auth code
+// requires — never a silent deferral behind the U/T prefix.
+for (const pid of ['U700001', 'T700001'] as const) {
+  void test(`an auth_required refusal of ${pid} pauses the drain with a per-key diagnostic`, async () => {
+    const world = await createWorld();
+    try {
+      const service = world.makeService(`svc-meta-auth-${pid}`);
+      await seedBacklog(world, world.alice.id, [pid, 'P1001']);
+      world.metadata.fail.set(
+        pid,
+        new PlatformError({
+          code: 'auth_required',
+          operation: 'problem',
+          retryable: false,
+          detail: 'synthetic login wall',
+        }),
+      );
+
+      assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+      await service.settle();
+      const status = await service.status(world.alice.id);
+      assert.deepEqual(world.metadata.calls, [pid], 'the authentication wall stops the pass after the refused key');
+      assert.equal(status.metadataResolved, 0);
+      assert.equal(status.metadataFailed, 1, 'the refused key counts as one failed attempt');
+      assert.equal(status.failure?.code, 'auth_required');
+      assert.equal(status.failure?.stage, 'metadata');
+      assert.equal(status.paused, true, 'a final auth refusal pauses automatic attempts');
+      assert.equal(status.metadataBacklog, 2, 'no queued key is dropped when the pass stops');
+      const record = await world.store.getLuoguSyncState(world.alice.id);
+      assert.equal(
+        record?.value.missingMetadata[1],
+        problemKeyOf(world.instance, pid),
+        'the refused key is rotated to the end, never dropped',
+      );
+      const issue = record?.value.metadataIssues?.[0];
+      assert.equal(issue?.problemKey, problemKeyOf(world.instance, pid));
+      assert.equal(issue?.code, 'auth_required');
+      assert.equal(issue?.reason, null, 'a code-only refusal records no invented reason');
+    } finally {
+      await world.dispose();
+    }
+  });
+}
+
 void test('a rate limit after a deferred private refusal stops the drain and replaces the failure', async () => {
   const world = await createWorld();
   try {
@@ -2303,7 +2351,7 @@ void test('a rate limit after a deferred private refusal stops the drain and rep
     world.metadata.fail.set(
       'U700002',
       new PlatformError({
-        code: 'auth_required',
+        code: 'forbidden',
         operation: 'problem',
         retryable: false,
         detail: 'synthetic private refusal',
@@ -2392,7 +2440,7 @@ void test('a cancel after a deferred private refusal keeps the refusal and the r
     world.metadata.fail.set(
       'U700004',
       new PlatformError({
-        code: 'auth_required',
+        code: 'forbidden',
         operation: 'problem',
         retryable: false,
         detail: 'synthetic private refusal',
@@ -2412,7 +2460,7 @@ void test('a cancel after a deferred private refusal keeps the refusal and the r
     assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
     await until(() => served >= 2, 'the second key is in flight after the private refusal was committed');
     const during = await service.status(world.alice.id);
-    assert.equal(during.failure?.code, 'auth_required', 'the refused item was committed durably');
+    assert.equal(during.failure?.code, 'forbidden', 'the refused item was committed durably');
     assert.equal(during.failure?.stage, 'metadata');
     assert.equal(during.metadataFailed, 1);
 
@@ -2423,7 +2471,7 @@ void test('a cancel after a deferred private refusal keeps the refusal and the r
 
     const after = await service.status(world.alice.id);
     assert.equal(after.running, false);
-    assert.equal(after.failure?.code, 'auth_required', 'the cancel keeps the item refusal instead of wiping it');
+    assert.equal(after.failure?.code, 'forbidden', 'the cancel keeps the item refusal instead of wiping it');
     assert.equal(after.failure?.stage, 'metadata');
     assert.equal(after.metadataFailed, 1);
     assert.equal(after.metadataBacklog, 3, 'the whole queue, including the discarded in-flight key, is kept');
@@ -2449,7 +2497,7 @@ void test('a backlog of only private U keys attempts every key at most once per 
       world.metadata.fail.set(
         pid,
         new PlatformError({
-          code: 'auth_required',
+          code: 'forbidden',
           operation: 'problem',
           retryable: false,
           detail: 'synthetic private refusal',
@@ -2469,7 +2517,7 @@ void test('a backlog of only private U keys attempts every key at most once per 
     assert.equal(status.metadataFailed, 2);
     assert.equal(status.metadataResolved, 0);
     assert.equal(status.metadataBacklog, 2, 'both refused keys stay queued for a later pass');
-    assert.equal(status.failure?.code, 'auth_required');
+    assert.equal(status.failure?.code, 'forbidden');
     assert.equal(status.failure?.stage, 'metadata');
   } finally {
     await world.dispose();

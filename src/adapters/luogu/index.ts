@@ -65,6 +65,14 @@ export {
 } from './session-reader.js';
 
 export {
+  LUOGU_PROBLEM_PATH_PREFIX,
+  LuoguProblemSessionSourceAdapter,
+  createLuoguProblemSessionSource,
+  type LuoguProblemSessionSource,
+  type LuoguProblemSessionSourceOptions,
+} from './problem-session-reader.js';
+
+export {
   LUOGU_PID_PATTERN,
   LUOGU_TAG_RAW_PREFIX,
   MAX_LUOGU_DISPLAY_NAME_CHARS,

@@ -4,13 +4,16 @@
  * This module is **pure**: no HTTP, no DOM, no React, no storage and no clock of its own, so every
  * decision the recovery UI makes can be tested without a browser. It owns three kinds of rule:
  *
- * 1. **Honest per-key diagnostics.** {@link luoguMetadataIssueText} translates the closed
- *    `PlatformErrorReason` vocabulary into fixed Chinese sentences. `missing_statement` is named as
- *    an empty description; the parser-shaped reasons (`html_response`, `invalid_json`,
- *    `invalid_payload`) stay explicitly *uncertain* and never invent a diagnosis, a raw exception
- *    text or a "cookie expired" conclusion. A key with no recorded issue says exactly
- *    {@link LUOGU_METADATA_ISSUE_UNKNOWN_LABEL} plus the honest explanation that old data carries no
- *    per-key record — never "this was never tried".
+ * 1. **Honest per-key diagnostics.** {@link luoguMetadataIssueText} translates the closed failure
+ *    code together with the closed `PlatformErrorReason` vocabulary into fixed Chinese sentences.
+ *    `auth_required` explains the current retry behavior without inventing an earlier session attempt —
+ *    it never claims the saved cookie expired and never claims the problem is private; `forbidden`
+ *    names an access refusal whose cause may be a permission or platform restriction, again without
+ *    blaming the login; `missing_statement` keeps its exact "blank description" sentence, and the
+ *    parser-shaped reasons (`html_response`, `invalid_json`, `invalid_payload`) stay explicitly
+ *    *uncertain* and never invent a diagnosis or a raw exception text. A key with no recorded issue
+ *    says exactly {@link LUOGU_METADATA_ISSUE_UNKNOWN_LABEL} plus the honest explanation that old
+ *    data carries no per-key record — never "this was never tried".
  * 2. **Counts that cannot be confused.** {@link luoguMetadataCounts} keeps the pending **item** count,
  *    the per-page known-issue count and the account's lifetime failed **attempt** count as three
  *    separate claims, so a lifetime counter is never rendered as "N failed problems".
@@ -34,7 +37,7 @@ import type {
   ApiLuoguStatusView,
   ApiLuoguSupplementMetadataRequest,
 } from '../application/workbench-api.js';
-import type { LuoguMetadataIssue } from '../application/luogu-sync-types.js';
+import type { LuoguMetadataIssue, LuoguSyncFailureCode } from '../application/luogu-sync-types.js';
 import type { PlatformErrorReason } from '../application/platform-errors.js';
 import { LUOGU_FAILURE_STAGE_LABELS, luoguTime } from './luogu-view.js';
 
@@ -228,12 +231,65 @@ export function luoguMetadataReasonText(reason: PlatformErrorReason | null): str
 }
 
 /**
+ * Fixed sentence per durable failure code, used when a per-key issue records no reason.
+ *
+ * Every sentence states only what the code itself supports. `auth_required` asks for a valid login
+ * and describes the current session fallback, including for legacy records — it never asserts that the saved
+ * cookie expired and never asserts that the problem is private. `forbidden` names an access refusal
+ * whose cause may be the problem's own permission or a platform restriction. Rate limits, timeouts
+ * and outages say only that nothing was fetched, and the remaining codes keep their next action.
+ */
+export const LUOGU_METADATA_CODE_TEXT: Readonly<Record<LuoguSyncFailureCode, string>> = {
+  auth_required:
+    '上次读取这道题时，洛谷要求有效登录。可点「重试此题」：当前版本在匿名读取被要求登录时，会使用当前账号保存的会话重试。仍失败时请点「检查登录」，按结果重新连接。这不等于保存的登录凭据一定过期。',
+  forbidden:
+    '洛谷拒绝了对这道题的访问：可能是题目的访问权限或平台限制（自建 U / T 类题目常见），具体原因需要核对；可打开原题检查、稍后重试或手工补充。',
+  rate_limited: '洛谷限流，这次没有取到这道题的公开资料：进度不受影响，请稍后重试，不要连续点击。',
+  timeout: '读取这道题时请求超时：可能是网络或平台繁忙，本地记录不受影响；可稍后重试或手工补充。',
+  unavailable: '洛谷暂时不可用，这次没有取到这道题的公开资料：可稍后重试或手工补充。',
+  changed_response:
+    '洛谷返回的内容与预期不符：可能是页面结构变化或人工验证，具体原因不确定；可打开原题检查、稍后重试或手工补充。',
+  invalid_input: '这次请求被平台或本地规则拒绝：请刷新待补列表后重试，或改用「手工补充」。',
+  not_connected: '读取这道题需要可用的登录连接：请先连接洛谷账号，或改用「手工补充」。',
+  unsupported: '当前系统或构建不支持读取这道题的公开资料：可改用「手工补充」。',
+  lease_lost: '这道题这次没有读取完成（同步租约已失效）：请稍后重试。',
+  cleanup_failed: '这道题这次没有读取完成（本地凭据清理失败）：请先在同步详情里处理「断开连接」。',
+  internal: '读取这道题时出现未预期错误：本地记录不受影响，可稍后重试或改用「手工补充」。',
+};
+
+/**
+ * One fixed sentence of a failure code plus the closed reason recorded with it.
+ *
+ * The reason is the more specific diagnosis when the code is `changed_response` — that pair is
+ * exactly what the metadata reader records for an HTML page, malformed JSON, an unexpected payload
+ * and an incomplete statement — so `missing_statement` keeps its exact "blank description" wording.
+ * A code without a reason is rendered from {@link LUOGU_METADATA_CODE_TEXT}, `null` from the honest
+ * "no classification recorded" sentence, and a code that carries a reason which is not its own
+ * diagnosis states both instead of silently dropping one.
+ */
+export function luoguMetadataFailureText(
+  code: LuoguSyncFailureCode | null,
+  reason: PlatformErrorReason | null,
+): string {
+  if (code === null) {
+    return LUOGU_METADATA_REASON_UNKNOWN_TEXT;
+  }
+  if (reason !== null && code === 'changed_response') {
+    return luoguMetadataReasonText(reason);
+  }
+  const sentence = LUOGU_METADATA_CODE_TEXT[code];
+  return reason === null ? sentence : `${sentence}（附带记录的原因：${luoguMetadataReasonText(reason)}）`;
+}
+
+/**
  * What is known about one queued key.
  *
  * A recorded issue names the last failure's instant, how many failures that key accumulated and the
- * translated reason. A key without a record renders the fixed unknown label plus the honest
- * explanation: old data (written before per-key diagnostics existed) may have been tried many times,
- * so the panel never claims it was never attempted.
+ * failure code together with its closed reason ({@link luoguMetadataFailureText}) — so a record
+ * written before reasons existed, or one whose code alone is the whole diagnosis, still renders an
+ * honest, actionable sentence instead of "no reason". A key without a record renders the fixed
+ * unknown label plus the honest explanation: old data (written before per-key diagnostics existed)
+ * may have been tried many times, so the panel never claims it was never attempted.
  */
 export function luoguMetadataIssueText(
   issue: LuoguMetadataIssue | null,
@@ -242,7 +298,7 @@ export function luoguMetadataIssueText(
   if (issue === null) {
     return `${unknownLabel}：可能是旧数据（写入这条待补记录时还没有逐题诊断），也可能是还没尝试过；可以点「重试此题」或手工补充。`;
   }
-  return `最近一次失败：${luoguTime(issue.at)} · 这道题累计失败 ${issue.attempts} 次 · ${luoguMetadataReasonText(issue.reason)}`;
+  return `最近一次失败：${luoguTime(issue.at)} · 这道题累计失败 ${issue.attempts} 次 · ${luoguMetadataFailureText(issue.code, issue.reason)}`;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -280,19 +336,22 @@ export function luoguMetadataMutationReason(status: ApiLuoguStatusView | null, l
  *
  * The three outcomes are different facts: `resolved` means the key left the backlog and local
  * material was written; `deferred` means the platform refused **this item** for this reader (for
- * example an incomplete personal statement) while the key stays queued; `failed` is any other
- * refusal. None of them is reported as a whole-pass result, and none promises an automatic retry.
+ * example an incomplete personal statement, or a private problem the platform will not serve) while
+ * the key stays queued; `failed` is any other refusal, including an authentication wall that stayed
+ * that requires a usable session. Both refusal sentences render the
+ * `failureCode` the API returned together with its closed reason, so a code-only failure is still
+ * explained. None of them is reported as a whole-pass result, and none promises an automatic retry.
  */
 export function luoguMetadataRetryText(
-  result: Pick<ApiLuoguRetryMetadataResult, 'outcome' | 'reason'>,
+  result: Pick<ApiLuoguRetryMetadataResult, 'outcome' | 'failureCode' | 'reason'>,
 ): string {
   switch (result.outcome) {
     case 'resolved':
       return '已补齐这一题的本地资料，并已从待补列表移除；题库会刷新。';
     case 'deferred':
-      return `平台这次没有提供这道题的公开资料，它仍留在待补列表：${luoguMetadataReasonText(result.reason)}`;
+      return `平台这次没有提供这道题的公开资料，它仍留在待补列表：${luoguMetadataFailureText(result.failureCode, result.reason)}`;
     case 'failed':
-      return `这次重试失败，题目仍留在待补列表：${luoguMetadataReasonText(result.reason)}`;
+      return `这次重试失败，题目仍留在待补列表：${luoguMetadataFailureText(result.failureCode, result.reason)}`;
   }
 }
 

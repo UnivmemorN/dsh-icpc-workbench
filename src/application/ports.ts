@@ -224,6 +224,22 @@ export interface PlatformAdapter {
   fetchEditorial(request: FetchEditorialRequest): Promise<EditorialFetchResult>;
 }
 
+/**
+ * Credential-free problem-detail port (Sprint 30b).
+ *
+ * The metadata repair path reads exactly one problem's public detail, so its port is narrowed to
+ * that: a full {@link PlatformAdapter} satisfies it structurally, and so does an account-bound
+ * authenticated reader. `capabilities()`, `listProblems`, `listSubmissions` and `fetchEditorial`
+ * are deliberately unreachable through it, so a caller holding this port cannot turn one metadata
+ * repair into a catalog scan, a history read or an editorial fetch — and an implementation that
+ * needs a session still only ever receives one problem request, never a caller-supplied cookie.
+ */
+export interface ProblemMetadataSource {
+  readonly sourceInstance: SourceInstance;
+  /** Fetch one problem's full detail; identical to {@link PlatformAdapter.fetchProblem}. */
+  fetchProblem(request: FetchProblemRequest): Promise<NormalizedProblem>;
+}
+
 // ---------------------------------------------------------------------------------------
 // Model gateway
 // ---------------------------------------------------------------------------------------

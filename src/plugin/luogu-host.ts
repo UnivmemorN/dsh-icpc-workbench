@@ -4,8 +4,8 @@
  * One runtime instance composes everything the authenticated Luogu slice needs, from public
  * extension points only: the workspace-scoped OS credential vault, the shared source-wide pacing
  * gate, the connection manager, the stored-session submissions source, the anonymous metadata
- * adapter and the durable `LuoguSyncService` — plus the single interval timer that drives the
- * per-account due instants.
+ * adapter, the account-bound authenticated metadata fallback and the durable `LuoguSyncService` —
+ * plus the single interval timer that drives the per-account due instants.
  *
  * ## Order of operations
  *
@@ -48,6 +48,8 @@
  */
 import {
   createLuoguConnectionManager,
+  createLuoguProblemSessionSource,
+  createStoredLuoguSessionProvider,
   createStoredSubmissionsSource,
 } from '../adapters/luogu/index.js';
 import { WindowsCredentialVault } from '../adapters/windows/index.js';
@@ -62,11 +64,12 @@ import {
 } from '../application/luogu-sync-types.js';
 import type { LocalCredentialVault } from '../application/local-credential-vault.js';
 import type { ImportService } from '../application/import-service.js';
-import type { PlatformAdapter, PlatformLimits, TrainingStore } from '../application/ports.js';
+import type { PlatformAdapter, PlatformLimits, ProblemMetadataSource, TrainingStore } from '../application/ports.js';
 import {
   DomainError,
   createCancellationSource,
   throwIfCancelled,
+  type Account,
   type CancellationToken,
   type SourceInstance,
 } from '../domain/index.js';
@@ -254,6 +257,34 @@ export function createLuoguHost(options: LuoguHostOptions): LuoguHostRuntime {
     sourceInstance: options.sourceInstance,
     ...(seam.transport === undefined ? {} : { transport: seam.transport }),
   });
+  // The account-bound metadata fallback. The anonymous metadata read is always tried first, and only
+  // its `auth_required` refusal reaches this factory; one source per account is cached, so the
+  // reader's own >= 2 s pacing survives across calls, while the stored-session provider under it
+  // re-reads the connection row and the vault on every call — a reconnected session is observed
+  // immediately and a removed one stops working. The cookie therefore travels only into the problem
+  // request of the account it belongs to, and never through the anonymous metadata adapter.
+  const sessions = createStoredLuoguSessionProvider({ store: options.store, vault });
+  const problemSources = new Map<string, ProblemMetadataSource>();
+  const authenticatedMetadataFor = (account: Account): ProblemMetadataSource => {
+    const existing = problemSources.get(account.id);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const transport = seam.transport;
+    const source = createLuoguProblemSessionSource({
+      sourceInstance: options.sourceInstance,
+      account,
+      sessions,
+      fetchImpl: transport?.fetchImpl,
+      clock: transport?.clock,
+      wait: transport?.wait,
+      setTimer: transport?.setTimer,
+      maxResponseBytes: transport?.maxResponseBytes,
+      maxRedirects: transport?.maxRedirects,
+    });
+    problemSources.set(account.id, source);
+    return source;
+  };
   const service = new LuoguSyncService({
     store: options.store,
     imports: options.imports,
@@ -261,6 +292,7 @@ export function createLuoguHost(options: LuoguHostOptions): LuoguHostRuntime {
     sourceInstance: options.sourceInstance,
     submissionsFor,
     metadataSource: seam.metadataSource ?? options.metadataSource,
+    authenticatedMetadataFor,
     ownerId: options.ownerId,
     now,
     wait,

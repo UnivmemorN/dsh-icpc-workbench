@@ -416,25 +416,28 @@ export const LUOGU_FAILURE_GUIDANCE: Readonly<Record<LuoguSyncFailureCode, strin
 };
 
 /**
- * Stage-specific sentences of the **anonymous metadata repair** (`stage: 'metadata'`).
+ * Stage-specific sentences of the **public problem-metadata repair** (`stage: 'metadata'`).
  *
- * This half reads public problem data, so a refusal here is a problem-data completion failure, not
- * evidence that the saved login expired: every sentence says so instead of sending the user to
- * reconnect for something a reconnect cannot fix. Codes without an entry keep the stage-less
- * sentence, which is already accurate for them (a rate limit or an outage preserves progress).
+ * This half starts from an anonymous public read and, when that read is refused with
+ * `auth_required`, makes exactly one retry with the account's own stored session. A final refusal is
+ * therefore a problem-data completion failure — never a verdict that unrelated history is broken —
+ * and the `auth_required` sentence asks the user to verify the login and to reconnect only when a
+ * login check also fails, instead of asserting an expired cookie. Codes without an entry keep the
+ * stage-less sentence, which is already accurate for them (a rate limit or an outage preserves
+ * progress).
  *
- * A `U`-prefixed (user-created) problem that refuses anonymous readers is an item-level failure: it
- * stays in the backlog while the drain keeps processing other keys, so a sentence below can describe
- * a single pending item rather than a stopped pass. A refusal, a rate limit or an unexpected page on
- * a public problem still stops the drain, and this repair never falls back to the saved login.
+ * A `forbidden` refusal of a `U`/`T` (user-created) problem is item-scoped: the key stays in the
+ * backlog while the drain keeps processing other keys, so the `forbidden` sentence describes a
+ * single pending item rather than a stopped pass. A final `auth_required`, a rate limit or an
+ * unexpected page on a public problem still stops the drain.
  */
 export const LUOGU_METADATA_FAILURE_GUIDANCE: Readonly<Partial<Record<LuoguSyncFailureCode, string>>> = {
   auth_required:
-    '上一轮在补齐题目资料（公开题目数据）时被平台要求登录：这不代表保存的登录凭据已过期，也不能靠重新连接解决。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队。请先在普通浏览器里确认账号与网络可用，并点「检查登录」查看当前登录；若登录检查成功，可以稍后手动继续同步来补资料。',
+    '上一轮补齐题目资料时被洛谷要求登录。请先点「重试此题」或手动继续同步；当前版本在匿名读取要求登录时会使用当前账号保存的会话重试。仍失败时请点「检查登录」，按结果重新连接。这不等于保存的登录凭据一定过期；已同步的提交记录、历史覆盖与检查点都会保留，待补题目资料继续排队。',
   forbidden:
-    '上一轮在补齐题目资料时被平台拒绝访问：此步骤使用匿名读取，这不代表登录凭据失效。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队；请稍后在普通浏览器里确认能正常访问洛谷，再手动继续。',
+    '上一轮在补齐题目资料时被平台拒绝访问：这通常是题目自己的访问权限或平台限制（例如自建 U / T 类题目），具体原因需要核对。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队；可以打开原题检查、稍后重试或手工补充。',
   changed_response:
-    '上一轮在补齐题目资料时平台返回与预期不符：可能是人工验证或页面结构变化；此错误不表示本地记录损坏。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队，可稍后手动继续；不要为此做「全历史完整核对」。',
+    '上一轮在补齐题目资料时平台返回与预期不符：可能是人工验证或页面结构变化；此错误不表示本地记录损坏，重新连接也不能解决。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队，可稍后手动继续；不要为此做「全历史完整核对」。',
 };
 
 /**
@@ -543,7 +546,7 @@ export const LUOGU_METADATA_DRAIN_NOTE =
   '普通「开始 / 继续同步」每轮最多补齐 100 条题目资料；积压较多时可以点「补齐全部积压资料（不使用 AI）」一次处理当前积压。' +
   '该动作按题逐个请求洛谷公开题目数据，每个请求之间至少间隔 2 秒，开始时已有的积压每题只尝试一次，做完就停；积压较大时可能需要几十分钟。' +
   '进度按题保存在本机，可以离开页面，但 dsh 需要保持运行；「暂停本轮」会保留已完成的进度，之后再点一次即可继续。' +
-  '自建或私有 U / T 类题目可能无法匿名读取；受限题保留待补，并继续处理其他题目。公开题访问受限、限流或页面异常仍会暂停。' +
+  '需要登录才能读取的题目会用当前账号的登录凭据再尝试一次（每个请求之间仍有至少 2 秒间隔）；U / T 类自建题被平台拒绝访问时保留待补并继续处理其他题目，两次都被要求登录、限流或页面异常时暂停本轮。' +
   '它不读取提交历史，也不改变历史覆盖、检查点、自动同步设置或计划。';
 
 /** Text of a `luogu.start` answer in the metadata-only mode; every outcome is stated as committed. */

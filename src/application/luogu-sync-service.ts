@@ -5,8 +5,9 @@
  * durable per-account lease, drives bounded history passes through the accepted
  * {@link ImportService}, repairs referenced problem metadata, and records every outcome in the
  * durable {@link LuoguSyncState} of Sprint 17c1. It never talks to a platform directly — the
- * authenticated submissions source and the anonymous metadata adapter arrive as injected ports —
- * and it never sees a credential: the stored-session provider lives in the adapter layer.
+ * authenticated submissions source, the anonymous metadata adapter and that account's optional
+ * authenticated metadata fallback arrive as injected ports — and it never sees a credential: the
+ * stored-session provider lives in the adapter layer.
  *
  * ## Concurrency model
  *
@@ -49,7 +50,9 @@
  * page and moves no history watermark, checkpoint or completion flag — and repairs the backlog
  * present at its start once per key (at most {@link LUOGU_SYNC_MAX_METADATA_BACKLOG} keys), so a
  * user can drain a large backlog without pretending it is a history scan. Neither half invokes a
- * model: metadata repair stays the same anonymous platform read as before.
+ * model: metadata repair is an anonymous public read that is retried exactly once with the
+ * account's own stored session after an `auth_required` refusal
+ * ({@link LuoguSyncServiceOptions.authenticatedMetadataFor}).
  * Completion is only ever derived from the adapter's `nextCursor: null`. `phase`/`historyComplete`
  * are independent of failures, a manual full reconciliation resets `historyComplete` without
  * deleting stored rows, and the whole-scan start instant is preserved across resumed passes so a
@@ -87,13 +90,15 @@ import type { ImportService } from './import-service.js';
 import {
   MAX_SUPPLEMENT_STATEMENT_CHARS,
   MAX_SUPPLEMENT_TITLE_CHARS,
+  type RefreshProblemMetadataReport,
+  type RefreshProblemMetadataRequest,
   type SnapshotWrite,
   type SyncMode,
   type SyncPageReport,
   type SyncPageSource,
 } from './import-types.js';
 import { LuoguConnectionError, type LuoguConnectionManager } from './luogu-connection.js';
-import { PlatformError, isPlatformError, type PlatformErrorCode, type PlatformErrorReason } from './platform-errors.js';
+import { PLATFORM_ERROR_CODES, PlatformError, isPlatformError, type PlatformErrorCode, type PlatformErrorReason } from './platform-errors.js';
 import type { LuoguSourceGate } from './luogu-source-gate.js';
 import {
   LUOGU_SYNC_MAX_BACKOFF_MS,
@@ -128,7 +133,7 @@ import {
   type LuoguSyncStateRecord,
   type LuoguSyncStore,
 } from './luogu-sync-types.js';
-import { DEFAULT_PLATFORM_LIMITS, type AccountProfile, type PlatformAdapter, type PlatformLimits, type TrainingStore } from './ports.js';
+import { DEFAULT_PLATFORM_LIMITS, type AccountProfile, type PlatformAdapter, type PlatformLimits, type ProblemMetadataSource, type TrainingStore } from './ports.js';
 
 // ---------------------------------------------------------------------------------------
 // Errors
@@ -316,6 +321,18 @@ export interface LuoguSyncServiceOptions {
   readonly submissionsFor: (account: Account) => SyncPageSource;
   /** Anonymous metadata source of the same instance; only `fetchProblem` is ever used. */
   readonly metadataSource: PlatformAdapter;
+  /**
+   * Optional per-account factory of that account's **authenticated** metadata source.
+   *
+   * It is consulted only after the anonymous read of one problem answered `auth_required`: the
+   * account-bound source (its stored session is re-read from the vault on every call) then gets
+   * exactly one attempt for the same key, as its own gated operation. An absent factory leaves the
+   * anonymous refusal unchanged; a configured factory failure is reported as its own fixed error.
+   * The factory is never
+   * consulted for a successful read, a 403, a challenge, malformed JSON, an incomplete statement,
+   * a rate limit, a timeout or a cancellation, so no request is ever duplicated.
+   */
+  readonly authenticatedMetadataFor?: (account: Account) => ProblemMetadataSource;
   /** Lease owner identity; must be unique per running service instance. */
   readonly ownerId: string;
   /** Injected clock returning an ISO-8601 timestamp. */
@@ -501,14 +518,19 @@ const PRIVATE_USER_PROBLEM_KEY = /^[UT]\d+$/u;
  *
  * The platform publishes user-created personal problems under `U` / `T` ids, and its public problem guide
  * documents private personal problems
- * (<https://help.luogu.com.cn/manual/luogu/problem/>). An anonymous metadata read of one may
- * therefore answer `auth_required` or `forbidden` while the session and every public problem remain
- * fine, so this is a refusal of *that key* and never evidence that the stored session expired. The
- * decision reads the canonical {@link ProblemRef.externalKey} of the parsed reference, so no raw
- * string, URL or display name can be mistaken for the private-key prefix.
+ * (<https://help.luogu.com.cn/manual/luogu/problem/>). A `forbidden` metadata read of one may
+ * therefore be a refusal of *that key* while the session and every public problem remain fine, so
+ * this is a refusal of one item and never evidence that the stored session expired. The decision
+ * reads the canonical {@link ProblemRef.externalKey} of the parsed reference, so no raw string, URL
+ * or display name can be mistaken for the private-key prefix.
+ *
+ * Only `forbidden` is classified here. An `auth_required` answer is deliberately **not** an
+ * item-level diagnosis: it may be a genuinely unusable session as easily as a restricted problem, so
+ * the metadata path first retries it with the account's own authenticated source and, when that also
+ * asks for authentication, pauses the source instead of deferring the key.
  */
 function isPrivateProblemRefusal(ref: ProblemRef, code: LuoguSyncFailureCode): boolean {
-  return (code === 'auth_required' || code === 'forbidden') && PRIVATE_USER_PROBLEM_KEY.test(ref.externalKey);
+  return code === 'forbidden' && PRIVATE_USER_PROBLEM_KEY.test(ref.externalKey);
 }
 
 /**
@@ -605,6 +627,7 @@ export class LuoguSyncService {
   private readonly sourceInstance: SourceInstance;
   private readonly submissionsFor: (account: Account) => SyncPageSource;
   private readonly metadataSource: PlatformAdapter;
+  private readonly authenticatedMetadataFor: ((account: Account) => ProblemMetadataSource) | null;
   private readonly ownerId: string;
   private readonly now: () => string;
   private readonly gate: LuoguSourceGate;
@@ -648,12 +671,18 @@ export class LuoguSyncService {
       'unfilled_settings',
       'LuoguSyncService requires an anonymous metadata source',
     );
+    invariant(
+      options.authenticatedMetadataFor === undefined || typeof options.authenticatedMetadataFor === 'function',
+      'invalid_input',
+      'authenticatedMetadataFor must be a function when supplied',
+    );
     this.store = options.store;
     this.imports = options.imports;
     this.connections = options.connections;
     this.sourceInstance = options.sourceInstance;
     this.submissionsFor = options.submissionsFor;
     this.metadataSource = options.metadataSource;
+    this.authenticatedMetadataFor = options.authenticatedMetadataFor ?? null;
     this.ownerId = options.ownerId;
     this.now = options.now;
     this.gate = options.gate;
@@ -1284,8 +1313,9 @@ export class LuoguSyncService {
    *
    * The outcome is typed rather than thrown: `resolved` means the key left the backlog and its
    * per-key diagnostic was cleared, `deferred` means the platform refused this one item for this
-   * reader (an incomplete personal statement, or an anonymous refusal of a private user-created
-   * problem) and the key stays queued with its diagnostic, and `failed` means any other refusal.
+   * reader (an incomplete personal statement, or a `forbidden` refusal of a private `U`/`T`
+   * problem) and the key stays queued with its diagnostic, and `failed` means any other refusal —
+   * including a final `auth_required` after the one authenticated fallback was tried.
    * A refusal of the whole source — a live lease held elsewhere, a lost lease, an account or key that
    * is not queued — is still a typed `LuoguSyncError`, because it is not an outcome of this item.
    */
@@ -1329,28 +1359,25 @@ export class LuoguSyncService {
       await this.claim(account, { purpose: 'repair', mode: 'resume' }, opToken);
       try {
         const problemRef = parseProblemKey(key);
-        const report = await this.gate.run(opToken, async () => {
-          throwIfCancelled(opToken);
-          await this.renewLease(account.id, 'before a metadata retry');
-          throwIfCancelled(opToken);
-          // The key may have left the backlog while this operation waited for the source floor or for
-          // the lease: re-read the durable row and refuse without one platform request.
-          await this.requireLiveQueuedMetadataKey(account.id, key, opToken, 'before a metadata retry');
-          throwIfCancelled(opToken);
-          return this.imports.refreshProblemMetadata(this.metadataSource, {
-            problemRef,
-            token: opToken,
-            limits: this.limits,
-            // Runs INSIDE the import transaction, before anything else is read back: a lease taken
-            // over or expired during the request — or a cancellation — makes this throw and rolls
-            // the problem row and its snapshot back, so a stale claim commits neither. The success
-            // mutation opens no transaction of its own (the import owns one) and re-checks the lease
-            // and the queued membership again at the write boundary.
-            beforeCommit: async () => {
-              await this.applyMetadataRetry(account.id, key, { status: 'fetched', error: null }, opToken);
-            },
-          });
-        });
+        const report = await this.fetchMetadataWithFallback(
+          account,
+          problemRef,
+          opToken,
+          async (phase) => {
+            await this.renewLease(account.id, phase);
+            // The key may have left the backlog while this operation waited for the source floor or
+            // for the lease: re-read the durable row and refuse without one platform request.
+            await this.requireLiveQueuedMetadataKey(account.id, key, opToken, phase);
+          },
+          // Runs INSIDE the import transaction, before anything else is read back: a lease taken
+          // over or expired during the request — or a cancellation — makes this throw and rolls the
+          // problem row and its snapshot back, so a stale claim commits neither. The success
+          // mutation opens no transaction of its own (the import owns one) and re-checks the lease
+          // and the queued membership again at the write boundary.
+          async () => {
+            await this.applyMetadataRetry(account.id, key, { status: 'fetched', error: null }, opToken);
+          },
+        );
         if (report.status === 'fetched') {
           return { accountId: account.id, problemKey: key, outcome: 'resolved' as const, failureCode: null, reason: null };
         }
@@ -1588,7 +1615,9 @@ export class LuoguSyncService {
    * `metadata` reserves the same source-wide slot but repairs the durable backlog only: it reads no
    * history page and leaves every history watermark, the checkpoint and `historyComplete` exactly as
    * stored. It is the mode a user picks to drain a large backlog without running a history scan, and
-   * it never invokes a model — the metadata source is an anonymous platform read.
+   * it never invokes a model — the metadata read is a public platform read that starts anonymously
+   * and may retry exactly once with the account's own stored session
+   * ({@link LuoguSyncServiceOptions.authenticatedMetadataFor}).
    *
    * ## The source slot is taken synchronously
    *
@@ -2293,14 +2322,19 @@ export class LuoguSyncService {
    * `ImportService.refreshProblemMetadata` is used. A session-level failure or a rate limit stops
    * the phase with a typed, durable failure; transient failures just move on.
    *
-   * ## Private user-created problems refuse the item, not the session
+   * ## Authentication is retried once, then it pauses; only a 403 defers an item
    *
-   * `auth_required` or `forbidden` for a `U`-prefixed user-created problem is that item being denied
-   * to anonymous readers (see {@link isPrivateProblemRefusal}), not an expired session: the key is
-   * rotated and counted as failed exactly like any other item, the phase keeps its remaining keys,
-   * and the refusal is remembered as a **deferred** metadata failure so the backlog it leaves behind
-   * is still reported. A later session-level failure (a non-private refusal, a rate limit or a
-   * challenge) overwrites it and stops the phase, while any later success leaves it in place.
+   * Every key is read anonymously first. A failed report whose code is `auth_required` — for a
+   * `T`/`U` personal problem exactly as for a `P` problem, with no prefix-based early skip — is the
+   * one eligible answer for a single authenticated attempt with the account's own stored session,
+   * gated like every other source operation. A final `auth_required` is then a source-level refusal:
+   * the key is rotated, counted as failed with its per-key diagnostic, and the phase stops with the
+   * pausing `auth_required` failure, because the stored session may genuinely be unusable. Only a
+   * `forbidden` refusal of a private `U`/`T` key ({@link isPrivateProblemRefusal}) and an explicit
+   * `missing_statement` are item-scoped and deferred: the key stays queued, the diagnostic is
+   * recorded and the phase continues with the other keys. A later source-level failure (a rate limit
+   * or a challenge) overwrites the deferred item refusal and stops the phase, while any later
+   * success leaves it in place.
    *
    * ## Per-item commitment and the lease
    *
@@ -2383,22 +2417,23 @@ export class LuoguSyncService {
       // The lease is validated and renewed inside the gate callback, immediately before the request:
       // the gate may park this operation for a long time, and a lease that expired or was taken over
       // during that wait must refuse the request instead of dispatching it on a stale claim.
-      const report = await this.gate.run(token, async () => {
-        throwIfCancelled(token);
-        await this.renewLease(account.id, 'before a metadata request');
-        throwIfCancelled(token);
-        return this.imports.refreshProblemMetadata(this.metadataSource, {
-          problemRef,
-          token,
-          limits: this.limits,
-          // Runs INSIDE the metadata import transaction: the key is dequeued, its diagnostic is
-          // cleared and its single counter increment is committed in the same commit as the problem
-          // row and its snapshot. A lease taken over or expired during the request — or a
-          // cancellation — makes the hook throw and rolls the whole metadata write back instead of
-          // committing problem data on a stale claim.
-          beforeCommit: () => this.commitMetadataBatchItem(account.id, key, token),
-        });
-      });
+      const report = await this.fetchMetadataWithFallback(
+        account,
+        problemRef,
+        token,
+        async (phase) => {
+          await this.renewLease(account.id, phase);
+          // The key must still be queued for this account at the moment of the request: a stale
+          // queue entry (for example a row written by another instance) is never dispatched.
+          await this.requireLiveQueuedMetadataKey(account.id, key, token, phase);
+        },
+        // Runs INSIDE the metadata import transaction: the key is dequeued, its diagnostic is
+        // cleared and its single counter increment is committed in the same commit as the problem
+        // row and its snapshot. A lease taken over or expired during the request — or a
+        // cancellation — makes the hook throw and rolls the whole metadata write back instead of
+        // committing problem data on a stale claim.
+        () => this.commitMetadataBatchItem(account.id, key, token),
+      );
       if (report.status === 'fetched') {
         // The durable success was already committed by the hook above, in the import's own
         // transaction; only this loop's local queue and diagnostics need to follow it.
@@ -2460,6 +2495,79 @@ export class LuoguSyncService {
       }
     }
     return { failure: stop ?? deferred ?? transient, priorFailure };
+  }
+
+  /**
+   * Fetch one problem's metadata through the anonymous source, with the one authenticated fallback.
+   *
+   * The anonymous read is one whole {@link LuoguSourceGate} operation. Any answer that is not a
+   * failed `auth_required` report is final: the authenticated factory is not even consulted, so a
+   * 403, a challenge, malformed JSON, an incomplete statement, a rate limit, a timeout or a
+   * cancellation never causes a second request. Only an anonymous `auth_required` refusal is
+   * eligible, and it receives exactly **one** authenticated attempt as its own second gated
+   * operation — never nested inside the first — so the source-wide floor is measured between the two
+   * requests exactly as between any other pair of operations.
+   *
+   * `prepare` runs inside each gate callback, immediately before that attempt's request: it checks
+   * the caller's token, renews this pass's lease and revalidates the queued membership of the key,
+   * so a lease that expired or was taken over while the gate waited refuses the request instead of
+   * dispatching it on a stale claim. `beforeCommit` is the caller's own import-transaction hook and
+   * is shared by both attempts.
+   *
+   * An absent factory leaves the anonymous refusal unchanged. A configured factory failure is
+   * visible as its own fixed error; the final reader outcome alone determines the item result.
+   */
+  private async fetchMetadataWithFallback(
+    account: Account,
+    problemRef: ProblemRef,
+    token: CancellationToken,
+    prepare: (phase: string) => Promise<void>,
+    beforeCommit: () => Promise<void>,
+  ): Promise<RefreshProblemMetadataReport> {
+    const request: RefreshProblemMetadataRequest = { problemRef, token, limits: this.limits, beforeCommit };
+    const anonymous = await this.gate.run(token, async () => {
+      throwIfCancelled(token);
+      await prepare('before a metadata request');
+      throwIfCancelled(token);
+      return this.imports.refreshProblemMetadata(this.metadataSource, request);
+    });
+    if (anonymous.status === 'fetched' || anonymous.error === null || anonymous.error.code !== 'auth_required') {
+      return anonymous;
+    }
+    if (this.authenticatedMetadataFor === null) return anonymous;
+    return this.gate.run(token, async () => {
+      throwIfCancelled(token);
+      await prepare('before an authenticated metadata request');
+      throwIfCancelled(token);
+      const source = this.authenticatedMetadataSource(account, token);
+      throwIfCancelled(token);
+      return this.imports.refreshProblemMetadata(source, request);
+    });
+  }
+
+  /** Resolve a configured reader only after the request owns a live lease. */
+  private authenticatedMetadataSource(account: Account, token: CancellationToken): ProblemMetadataSource {
+    const factory = this.authenticatedMetadataFor;
+    if (factory === null) throw new PlatformError({ code: 'invalid_input', operation: 'problem', retryable: false, detail: 'the authenticated metadata reader is not configured' });
+    let source: ProblemMetadataSource;
+    try {
+      source = factory(account);
+    } catch (error) {
+      throwIfCancelled(token);
+      if ((error instanceof DomainError || isPlatformError(error)) && error.code === 'cancelled') {
+        throw new DomainError('cancelled', 'operation cancelled');
+      }
+      const typed = isPlatformError(error) && PLATFORM_ERROR_CODES.includes(error.code) && typeof error.retryable === 'boolean' ? error : null;
+      throw new PlatformError({ code: typed?.code ?? 'unavailable', operation: 'problem', retryable: typed?.retryable ?? false, retryAfterMs: typed?.retryAfterMs, detail: 'the authenticated metadata reader could not be created' });
+    }
+    if (!source || typeof source !== 'object' || typeof source.fetchProblem !== 'function' ||
+        source.sourceInstance?.id !== this.sourceInstance.id ||
+        source.sourceInstance.platform !== this.sourceInstance.platform ||
+        source.sourceInstance.baseUrl !== this.sourceInstance.baseUrl ||
+        source.sourceInstance.domain !== this.sourceInstance.domain) {
+      throw new PlatformError({ code: 'invalid_input', operation: 'problem', retryable: false, detail: 'the authenticated metadata reader does not match this source instance' });
+    }
+    return source;
   }
 
   /**
@@ -2698,11 +2806,13 @@ export class LuoguSyncService {
   /**
    * True when a metadata refusal addresses **this item** instead of the whole source.
    *
-   * Two refusals are item-scoped and therefore deferrable: an anonymous refusal of a private
-   * user-created problem ({@link isPrivateProblemRefusal}) and an explicitly diagnosed incomplete
-   * statement (`missing_statement`), which the official manual allows for personal problems and
-   * which no retry of the same request can repair. Every other refusal — a challenge, an HTML page,
-   * malformed JSON, a rate limit — belongs to the source and keeps its pause/backoff behavior.
+   * Two refusals are item-scoped and therefore deferrable: an explicit incomplete statement — the
+   * `missing_statement` reason of a `changed_response` payload refusal, which the official manual
+   * allows for personal problems and which no retry of the same request can repair — and a
+   * `forbidden` refusal of a private user-created problem ({@link isPrivateProblemRefusal}). Neither
+   * is evidence about the stored session. Every other refusal — an authentication wall, a challenge,
+   * an HTML page, malformed JSON, a rate limit — belongs to the source and keeps its pause/backoff
+   * behavior, so an exhausted authenticated fallback pauses instead of being deferred.
    */
   private isDeferrableItemFailure(
     problemRef: ProblemRef,

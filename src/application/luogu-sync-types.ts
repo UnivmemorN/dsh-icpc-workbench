@@ -190,11 +190,13 @@ export function luoguSyncFailurePauses(code: LuoguSyncFailureCode): boolean {
 /**
  * Which half of one pass produced a failure.
  *
- * A pass reads the authenticated submission history first and then repairs the **anonymous**
- * problem-metadata backlog. Both halves can answer `auth_required`, but the two answers do not mean
- * the same thing: a metadata refusal is an anonymous read being denied, so it is not evidence that
- * the stored session expired. `stage` exists to keep that distinction durable instead of inferring
- * it from a code that two different operations share.
+ * A pass reads the authenticated submission history first and then repairs the problem-metadata
+ * backlog, which starts as an anonymous public read and may retry exactly once with the account's
+ * own stored session. Both halves can answer `auth_required`, but the two answers do not mean the
+ * same thing: a metadata `auth_required` is a public problem read the platform asked to
+ * authenticate (older records may predate the authenticated retry) so it is not evidence that the
+ * session of the history reader is broken. `stage` exists to keep that distinction durable instead
+ * of inferring it from a code that two different operations share.
  */
 export type LuoguSyncFailureStage = 'history' | 'metadata';
 
@@ -248,9 +250,12 @@ export const LUOGU_METADATA_MAX_ISSUE_ATTEMPTS = 1_000_000;
  * how many failures this key has accumulated. A raw parser message, an exception text, a response
  * body, a cookie and a credential have no field here and are refused on the way in.
  *
- * The issue is **deferrable**: an explicit `missing_statement` (or an anonymous refusal of a private
- * user-created problem) leaves the key queued and the sync continues with the other keys, while the
- * diagnostic stays until that key is actually resolved.
+ * The issue is **deferrable** for exactly two item-scoped refusals: an explicit `missing_statement`
+ * and a `forbidden` refusal of a private `U`/`T` problem. Those leave the key queued and the sync
+ * continues with the other keys, while the diagnostic stays until that key is actually resolved. An
+ * `auth_required` answer is not one of them: the metadata read first retries with the account's own
+ * stored session and, if that also asks for authentication, this diagnostic is recorded while the
+ * source pauses instead of deferring the key.
  */
 export interface LuoguMetadataIssue {
   readonly problemKey: string;

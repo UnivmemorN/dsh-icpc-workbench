@@ -12,7 +12,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SqliteTrainingStore } from '../../src/adapters/sqlite/index.js';
 import { createLuoguAccount, luoguSourceInstance } from '../../src/adapters/luogu/index.js';
+import type { FetchInitLike, FetchLike, FetchResponseLike } from '../../src/adapters/platform/http.js';
 import { ImportService } from '../../src/application/import-service.js';
+import { emptyLuoguSyncState } from '../../src/application/luogu-sync-types.js';
+import { PlatformError } from '../../src/application/platform-errors.js';
 import { DEFAULT_PLATFORM_LIMITS } from '../../src/application/ports.js';
 import { createCancellationSource, type Account, type SourceInstance } from '../../src/domain/index.js';
 import { createLuoguHost } from '../../src/plugin/luogu-host.js';
@@ -219,6 +222,199 @@ void test('a throwing error observer is reported by disposal instead of becoming
     await sfx.until(() => observed.length === 1, 'the failed sweep to reach the observer');
     await assert.rejects(() => world.host.dispose(), /observer exploded/);
   } finally {
+    await world.disposeStore();
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Sprint 30b: the host composes the account-bound authenticated metadata fallback
+// ---------------------------------------------------------------------------------------
+
+/** One observed authenticated problem request of the host's own fallback reader. */
+interface HostProblemCall {
+  readonly pid: string;
+  readonly cookie: string | null;
+}
+
+interface HostProblemFeed {
+  readonly fetchImpl: FetchLike;
+  readonly calls: HostProblemCall[];
+}
+
+/** A valid `/problem/<pid>` answer the real parser accepts; nothing here talks to Luogu. */
+function hostProblemPayload(pid: string): unknown {
+  return {
+    data: {
+      problem: {
+        pid,
+        content: { name: `Problem ${pid}`, description: `Statement body of ${pid}` },
+        samples: [],
+        limits: { time: [1000], memory: [262_144] },
+        difficulty: 3,
+        tags: [1],
+      },
+    },
+  };
+}
+
+function createHostProblemFeed(): HostProblemFeed {
+  const calls: HostProblemCall[] = [];
+  const fetchImpl: FetchLike = async (url: string, init: FetchInitLike): Promise<FetchResponseLike> => {
+    const parsed = new URL(url);
+    const pid = decodeURIComponent(parsed.pathname.replace('/problem/', ''));
+    calls.push({ pid, cookie: init.headers['cookie'] ?? null });
+    return sfx.jsonResponse(hostProblemPayload(pid));
+  };
+  return { fetchImpl, calls };
+}
+
+interface FallbackHostWorld {
+  readonly temp: { readonly path: string; readonly dir: string };
+  readonly store: SqliteTrainingStore;
+  readonly instance: SourceInstance;
+  readonly alice: Account;
+  readonly bob: Account;
+  readonly host: ReturnType<typeof createLuoguHost>;
+  readonly metadata: sfx.MetadataHarness;
+  readonly problems: HostProblemFeed;
+  readonly token: ReturnType<typeof createCancellationSource>['token'];
+  disposeStore(): Promise<void>;
+}
+
+/**
+ * A host world whose transport answers both the authenticated `/record/list` validation page and the
+ * authenticated `/problem/<pid>` fallback request, so `createLuoguHost` can be driven end to end.
+ */
+async function createFallbackHostWorld(): Promise<FallbackHostWorld> {
+  const temp = fx.tempDatabase();
+  const clock = sfx.createClock();
+  const waits = sfx.createWait();
+  const vault = sfx.createMemoryVault();
+  const store = new SqliteTrainingStore({ path: temp.path, now: () => clock.now() });
+  const instance = luoguSourceInstance();
+  await store.upsertSourceInstances([instance]);
+  const alice = createLuoguAccount(instance, '800001');
+  const bob = createLuoguAccount(instance, '800002');
+  await store.upsertAccounts([alice, bob]);
+  const metadata = sfx.createMetadataAdapter(instance, clock.now);
+  const problems = createHostProblemFeed();
+  const records = sfx.createRecordFeed();
+  const transport: FetchLike = async (url, init) => {
+    return new URL(url).pathname.startsWith('/problem/')
+      ? problems.fetchImpl(url, init)
+      : records.fetchImpl(url, init);
+  };
+  const timers = timerSeam();
+  const host = createLuoguHost({
+    store,
+    imports: new ImportService({ store, now: clock.now }),
+    sourceInstance: instance,
+    metadataSource: metadata.adapter,
+    dataDir: temp.dir,
+    limits: DEFAULT_PLATFORM_LIMITS,
+    ownerId: 'host-fallback-owner',
+    onInternalError: () => {},
+    seam: {
+      vault,
+      now: clock.now,
+      nowMs: clock.nowMs,
+      wait: waits.wait,
+      tickIntervalMs: 1_000,
+      setInterval: timers.interval,
+      transport: { fetchImpl: transport, clock: clock.nowMs, wait: waits.wait, setTimer: sfx.neverFireTimer },
+    },
+  });
+  return {
+    temp,
+    store,
+    instance,
+    alice,
+    bob,
+    host,
+    metadata,
+    problems,
+    token: createCancellationSource().token,
+    async disposeStore() {
+      await store.close();
+      fx.removeDirectory(temp.dir);
+    },
+  };
+}
+
+/** Queue exactly `externalKeys` for one account, preserving every other durable field. */
+async function seedHostBacklog(
+  world: FallbackHostWorld,
+  accountId: string,
+  externalKeys: readonly string[],
+): Promise<void> {
+  const existing = await world.store.getLuoguSyncState(accountId);
+  const base = existing?.value ?? emptyLuoguSyncState(accountId, world.instance.id, fx.AT);
+  await world.store.saveLuoguSyncState(
+    {
+      ...base,
+      missingMetadata: externalKeys.map((key) => sfx.problemKeyOf(world.instance, key)),
+      updatedAt: fx.AT,
+    },
+    existing?.revision ?? null,
+  );
+}
+
+/** The anonymous metadata refusal every fallback of this case starts from. */
+function hostAuthWall(detail: string): PlatformError {
+  return new PlatformError({ code: 'auth_required', operation: 'problem', retryable: false, detail });
+}
+
+void test('the host composes a per-account metadata fallback and re-reads the stored session', async () => {
+  const world = await createFallbackHostWorld();
+  try {
+    await world.host.start(createCancellationSource().token);
+    await world.host.service.connect(world.alice.id, sfx.cookieFor('800001', 'alice-first'), world.token);
+    await world.host.service.connect(world.bob.id, sfx.cookieFor('800002', 'bob-client'), world.token);
+    await seedHostBacklog(world, world.alice.id, ['P900000001']);
+    await seedHostBacklog(world, world.bob.id, ['P900000002']);
+    // Both anonymous reads are refused with the login wall; only then may the host use a session.
+    world.metadata.fail.set('P900000001', hostAuthWall('synthetic login wall'));
+    world.metadata.fail.set('P900000002', hostAuthWall('synthetic login wall'));
+
+    assert.equal((await world.host.service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await world.host.service.settle();
+    const alice = await world.host.service.status(world.alice.id);
+    assert.equal(alice.metadataResolved, 1, 'the host fallback resolved the refused key');
+    assert.equal(alice.failure, null);
+    assert.deepEqual(
+      world.problems.calls,
+      [{ pid: 'P900000001', cookie: '__client_id=alice-first; _uid=800001' }],
+      "the host's fallback reader requested the same pid with alice's own stored session",
+    );
+    assert.ok(await world.store.getProblem(sfx.problemKeyOf(world.instance, 'P900000001')));
+
+    // Account isolation: bob's run uses bob's stored session for bob's pid, never alice's.
+    assert.equal((await world.host.service.start(world.bob.id, 'metadata')).outcome, 'started');
+    await world.host.service.settle();
+    const bob = await world.host.service.status(world.bob.id);
+    assert.equal(bob.metadataResolved, 1);
+    assert.deepEqual(
+      world.problems.calls.map((call) => call.cookie),
+      ['__client_id=alice-first; _uid=800001', '__client_id=bob-client; _uid=800002'],
+      'each account request carries exactly its own stored session',
+    );
+    assert.deepEqual(world.problems.calls.map((call) => call.pid), ['P900000001', 'P900000002']);
+
+    // A reconnect is observed by the very next fallback: the source re-reads the connection row and
+    // the vault on every call instead of caching the previous cookie.
+    await world.host.service.connect(world.alice.id, sfx.cookieFor('800001', 'alice-second'), world.token);
+    await seedHostBacklog(world, world.alice.id, ['P900000003']);
+    world.metadata.fail.set('P900000003', hostAuthWall('synthetic login wall'));
+    assert.equal((await world.host.service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await world.host.service.settle();
+    assert.equal(
+      world.problems.calls.at(-1)?.cookie,
+      '__client_id=alice-second; _uid=800001',
+      'the fresh stored session is used by the next fallback',
+    );
+    assert.ok(await world.store.getProblem(sfx.problemKeyOf(world.instance, 'P900000003')));
+  } finally {
+    await world.host.dispose();
     await world.disposeStore();
   }
 });

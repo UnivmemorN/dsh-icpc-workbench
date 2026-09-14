@@ -74,7 +74,7 @@ import {
   type Submission,
 } from '../domain/index.js';
 import { describePlatformError, editorialFailureFromPlatformError } from './platform-errors.js';
-import type { EditorialFetchResult, Page, PlatformAdapter, TrainingStore } from './ports.js';
+import type { EditorialFetchResult, Page, PlatformAdapter, ProblemMetadataSource, TrainingStore } from './ports.js';
 import type { SyncCheckpoint, SyncCheckpointRef } from './storage-types.js';
 import {
   IMPORT_PAGE_LIMITS,
@@ -805,10 +805,13 @@ export class ImportService {
    * transaction. A typed operational failure is returned as `status: 'failed'` (it never discards
    * the stored problem or its submissions), while cancellation and a caller-contract violation are
    * thrown. The identity of the fetched body is re-checked against the request before anything is
-   * written, so a foreign or renamed body can never be merged under this key.
+   * written, so a foreign or renamed body can never be merged under this key. The parameter is the
+   * narrow {@link ProblemMetadataSource} — only `sourceInstance` and `fetchProblem` are used — so an
+   * account-bound authenticated reader is a legal argument and no catalog, history or editorial
+   * call is reachable from this operation.
    */
   async refreshProblemMetadata(
-    adapter: PlatformAdapter,
+    adapter: ProblemMetadataSource,
     request: RefreshProblemMetadataRequest,
   ): Promise<RefreshProblemMetadataReport> {
     const token = request.token;
