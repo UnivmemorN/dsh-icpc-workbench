@@ -1,5 +1,8 @@
 # 独立 AI 能力评估
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 0.1.13 在「薄弱项 → 能力评估」加入独立报告。工作台通过 dsh 原生 llm 与持久审计会话调用 deepseek-official/deepseek-flash，推理强度 max；不另建 DeepSeek 直连客户端，也不使用 Pro。插件训练库与 Harness 工作区保持分离。
 
 ## 使用

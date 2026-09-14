@@ -1,5 +1,8 @@
 # 来源标签对照（source-aware raw-tag crosswalk）
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 状态：Sprint 10 已实现，规则版本 `TAG_MAPPING_VERSION = 2026.09.13.1`（每次随统计报告一起返回）。
 
 平台原始标签是**平台自己的说法**，不是本项目的知识分类。Codeforces 的 `dfs and similar`、`hashing`

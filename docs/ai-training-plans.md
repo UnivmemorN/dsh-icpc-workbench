@@ -1,5 +1,8 @@
 # AI training plans
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 The workbench prepares an AI training plan from a player's **real** stored data: the problems they have not solved in their own source instance, their aggregate weakness ranking and an identifier-free self-assessment reference plus descriptive practice statistics. The **训练计划** page drives this flow: AI planning is the default mode, the free rule-based preview stays one explicit switch away, and neither mode ever happens behind the user's back.
 
 ## The browser flow

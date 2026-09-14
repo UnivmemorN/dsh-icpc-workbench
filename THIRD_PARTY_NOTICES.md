@@ -64,20 +64,20 @@ file reproduces verified full upstream notices from exact release commits retain
 ## Knowledge learning references
 
 - [Nowcoder ACM knowledge-point exercises](https://ac.nowcoder.com/acm/skill/acm), observed 2026-09-13: inspiration for category browsing, search/filter and per-topic practice counts. The learning-evidence rules and implementation here are independent; no Nowcoder page, code, question bank or account records are copied.
-- [OI Wiki](https://oi-wiki.org/), OI Wiki Team and community contributors, [repository](https://github.com/OI-wiki/OI-wiki), observed 2026-09-13: reference for topic navigation and external learning resources. The package contains independently selected title/URL mappings, not OI Wiki article bodies, code, images or a mirror. Broad mappings are explicitly marked as overview references. See [knowledge-learning.md](docs/knowledge-learning.md) for implemented roles and future plans.
+- [OI Wiki](https://oi-wiki.org/), OI Wiki Team and community contributors, [repository](https://github.com/OI-wiki/OI-wiki), observed 2026-09-13: reference for topic navigation and external learning resources. The package contains independently selected title/URL mappings, not OI Wiki article bodies, code, images or a mirror. Broad mappings are explicitly marked as overview references. See [knowledge-learning.md](https://github.com/UnivmemorN/dsh-icpc-workbench/blob/main/docs/knowledge-learning.md) for implemented roles and future plans.
 - OI Wiki's [copyright declaration](https://github.com/OI-wiki/OI-wiki#版权声明) states that non-code content, unless otherwise specified, is available under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) and additional [SATA](https://github.com/zTrix/sata-license) terms; individual material may have separate notices. Any future reproduced/adapted content must retain its applicable attribution, license, source/version and change notices and must not be represented as covered solely by this project's MIT license.
 
 Neither Nowcoder nor OI Wiki supplies or certifies this project's mastery assessment. The status labels describe recorded evidence and are not a validated mastery probability.
 
 ## Source-tag alignment
 
-The [tag-alignment rules](docs/tag-alignment.md) reference public terminology from [Codeforces](https://codeforces.com/apiHelp/objects#Problem), [Luogu](https://www.luogu.com.cn/problem/list), [Nowcoder](https://ac.nowcoder.com/acm/skill/acm), and [OI Wiki](https://oi-wiki.org/), checked 2026-09-13. Cross-source equivalences and conservative exclusions are independently maintained project decisions, not an official joint taxonomy or endorsement. No problem/editorial bodies or third-party article code/images are incorporated. Existing project and content-license notices above continue to apply.
+The [tag-alignment rules](https://github.com/UnivmemorN/dsh-icpc-workbench/blob/main/docs/tag-alignment.md) reference public terminology from [Codeforces](https://codeforces.com/apiHelp/objects#Problem), [Luogu](https://www.luogu.com.cn/problem/list), [Nowcoder](https://ac.nowcoder.com/acm/skill/acm), and [OI Wiki](https://oi-wiki.org/), checked 2026-09-13. Cross-source equivalences and conservative exclusions are independently maintained project decisions, not an official joint taxonomy or endorsement. No problem/editorial bodies or third-party article code/images are incorporated. Existing project and content-license notices above continue to apply.
 
 ## Ability scoring references
 
 Reviewed 2026-09-13: [ZF3373/icpc-workbench](https://github.com/ZF3373/icpc-workbench) commit ac4a2e0920e07a9d5abde8cee54ac8aa8a3a5fa7, server/src/today/ability.ts and select.ts (MIT, Copyright (c) 2026 ZF3373). The separation of explicit overrides and practice evidence is a design reference; its median formula is not used as player ability. No implementation files are copied; the original MIT notice above remains included.
 
-[Codeforces official problem-difficulty explanation](https://codeforces.com/blog/entry/62865) and [official rating API](https://codeforces.com/apiHelp/methods#user.rating) define the distinction between problem ratings and official competition ratings. [AtCoder AHC v2](https://atcoder.jp/posts/1381) and its [formula](https://img.atcoder.jp/file/AHC_rating_v2_en.pdf) were reviewed, not implemented: practice solves are not contest performances. No article bodies, images or rating implementation code are incorporated. The product uses CF's returned current rating and independently implements the fetch, persistence and display; the sites do not certify or endorse this plugin. See [method and limitations](docs/ability-scoring.md).
+[Codeforces official problem-difficulty explanation](https://codeforces.com/blog/entry/62865) and [official rating API](https://codeforces.com/apiHelp/methods#user.rating) define the distinction between problem ratings and official competition ratings. [AtCoder AHC v2](https://atcoder.jp/posts/1381) and its [formula](https://img.atcoder.jp/file/AHC_rating_v2_en.pdf) were reviewed, not implemented: practice solves are not contest performances. No article bodies, images or rating implementation code are incorporated. The product uses CF's returned current rating and independently implements the fetch, persistence and display; the sites do not certify or endorse this plugin. See [method and limitations](https://github.com/UnivmemorN/dsh-icpc-workbench/blob/main/docs/ability-scoring.md).
 
 ## Luogu history synchronization
 
@@ -87,7 +87,7 @@ The Luogu history adapter references the account-history workflow and public end
 
 ## Luogu platform tag-name snapshot
 
-Sprint 21a bundles a public id → display-name snapshot read from [Luogu's public tag payload](https://www.luogu.com.cn/_lfe/tags), retrieved 2026-09-14 (HTTP 200, 505 entries). Only public tag identifiers and their platform display names are stored; the snapshot contains no problem statements, editorials, submissions, account records or other user material, and no third-party code is copied. These names are platform metadata for Luogu's own raw tags, not an algorithm taxonomy and not a verification by this plugin: unknown future ids stay explicitly unnamed, the snapshot is versioned with the plugin, and stored records are never migrated, re-imported or rewritten. No third-party license is asserted for this factual metadata here; Luogu does not license or endorse this plugin. See [docs/luogu-tag-names.md](docs/luogu-tag-names.md).
+Sprint 21a bundles a public id → display-name snapshot read from [Luogu's public tag payload](https://www.luogu.com.cn/_lfe/tags), retrieved 2026-09-14 (HTTP 200, 505 entries). Only public tag identifiers and their platform display names are stored; the snapshot contains no problem statements, editorials, submissions, account records or other user material, and no third-party code is copied. These names are platform metadata for Luogu's own raw tags, not an algorithm taxonomy and not a verification by this plugin: unknown future ids stay explicitly unnamed, the snapshot is versioned with the plugin, and stored records are never migrated, re-imported or rewritten. No third-party license is asserted for this factual metadata here; Luogu does not license or endorse this plugin. See [docs/luogu-tag-names.md](https://github.com/UnivmemorN/dsh-icpc-workbench/blob/main/docs/luogu-tag-names.md).
 
 ## Luogu public nickname presentation
 
@@ -99,7 +99,7 @@ reference page <https://www.luogu.com.cn/user/1> is cited only to identify that 
 page may include), and never biography, scores, submissions or other profile content. The
 implementation here is independent: no profile body, upstream code or dataset is copied, and no AI
 model is involved. Luogu does not license or endorse this plugin. See
-[docs/luogu-account-names.md](docs/luogu-account-names.md).
+[docs/luogu-account-names.md](https://github.com/UnivmemorN/dsh-icpc-workbench/blob/main/docs/luogu-account-names.md).
 
 ## Installable training methods
 

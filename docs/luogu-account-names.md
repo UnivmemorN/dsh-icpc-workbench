@@ -1,5 +1,8 @@
 # Luogu account names in the workbench
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 Status: UI presentation implemented (Sprint Contract 22b2). The backend `luogu.profile` route this
 document describes was implemented in the 22b1 round and is reported in
 [stage-22b-luogu-nickname.md](reports/stage-22b-luogu-nickname.md). Live acceptance against the real

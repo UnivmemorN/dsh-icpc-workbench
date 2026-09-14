@@ -1,5 +1,8 @@
 # DeepSeek balance plugin setup (ICPC workbench)
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 `@lemcae/dsh-balance` is an optional companion plugin that shows the DeepSeek Open Platform balance
 and an estimated session spend. It is installed per profile; it is never installed globally and it is
 not part of the ICPC workbench bundle.

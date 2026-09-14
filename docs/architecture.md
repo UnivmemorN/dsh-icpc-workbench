@@ -1,5 +1,8 @@
 # Architecture
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 ## Runtime
 TypeScript ESM, React and node:sqlite. Deliver one installable Cordis bundle with host and client halves.
 Support baseline: dsh 0.1.5-rc.2, source commit fb2c4b9e698e30edb738bca4cf0618587db7d203.

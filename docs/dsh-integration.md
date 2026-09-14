@@ -1,5 +1,8 @@
 # dsh integration notes (coordinator, 2026-09-12)
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 Tested baseline: dsh 0.1.5-rc.2, commit fb2c4b9e698e30edb738bca4cf0618587db7d203. The harness checkout remains an external read-only reference. npm has exact baseline versions of the public dsh packages even where the latest dist-tag is older. Use exact baseline peers, not the latest tag.
 
 ## Host boundaries

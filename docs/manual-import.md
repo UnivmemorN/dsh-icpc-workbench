@@ -1,5 +1,8 @@
 # Manual interchange v1 (offline import)
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 The manual import turns a user-authored file into validated domain records. It is a **file**
 format, not a platform download: parsing performs no request, and every `http(s)` URL in a
 document is stored as attribution only and is never fetched.

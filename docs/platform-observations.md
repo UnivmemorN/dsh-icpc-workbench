@@ -1,5 +1,8 @@
 # Platform observations (2026-09-12)
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 Coordinator performed anonymous Node fetch requests from this Windows host, with normal TLS verification and 20-second timeouts. Responses are ignored local artifacts, not repository fixtures. Do not infer editorial absence from failures.
 
 | Request | Result | Observed shape |

@@ -1,5 +1,8 @@
 # Credential boundary
 
+> **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
+
+
 What the ICPC workbench sends to a model, what it records, and which credentials it never touches.
 This document describes the Stage 25c privacy fix; it is not a claim that every possible secret is
 detected or that historical data is erased.
