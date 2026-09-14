@@ -498,6 +498,9 @@ export function AiAssessment({ accountId }: { accountId: string }) {
         }
       >
         <p className="icpc-muted">{ASSESSMENT_HISTORY_NOTE}</p>
+        <p className="icpc-muted">
+          修改完成方式不会重写已生成的历史报告：报告保留生成时的证据与结果，如需更新请重新准备并生成评估。
+        </p>
         <div className="icpc-toolbar">
           <label>
             每页条数

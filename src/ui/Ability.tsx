@@ -4,7 +4,7 @@ import { AbilityCalibrationEditor } from './AbilityCalibration.js';
 import { AbilityHistory } from './AbilityHistory.js';
 import { VirtualPerformance } from './VirtualPerformance.js';
 import type { ApiWeaknessResult } from '../application/workbench-api.js';
-import { Empty, Notice, Panel, Stats } from './common.js';
+import { Empty, Notice, Panel, Stats, useWorkbench } from './common.js';
 import {
   ABILITY_MODE_LABELS,
   ABILITY_NO_CONVERSION_NOTE,
@@ -22,6 +22,7 @@ export type AbilityViewData = ApiWeaknessResult['ability'];
 
 /** Personal calibration and descriptive evidence, projected from the typed weakness response. */
 export function Ability({ ability, onSaved }: { ability: AbilityViewData; onSaved: () => void }) {
+  const { navigate } = useWorkbench();
   const estimate = ability.estimate;
   const estimated = estimate.status === 'estimated';
   return (
@@ -60,6 +61,14 @@ export function Ability({ ability, onSaved }: { ability: AbilityViewData; onSave
         {abilityModeText(ability.completionModes.allTime)}；最近 {ability.coverage.recentWindowDays} 天新通过{' '}
         {ability.last90Days.newSolvedDistinct} 题（旧题重复 AC {ability.last90Days.repeatedAcDistinct} 题不计入新通过）。通过（AC）不等于独立完成，只有复盘能说明完成方式。
       </p>
+      <p className="icpc-muted">
+        “未标注”表示这道通过题没有复盘记录，独立性未知，不会被当作独立完成。修改完成方式请到题库（可单题或批量）：只改完成方式，不自动确认题目标签，也不改写历史 AI 报告。
+      </p>
+      <div className="icpc-actions">
+        <button type="button" onClick={() => navigate('bank')}>
+          去题库修改完成方式
+        </button>
+      </div>
       <p>{abilityExcludedText(ability)}</p>
 
       <h3>原生难度分布（描述性，不做跨平台换算）</h3>

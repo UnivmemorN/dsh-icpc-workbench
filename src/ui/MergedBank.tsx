@@ -658,6 +658,9 @@ export function MergedBank({ onSwitchToPlatform }: { onSwitchToPlatform: () => v
         </div>
         {read.error === null && pager('bottom')}
         <p className="icpc-muted">{MERGED_VIEW_NOTE}</p>
+        <Notice>
+          批量修改完成方式需切到「分平台题库」并选择该平台账号后进行：合并题库只做跨站浏览与通过联动，不会在这里写入任何平台的历史记录。
+        </Notice>
         <details className="icpc-merged-rules">
           <summary>合并规则说明（只识别 CF 原题编号）</summary>
           <p className="icpc-muted">

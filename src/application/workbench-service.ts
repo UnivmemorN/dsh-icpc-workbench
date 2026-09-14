@@ -162,6 +162,18 @@ import type {
   WorkbenchWeaknessCoverage,
   WorkbenchWeaknessResult,
 } from './workbench-types.js';
+import {
+  applyRetrospectiveEdits as applyRetrospectiveEditBatch,
+  listRetrospectiveEdits as listRetrospectiveEditBatch,
+  previewRetrospectiveEdits as previewRetrospectiveEditBatch,
+  type RetrospectiveEditApplyRequest,
+  type RetrospectiveEditApplyResult,
+  type RetrospectiveEditDeps,
+  type RetrospectiveEditListRequest,
+  type RetrospectiveEditListResult,
+  type RetrospectiveEditPreviewResult,
+  type RetrospectiveEditRequest,
+} from './retrospective-edit.js';
 
 /** Store rows read per internal walk of one account's submission history. */
 export const WORKBENCH_SUBMISSION_PAGE_SIZE = 500;
@@ -318,6 +330,12 @@ export interface WorkbenchRetrospectiveRequest {
   readonly taxonomyIds?: readonly string[];
   readonly solutionIds?: readonly string[];
   readonly note?: string | null;
+  /**
+   * Optional compare-and-set: omitted keeps the legacy append behaviour, `null` demands that no
+   * record exists yet and a string demands that exact latest record. A mismatch is refused before
+   * the insert, so a prefilled edit form cannot overwrite a newer record.
+   */
+  readonly expectedRetrospectiveId?: string | null;
 }
 
 /** One account's weakness statistics. Training mutations always need an explicit account. */
@@ -857,6 +875,7 @@ export class WorkbenchService {
       { reason: 'independent_with_solutions', solutionIds },
     );
     const note = optionalNote(request.note);
+    const expectedRetrospectiveId = optionalExpectedRetrospectiveId(request.expectedRetrospectiveId);
 
     // Everything the write depends on is read inside the write transaction: a concurrent snapshot
     // replacement that drops a consulted solution between a pre-transaction read and the insert is
@@ -890,15 +909,26 @@ export class WorkbenchService {
       token.throwIfCancelled();
       const previous = history
         .filter((entry) => entry.problemKey === problemKey)
-        .reduce<string | null>(
-          (latest, entry) => (latest === null || Date.parse(entry.recordedAt) > Date.parse(latest) ? entry.recordedAt : latest),
+        .reduce<Retrospective | null>(
+          (latest, entry) =>
+            latest === null || Date.parse(entry.recordedAt) >= Date.parse(latest.recordedAt) ? entry : latest,
           null,
         );
+      // The compare-and-set runs against the same history read the insert is based on: a record
+      // appended since the caller read the form is observed before anything is written.
+      if (expectedRetrospectiveId !== undefined && (previous?.retrospectiveId ?? null) !== expectedRetrospectiveId) {
+        throw new DomainError('invalid_transition', `the completion record of ${problemKey} changed since it was read`, {
+          reason: 'stale_retrospective',
+          problemKey,
+          expectedRetrospectiveId: expectedRetrospectiveId ?? null,
+          actualRetrospectiveId: previous?.retrospectiveId ?? null,
+        });
+      }
       const retrospective = createRetrospective({
         problemRef: problem.ref,
         accountId: account.id,
         mode,
-        recordedAt: monotonicInstant(previous, this.now()),
+        recordedAt: monotonicInstant(previous?.recordedAt ?? null, this.now()),
         taxonomyIds,
         solutionIds,
         note,
@@ -917,6 +947,38 @@ export class WorkbenchService {
         recorded: true,
       };
     });
+  }
+
+  // -------------------------------------------------------------------------------------
+  // retrospective batch editing (Sprint 23a)
+  // -------------------------------------------------------------------------------------
+
+  /** Latest completion record per problem (1..100), deduplicated and read in one transaction. */
+  async listRetrospectiveEdits(
+    request: RetrospectiveEditListRequest,
+    token: CancellationToken,
+  ): Promise<RetrospectiveEditListResult> {
+    return listRetrospectiveEditBatch(this.retrospectiveEditDeps(), request, requireToken(token));
+  }
+
+  /** Pure preview of one batch completion edit; nothing is persisted. */
+  async previewRetrospectiveEdits(
+    request: RetrospectiveEditRequest,
+    token: CancellationToken,
+  ): Promise<RetrospectiveEditPreviewResult> {
+    return previewRetrospectiveEditBatch(this.retrospectiveEditDeps(), request, requireToken(token));
+  }
+
+  /** Apply a previewed batch edit; a stale `expectedPreviewHash` writes nothing. */
+  async applyRetrospectiveEdits(
+    request: RetrospectiveEditApplyRequest,
+    token: CancellationToken,
+  ): Promise<RetrospectiveEditApplyResult> {
+    return applyRetrospectiveEditBatch(this.retrospectiveEditDeps(), request, requireToken(token));
+  }
+
+  private retrospectiveEditDeps(): RetrospectiveEditDeps {
+    return { store: this.store, taxonomy: this.taxonomy, now: this.now };
   }
 
   // -------------------------------------------------------------------------------------
@@ -2780,6 +2842,23 @@ function assertSolvedProjectionCoherent(
       accountSource: account.sourceInstanceId,
     },
   );
+}
+
+/** Optional CAS id: `undefined` means "not supplied", `null` means "no record expected yet". */
+function optionalExpectedRetrospectiveId(value: string | null | undefined): string | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  invariant(
+    typeof value === 'string' && value.trim().length > 0,
+    'invalid_input',
+    'expectedRetrospectiveId must be a non-empty string or null',
+    { reason: 'invalid_expected_retrospective_id' },
+  );
+  return value.trim();
 }
 
 /** Optional opaque id: omitted/`null` means "no scope", a non-empty string is passed through. */

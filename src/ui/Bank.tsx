@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Panel, Empty, Notice, ErrorNotice, useWorkbench, useRequest, tagName } from './common.js';
+import { CompletionEditor } from './CompletionEditor.js';
+import {
+  MAX_COMPLETION_EDIT_KEYS,
+  completionModeText,
+  pageSelectionNotice,
+  unrecordedProblemKeys,
+  unionPageSelection,
+} from './completion-view.js';
 import { MergedBank } from './MergedBank.js';
 import { jumpHint, pageNumbers, pagerDisplay, parseJumpPage } from './pager.js';
 import { ProblemView } from './Problem.js';
@@ -156,6 +164,45 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
   });
   const data = read.data;
 
+  // One batched `retro.list` for exactly the rows of the confirmed page: the completion column never
+  // issues one detail request per row. Without an account, or without rows, there is nothing honest
+  // to ask for, so no request is sent at all.
+  const pageKeys = (data?.items ?? []).map((problem) => problem.problemKey);
+  const modes = useRequest(
+    'retro.list',
+    accountId !== null && pageKeys.length > 0 ? { accountId, problemKeys: pageKeys } : null,
+  );
+  const latestModes = new Map(
+    (modes.data?.items ?? []).map((entry) => [entry.problemKey, entry.mode] as const),
+  );
+  const unrecordedOnPage = modes.data === null ? 0 : unrecordedProblemKeys(modes.data.items).length;
+  /** The scope one open editor owns; captured so a later page or account change cannot reach it. */
+  const [editor, setEditor] = useState<{
+    accountId: string;
+    keys: readonly string[];
+    /** True when it was opened from the selection: a selection change then closes it. */
+    fromSelection: boolean;
+  } | null>(null);
+  const [selectionNotice, setSelectionNotice] = useState<string | null>(null);
+  /** Bumped after a successful completion edit so the open problem detail re-reads its record. */
+  const [detailVersion, setDetailVersion] = useState(0);
+  const editorAnchor = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (editor !== null) {
+      editorAnchor.current?.scrollIntoView({ block: 'start' });
+    }
+  }, [editor]);
+
+  const selectionKey = selectedKeys.join('\u0000');
+  // A bulk editor's captured keys must match the visible selection: when the user changes it the
+  // editor closes, which aborts its in-flight request and drops its preview. A single-row editor is
+  // independent of the selection and stays open.
+  useEffect(() => {
+    setEditor((current) =>
+      current !== null && current.fromSelection && current.keys.join('\u0000') !== selectionKey ? null : current,
+    );
+  }, [selectionKey]);
+
   // The store clamps an out-of-range page to the last valid page (for example after data changed
   // underneath this screen); mirror that answer back so the next request starts where the server
   // actually served from.
@@ -208,6 +255,42 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
     setSelectedKeys(
       selectedKeys.includes(key) ? selectedKeys.filter((entry) => entry !== key) : [...selectedKeys, key],
     );
+    setSelectionNotice(null);
+  }
+
+  /** Open the reusable editor on an explicit scope; without an account or a key there is no scope. */
+  function openEditor(keys: readonly string[], fromSelection: boolean): void {
+    if (!accountId || keys.length === 0 || keys.length > MAX_COMPLETION_EDIT_KEYS) {
+      return;
+    }
+    setEditor({ accountId, keys: [...keys], fromSelection });
+  }
+
+  /**
+   * Add one explicit page scope (all rows, or only the rows whose latest record is missing).
+   *
+   * The union is bounded at 100 and reports how many visible rows did not fit, so a full selection
+   * never drops rows silently. The `未标注` set comes only from the confirmed batched list read.
+   */
+  function selectPage(unrecordedOnly: boolean): void {
+    const page = unrecordedOnly
+      ? unrecordedProblemKeys(modes.data?.items ?? [])
+      : (data?.items ?? []).map((problem) => problem.problemKey);
+    if (page.length === 0) {
+      setSelectionNotice(unrecordedOnly ? '本页没有“未标注”完成方式的题目。' : '当前页没有可选择的题目。');
+      return;
+    }
+    const outcome = unionPageSelection(selectedKeys, page);
+    setSelectedKeys([...outcome.keys]);
+    setSelectionNotice(
+      pageSelectionNotice(outcome) ??
+        (outcome.added === 0 ? '本页题目都已在选择中。' : `已加入 ${outcome.added} 题（来自本页）。`),
+    );
+  }
+
+  function clearSelection(): void {
+    setSelectedKeys([]);
+    setSelectionNotice(null);
   }
 
   function submitJump(event: FormEvent<HTMLFormElement>, from: 'top' | 'bottom'): void {
@@ -526,6 +609,7 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
                 <th>选择</th>
                 <th>题目</th>
                 <th>平台难度</th>
+                <th>完成方式</th>
                 <th>状态 / 标签</th>
               </tr>
             </thead>
@@ -551,6 +635,26 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
                       '未提供'}
                   </td>
                   <td>
+                    {accountId === null ? (
+                      <span className="icpc-muted">未选择账号</span>
+                    ) : modes.data === null ? (
+                      <span className="icpc-muted">
+                        {modes.pending ? '正在读取…' : modes.error !== null ? '未读取' : '—'}
+                      </span>
+                    ) : latestModes.has(problem.problemKey) ? (
+                      completionModeText(latestModes.get(problem.problemKey) ?? null)
+                    ) : (
+                      <span className="icpc-muted">未读取</span>
+                    )}{' '}
+                    <button
+                      type="button"
+                      disabled={accountId === null}
+                      onClick={() => openEditor([problem.problemKey], false)}
+                    >
+                      修改
+                    </button>
+                  </td>
+                  <td>
                     {problem.solvedByAccount ? '已通过' : '未确认通过'}
                     {problem.pendingReview && <span className="icpc-tag icpc-warning">待审核</span>}
                     {problem.effectiveTaxonomyIds?.map((id) => (
@@ -564,11 +668,42 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
             </tbody>
           </table>
         </div>
+        {modes.error !== null && (
+          <div className="icpc-actions">
+            <ErrorNotice error={modes.error} />
+            <button type="button" onClick={modes.refresh}>
+              重试读取完成方式
+            </button>
+          </div>
+        )}
         {read.error === null && pager('bottom')}
         <div className="icpc-actions">
-          <span className="icpc-muted">已选择 {selectedKeys.length} / 100 题</span>
-          <button type="button" disabled={!selectedKeys.length} onClick={() => setSelectedKeys([])}>
-            清空选择
+          <span className="icpc-muted">
+            已选择 {selectedKeys.length} / {MAX_COMPLETION_EDIT_KEYS} 题
+          </span>
+          <button
+            type="button"
+            disabled={read.pending || (data?.items.length ?? 0) === 0}
+            onClick={() => selectPage(false)}
+          >
+            选择本页
+          </button>
+          <button
+            type="button"
+            disabled={accountId === null || modes.data === null || unrecordedOnPage === 0}
+            onClick={() => selectPage(true)}
+          >
+            选择本页未标注
+          </button>
+          <button type="button" disabled={!selectedKeys.length} onClick={clearSelection}>
+            清空
+          </button>
+          <button
+            type="button"
+            disabled={accountId === null || selectedKeys.length === 0}
+            onClick={() => openEditor(selectedKeys, true)}
+          >
+            批量修改完成方式
           </button>
           <button
             type="button"
@@ -586,9 +721,46 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
             作为计划候选题
           </button>
         </div>
+        <p className="icpc-muted">
+          “本页”只指当前列表页；选择会跨页保留（最多 {MAX_COMPLETION_EDIT_KEYS} 题）。批量修改完成方式只写入当前账号与所选题目。
+        </p>
+        {selectionNotice !== null && (
+          <p className="icpc-muted" role="status">
+            {selectionNotice}
+          </p>
+        )}
       </Panel>
+      {editor !== null && (
+        <div className="icpc-completion-editor-anchor" ref={editorAnchor}>
+          <CompletionEditor
+            key={editor.accountId + '|' + editor.keys.join('\u0000')}
+            accountId={editor.accountId}
+            problemKeys={editor.keys}
+            onClose={() => setEditor(null)}
+            onApplied={() => {
+              // Refresh the page's own completion column and the open detail; bootstrap carries no
+              // completion record, so it is not re-read.
+              read.refresh();
+              modes.refresh();
+              setDetailVersion((value) => value + 1);
+            }}
+          />
+        </div>
+      )}
       {problemKey ? (
-        <ProblemView key={problemKey + '|' + accountId} problemKey={problemKey} onChange={read.refresh} />
+        <ProblemView
+          key={problemKey + '|' + accountId + '|' + detailVersion}
+          problemKey={problemKey}
+          onChange={() => {
+            // A save from the detail (the full retrospective form or its quick editor) moves the
+            // completion record of a row already on this page. The page keys usually do not change,
+            // so the batched `retro.list` input string stays identical and must be refreshed next to
+            // the browse rows. The detail key is deliberately untouched here: the form that saved
+            // stays mounted, so its own acknowledgement remains visible.
+            read.refresh();
+            modes.refresh();
+          }}
+        />
       ) : (
         <Notice>点击题目查看题面；未完成题目的标签与题解保持隐藏，直到你明确选择查看。</Notice>
       )}

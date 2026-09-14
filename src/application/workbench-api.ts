@@ -76,6 +76,14 @@ import type {
   VirtualPerformanceListRequest,
   VirtualPerformanceSaveRequest,
 } from './virtual-performance-service.js';
+import type {
+  RetrospectiveEditApplyRequest,
+  RetrospectiveEditApplyResult,
+  RetrospectiveEditListRequest,
+  RetrospectiveEditListResult,
+  RetrospectiveEditPreviewResult,
+  RetrospectiveEditRequest,
+} from './retrospective-edit.js';
 
 // ---------------------------------------------------------------------------------------
 // Endpoint vocabulary
@@ -163,6 +171,9 @@ export const WORKBENCH_API_OPERATIONS = {
   problemDetail: 'problem.detail',
   reviewTag: 'review.tag',
   retroRecord: 'retro.record',
+  retroList: 'retro.list',
+  retroEditPreview: 'retro.editPreview',
+  retroEditApply: 'retro.editApply',
   weakness: 'weakness',
   planPreview: 'plan.preview',
   planList: 'plan.list',
@@ -746,6 +757,21 @@ export type ApiReviewTagResult = WorkbenchTagReviewResult;
 export type ApiRetroRecordRequest = ApiRequestOf<WorkbenchRetrospectiveRequest>;
 export type ApiRetroRecordResult = WorkbenchRetrospectiveResult;
 
+/**
+ * Batch completion editing (Sprint 23a).
+ *
+ * `retro.list` reads the latest completion record of up to 100 problems of one account;
+ * `retro.editPreview` returns a hash-bound, spoiler-free projection of an edit and writes nothing;
+ * `retro.editApply` repeats the intent with that hash and appends one row per changed problem in a
+ * single transaction. None of them carries raw tags, a note or a consulted solution id.
+ */
+export type ApiRetroListRequest = ApiRequestOf<RetrospectiveEditListRequest>;
+export type ApiRetroListResult = RetrospectiveEditListResult;
+export type ApiRetroEditPreviewRequest = ApiRequestOf<RetrospectiveEditRequest>;
+export type ApiRetroEditPreviewResult = RetrospectiveEditPreviewResult;
+export type ApiRetroEditApplyRequest = ApiRequestOf<RetrospectiveEditApplyRequest>;
+export type ApiRetroEditApplyResult = RetrospectiveEditApplyResult;
+
 export type ApiWeaknessRequest = ApiRequestOf<WorkbenchWeaknessRequest>;
 export type ApiWeaknessResult = WorkbenchWeaknessResult;
 
@@ -825,6 +851,9 @@ export interface WorkbenchApiMap {
   'problem.detail': ApiEndpoint<ApiProblemDetailRequest, ApiProblemDetailResult>;
   'review.tag': ApiEndpoint<ApiReviewTagRequest, ApiReviewTagResult>;
   'retro.record': ApiEndpoint<ApiRetroRecordRequest, ApiRetroRecordResult>;
+  'retro.list': ApiEndpoint<ApiRetroListRequest, ApiRetroListResult>;
+  'retro.editPreview': ApiEndpoint<ApiRetroEditPreviewRequest, ApiRetroEditPreviewResult>;
+  'retro.editApply': ApiEndpoint<ApiRetroEditApplyRequest, ApiRetroEditApplyResult>;
   weakness: ApiEndpoint<ApiWeaknessRequest, ApiWeaknessResult>;
   'plan.preview': ApiEndpoint<ApiPlanPreviewRequest, ApiPlanPreviewResult>;
   'plan.list': ApiEndpoint<ApiPlanListRequest, ApiPlanListResult>;

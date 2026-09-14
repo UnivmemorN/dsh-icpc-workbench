@@ -161,4 +161,20 @@ export const styles=`
 .icpc-sync-link{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin-bottom:16px}
 .icpc-sync-link .icpc-muted{flex:1 1 220px;min-width:0;font-size:12px;overflow-wrap:anywhere}
 @media(max-width:640px){.icpc-account-list{grid-template-columns:1fr}.icpc-accounts-source .icpc-toolbar>label{flex-basis:100%}}
+/* Sprint 23b: per-problem and bulk completion editing. The editor is a normal inline section; the
+   bank scrolls it into view, so it never becomes an off-screen form without a cue. */
+.icpc-completion-summary{margin-top:14px;padding-top:12px;border-top:1px solid var(--icpc-line);min-width:0}
+.icpc-completion-summary>h3{margin-bottom:6px}
+.icpc-completion-editor{margin-top:16px;padding:14px 16px;border:1px solid var(--icpc-line);border-radius:9px;background:var(--icpc-soft);min-width:0;display:flex;flex-direction:column;gap:10px}
+.icpc-completion-editor h3,.icpc-completion-editor h4{margin:0}
+.icpc-completion-editor fieldset{display:flex;flex-direction:column;gap:9px;min-width:0;border:1px solid var(--icpc-line);border-radius:8px;padding:10px 12px;margin:0}
+.icpc-completion-editor legend{padding:0 6px;color:var(--icpc-muted);font-size:12px}
+.icpc-knowledge-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:4px 12px;max-height:15rem;overflow:auto;padding:6px;border:1px solid var(--icpc-line);border-radius:8px;background:var(--icpc-card)}
+.icpc-knowledge-list .icpc-check{flex-direction:row;align-items:center;gap:6px}
+.icpc-completion-preview{margin-top:8px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.icpc-completion-editor-anchor{margin-top:16px}
+.icpc-retro-form{margin-top:14px;padding-top:12px;border-top:1px solid var(--icpc-line);min-width:0}
+.icpc-retro-form>summary{cursor:pointer;font-weight:600;padding:4px 0;color:var(--icpc-ink)}
+.icpc-retro-form form{display:flex;flex-direction:column;gap:9px;margin-top:10px;min-width:0}
+@media(max-width:640px){.icpc-knowledge-list{grid-template-columns:1fr}}
 `;

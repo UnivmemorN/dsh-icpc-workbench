@@ -30,7 +30,7 @@ export function ProblemView({problemKey,onChange}:{problemKey:string;onChange:()
  </>}
  <UserAnswer key={problemKey} problemKey={problemKey} snapshotId={problem.snapshot?.snapshotId??null} hasStatement={Boolean(problem.statement)} onChange={changed}/>
  <Coaching key={problem.snapshot?.snapshotId??'no-snapshot'} problemKey={problemKey} snapshotId={problem.snapshot?.snapshotId??null} hasStatement={Boolean(problem.statement)}/>
- <Retrospective problem={problem} onChange={changed}/>
+ <Retrospective problem={problem} onChange={changed} onReveal={()=>setReveal(true)}/>
  <details><summary>刷新或补充材料</summary><label>CF 官方 tutorial 链接（可选）<input value={tutorial} onChange={e=>setTutorial(e.target.value)} placeholder="https://codeforces.com/blog/entry/…"/></label><button disabled={action.busy} onClick={()=>{void action.run(async signal=>{const result=await api.request('material.refresh',{problemKey,fetchStatement:true,...(tutorial.trim()?{officialTutorialUrl:tutorial.trim()}:{})},signal);setRefreshed(result);changed();return result;});}}>从平台刷新题面与题解</button>
  {refreshed&&<Notice>题面：{refreshed.statement.status}{refreshed.statement.failure?' / '+refreshed.statement.failure.code:''}\n题解：{refreshed.editorial.status??'未获取'}{refreshed.editorial.failure?' / '+refreshed.editorial.failure.code:''}{refreshed.editorial.skippedReason?' / '+refreshed.editorial.skippedReason:''}</Notice>}
  <Notice>鉴权、限流和网络错误不代表“没有题解”。可以手工粘贴你已获取的真实材料。</Notice>

@@ -317,6 +317,12 @@ export function Weakness() {
                       ]}
                     />
                     <p>这些记录来自你填写的复盘。通过一道题不会自动确认掌握它的所有解法。</p>
+                    <p className="icpc-muted">
+                      没有复盘记录的已通过题在这里计为“未标注”：通过（AC）只说明提交被接受，独立性未知。批量或单题“修改完成方式”只改完成方式，不会自动确认题目的全部标签，也不会改写历史 AI 报告。
+                    </p>
+                    <div className="icpc-actions">
+                      <button onClick={() => navigate('bank')}>去题库修改完成方式</button>
+                    </div>
                     <div className="icpc-tags">
                       {data.report.confirmedSkills.taxonomyIds.map((id) => (
                         <span key={id} className="icpc-tag">

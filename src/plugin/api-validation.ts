@@ -45,6 +45,10 @@ import {
   MAX_REVIEW_NOTE_CHARS,
 } from '../application/workbench-service.js';
 import {
+  MAX_RETROSPECTIVE_EDIT_KEYS,
+  type RetrospectiveKnowledgeIntent,
+} from '../application/retrospective-edit.js';
+import {
   MAX_SUPPLEMENT_STATEMENT_CHARS,
 } from '../application/import-types.js';
 import {
@@ -68,6 +72,9 @@ import {
   type ApiProblemDetailRequest,
   type ApiProblemListRequest,
   type ApiProblemMergedBrowseRequest,
+  type ApiRetroEditApplyRequest,
+  type ApiRetroEditPreviewRequest,
+  type ApiRetroListRequest,
   type ApiRetroRecordRequest,
   type ApiReviewTagRequest,
   type ApiSupplementEditorial,
@@ -807,7 +814,12 @@ export function validateReviewTag(value: unknown): ApiReviewTagRequest {
 
 export function validateRetroRecord(value: unknown): ApiRetroRecordRequest {
   const object = plainObject('retro.record', value);
-  requireKeys('retro.record', object, ['problemKey', 'accountId', 'mode'], ['taxonomyIds', 'solutionIds', 'note']);
+  requireKeys('retro.record', object, ['problemKey', 'accountId', 'mode'], [
+    'taxonomyIds',
+    'solutionIds',
+    'note',
+    'expectedRetrospectiveId',
+  ]);
   return {
     problemKey: problemKeyInput('problemKey', object['problemKey']),
     accountId: accountIdInput('accountId', object['accountId']),
@@ -837,6 +849,82 @@ export function validateRetroRecord(value: unknown): ApiRetroRecordRequest {
     ...(object['note'] === undefined
       ? {}
       : { note: nullableString('note', object['note'], MAX_REVIEW_NOTE_CHARS) }),
+    // Absent means "legacy append"; an explicit null or id is the optimistic-concurrency guard.
+    ...(object['expectedRetrospectiveId'] === undefined
+      ? {}
+      : {
+          expectedRetrospectiveId: nullableString(
+            'expectedRetrospectiveId',
+            object['expectedRetrospectiveId'],
+            MAX_API_ID_CHARS,
+          ),
+        }),
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// Batch completion editing (Sprint 23a)
+// ---------------------------------------------------------------------------------------
+
+/** 1..100 canonical problem keys; the array bound is enforced before any per-entry work. */
+function retroEditProblemKeys(value: unknown): readonly string[] {
+  return arrayValue('problemKeys', value, MAX_RETROSPECTIVE_EDIT_KEYS, (entry, path) => problemKeyInput(path, entry));
+}
+
+/** Closed knowledge intent: `preserve` carries nothing, `add` needs a non-empty id list. */
+function knowledgeIntent(value: unknown): RetrospectiveKnowledgeIntent {
+  const object = plainObject('knowledge', value);
+  const kind = enumValue('knowledge.kind', object['kind'], ['preserve', 'add'] as const);
+  if (kind === 'preserve') {
+    requireKeys('knowledge', object, ['kind']);
+    return { kind: 'preserve' };
+  }
+  requireKeys('knowledge', object, ['kind', 'taxonomyIds']);
+  return {
+    kind: 'add',
+    taxonomyIds: arrayValue(
+      'knowledge.taxonomyIds',
+      object['taxonomyIds'],
+      MAX_RETROSPECTIVE_IDS,
+      (entry, path) => requiredString(path, entry, MAX_API_TEXT_CHARS),
+    ),
+  };
+}
+
+export function validateRetroList(value: unknown): ApiRetroListRequest {
+  const object = plainObject('retro.list', value);
+  requireKeys('retro.list', object, ['accountId', 'problemKeys']);
+  return {
+    accountId: accountIdInput('accountId', object['accountId']),
+    problemKeys: retroEditProblemKeys(object['problemKeys']),
+  };
+}
+
+export function validateRetroEditPreview(value: unknown): ApiRetroEditPreviewRequest {
+  const object = plainObject('retro.editPreview', value);
+  requireKeys('retro.editPreview', object, ['accountId', 'problemKeys', 'mode'], ['knowledge']);
+  return {
+    accountId: accountIdInput('accountId', object['accountId']),
+    problemKeys: retroEditProblemKeys(object['problemKeys']),
+    mode: enumValue('mode', object['mode'], COMPLETION_MODES),
+    ...(object['knowledge'] === undefined ? {} : { knowledge: knowledgeIntent(object['knowledge']) }),
+  };
+}
+
+export function validateRetroEditApply(value: unknown): ApiRetroEditApplyRequest {
+  const object = plainObject('retro.editApply', value);
+  requireKeys(
+    'retro.editApply',
+    object,
+    ['accountId', 'problemKeys', 'mode', 'expectedPreviewHash'],
+    ['knowledge'],
+  );
+  return {
+    accountId: accountIdInput('accountId', object['accountId']),
+    problemKeys: retroEditProblemKeys(object['problemKeys']),
+    mode: enumValue('mode', object['mode'], COMPLETION_MODES),
+    expectedPreviewHash: requiredString('expectedPreviewHash', object['expectedPreviewHash'], MAX_API_ID_CHARS),
+    ...(object['knowledge'] === undefined ? {} : { knowledge: knowledgeIntent(object['knowledge']) }),
   };
 }
 

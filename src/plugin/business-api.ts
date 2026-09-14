@@ -112,6 +112,9 @@ import {
   validateProblemList,
   validateProblemMergedBrowse,
   validateRetroRecord,
+  validateRetroList,
+  validateRetroEditPreview,
+  validateRetroEditApply,
   validateReviewTag,
   validateSyncPage,
   validateWeakness,
@@ -467,6 +470,23 @@ function businessRoutes(context: ApiContext): readonly BusinessRouteEntry[] {
       method: 'POST',
       validate: validateRetroRecord,
       handle: async (input, token) => context.workbench.recordRetrospective(input, token),
+    }),
+    // Batch completion editing (Sprint 23a): list the latest record, preview an edit hash, then
+    // apply it. All three are free local reads/writes; none dispatches a model or a platform call.
+    businessRoute(WORKBENCH_API_OPERATIONS.retroList, {
+      method: 'POST',
+      validate: validateRetroList,
+      handle: async (input, token) => context.workbench.listRetrospectiveEdits(input, token),
+    }),
+    businessRoute(WORKBENCH_API_OPERATIONS.retroEditPreview, {
+      method: 'POST',
+      validate: validateRetroEditPreview,
+      handle: async (input, token) => context.workbench.previewRetrospectiveEdits(input, token),
+    }),
+    businessRoute(WORKBENCH_API_OPERATIONS.retroEditApply, {
+      method: 'POST',
+      validate: validateRetroEditApply,
+      handle: async (input, token) => context.workbench.applyRetrospectiveEdits(input, token),
     }),
     businessRoute(WORKBENCH_API_OPERATIONS.abilitySyncRating, {
       method: 'POST', validate: validateWeakness,
