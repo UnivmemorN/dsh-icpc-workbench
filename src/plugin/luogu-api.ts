@@ -29,7 +29,9 @@
 import type { HostConnectionFetch } from '@deepseek-ai/dsh-client-connection';
 import {
   DomainError,
+  MAX_DISPOSITION_BATCH,
   MAX_LUOGU_COOKIE_INPUT_BYTES,
+  canonicalProblemKey,
   createCancellationSource,
   inspectLuoguSessionCookie,
   normalizeLuoguSessionCookie,
@@ -43,7 +45,13 @@ import {
 import { MAX_SUPPLEMENT_STATEMENT_CHARS, MAX_SUPPLEMENT_TITLE_CHARS } from '../application/import-types.js';
 import { MAX_CREDENTIAL_SECRET_BYTES } from '../application/local-credential-vault.js';
 import { LuoguConnectionError } from '../application/luogu-connection.js';
-import { LuoguSyncError, LuoguSyncService, combineTokens } from '../application/luogu-sync-service.js';
+import {
+  LUOGU_MANAGED_PROBLEMS_DEFAULT_PAGE_SIZE,
+  LUOGU_MANAGED_PROBLEMS_MAX_PAGE_SIZE,
+  LuoguSyncError,
+  LuoguSyncService,
+  combineTokens,
+} from '../application/luogu-sync-service.js';
 import {
   LUOGU_SYNC_INTERVAL_MAX_MINUTES,
   LUOGU_SYNC_INTERVAL_MIN_MINUTES,
@@ -60,6 +68,11 @@ import {
   type ApiLuoguAccountRequest,
   type ApiLuoguConfigureRequest,
   type ApiLuoguConnectRequest,
+  type ApiLuoguManageProblemsItem,
+  type ApiLuoguManageProblemsRequest,
+  type ApiLuoguManageProblemsResult,
+  type ApiLuoguManagedProblemsRequest,
+  type ApiLuoguManagedProblemsView,
   type ApiLuoguMetadataBacklogRequest,
   type ApiLuoguMetadataBacklogView,
   type ApiLuoguProfileResult,
@@ -207,6 +220,16 @@ function toTransportFailure(error: unknown): never {
     // A stale snapshot is a *refresh* condition, not a settings condition: the caller must re-read
     // the problem (refresh the page or reopen the recovery form) and resubmit. It is recognised by
     // the application-owned reason tag, never by the exception text.
+    // A lost compare-and-set on the durable disposition means another window or account changed the
+    // same key: the caller must re-read the managed list and resubmit the whole batch.
+    if (error.details['reason'] === 'disposition_conflict') {
+      throw new ApiTransportError('conflict', '题目状态已在别处修改，请刷新管理列表后重试。');
+    }
+    // A restore whose keys cannot fit the bounded metadata backlog rolled back completely; the
+    // caller must free queue space before restoring them.
+    if (error.details['reason'] === 'metadata_backlog_full') {
+      throw new ApiTransportError('conflict', '待补全题目的队列已满，无法恢复这些题目；请先补全或清理队列后重试。');
+    }
     if (error.details['reason'] === 'stale_snapshot') {
       throw new ApiTransportError(
         'conflict',
@@ -409,6 +432,113 @@ function validateRetryMetadataRequest(instance: SourceInstance) {
       refuse('problemKey 无效。');
     }
     return { accountId, problemKey };
+  };
+}
+
+/**
+ * Validate one luogu.managedProblems request without IO.
+ *
+ * state selects the skipped or the trashed set; both bounds are optional and defaulted here, so a
+ * caller cannot ask for an unbounded page (the store's recovery read refuses more than 50 rows).
+ */
+function validateManagedProblemsRequest(instance: SourceInstance) {
+  return (value: unknown): ApiLuoguManagedProblemsRequest => {
+    const record = requireObject('luogu.managedProblems', value, ['accountId', 'page', 'pageSize', 'state']);
+    const accountId = requireAccountId(instance, record['accountId']);
+    const state = record['state'];
+    if (state !== 'skipped' && state !== 'trashed') {
+      refuse('state 必须是 skipped 或 trashed。');
+    }
+    const page = record['page'];
+    if (page !== undefined && !(typeof page === 'number' && Number.isSafeInteger(page) && page >= 1)) {
+      refuse('page 必须是 ≥ 1 的整数。');
+    }
+    const pageSize = record['pageSize'];
+    if (
+      pageSize !== undefined &&
+      !(
+        typeof pageSize === 'number' &&
+        Number.isSafeInteger(pageSize) &&
+        pageSize >= 1 &&
+        pageSize <= LUOGU_MANAGED_PROBLEMS_MAX_PAGE_SIZE
+      )
+    ) {
+      refuse('pageSize 必须是 1..' + String(LUOGU_MANAGED_PROBLEMS_MAX_PAGE_SIZE) + ' 的整数。');
+    }
+    return {
+      accountId,
+      state,
+      ...(page === undefined ? {} : { page }),
+      ...(pageSize === undefined ? {} : { pageSize }),
+    };
+  };
+}
+
+/**
+ * Canonical key check shared by luogu.manageProblems: of this configured instance, and exactly its
+ * own canonical re-encoding.
+ *
+ * Parsing alone is not enough: `parseProblemKey` accepts an encoded part that decodes to text whose
+ * canonical encoding differs (for example an encoded leading space, which the composing factory
+ * trims away). The domain's {@link canonicalProblemKey} owns the full roundtrip rule — bounded
+ * length, parseable shape and `problemKey(parseProblemKey(value)) === value` — so the boundary
+ * applies exactly that rule, then requires the key's own source instance. Every refusal therefore
+ * happens here, before the handler reads the store or reaches the service, and the returned key is
+ * the canonical spelling rather than the caller's text.
+ */
+function requireManagedProblemKey(instance: SourceInstance, value: unknown): string {
+  let key: string;
+  try {
+    key = canonicalProblemKey(value);
+  } catch {
+    return refuse('problemKey 不是规范的题目标识。');
+  }
+  if (parseProblemKey(key).sourceInstanceId !== instance.id) {
+    return refuse('该题目不属于已配置的洛谷来源。');
+  }
+  return key;
+}
+
+/**
+ * Validate one luogu.manageProblems request without IO.
+ *
+ * The batch contract is closed: 1..MAX_DISPOSITION_BATCH items, each exactly problemKey plus
+ * expectedState, distinct canonical keys of this configured instance, and expectedState limited to
+ * active/skipped/trashed. Action/state compatibility and local knowledge are decided against
+ * durable state by the store's atomic CAS batch inside one transaction, so this boundary never
+ * reads the store.
+ */
+function validateManageProblemsRequest(instance: SourceInstance) {
+  return (value: unknown): ApiLuoguManageProblemsRequest => {
+    const record = requireObject('luogu.manageProblems', value, ['accountId', 'action', 'items']);
+    const accountId = requireAccountId(instance, record['accountId']);
+    const action = record['action'];
+    if (action !== 'skip' && action !== 'trash' && action !== 'restore') {
+      refuse('action 必须是 skip、trash 或 restore。');
+    }
+    const rawItems = record['items'];
+    if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > MAX_DISPOSITION_BATCH) {
+      refuse('items 必须是 1..' + String(MAX_DISPOSITION_BATCH) + ' 项的数组。');
+    }
+    const seen = new Set<string>();
+    const items: ApiLuoguManageProblemsItem[] = rawItems.map((entry, index) => {
+      const item = requireObject(
+        'luogu.manageProblems.items[' + String(index) + ']',
+        entry,
+        ['problemKey', 'expectedState'],
+      );
+      const problemKey = requireManagedProblemKey(instance, item['problemKey']);
+      if (seen.has(problemKey)) {
+        refuse('items 中的题目标识不能重复。');
+      }
+      seen.add(problemKey);
+      const expectedState = item['expectedState'];
+      if (expectedState !== 'active' && expectedState !== 'skipped' && expectedState !== 'trashed') {
+        refuse('expectedState 必须是 active、skipped 或 trashed。');
+      }
+      return { problemKey, expectedState };
+    });
+    return { accountId, action, items };
   };
 }
 
@@ -928,6 +1058,44 @@ export async function registerLuoguApi(options: RegisterLuoguApiOptions): Promis
           status: await projectStatus(context, account),
           outcome: result.outcome,
         };
+      },
+    );
+    add(
+      LUOGU_API_OPERATIONS.managedProblems,
+      validateManagedProblemsRequest(options.sourceInstance),
+      async (input): Promise<ApiLuoguManagedProblemsView> => {
+        const account = await requireStoredAccount(context, input.accountId);
+        // Local read: no connection backend, no gate and no lease. The account must still be stored
+        // and belong to this configured instance.
+        return context.service.managedProblems(
+          account.id,
+          input.state,
+          input.page ?? 1,
+          input.pageSize ?? LUOGU_MANAGED_PROBLEMS_DEFAULT_PAGE_SIZE,
+        );
+      },
+    );
+    add(
+      LUOGU_API_OPERATIONS.manageProblems,
+      validateManageProblemsRequest(options.sourceInstance),
+      async (input, token): Promise<ApiLuoguManageProblemsResult> => {
+        const account = await requireStoredAccount(context, input.accountId);
+        // Local write: no requireConnectionBackend, because skipping, trashing or restoring a local
+        // problem must work while the account is disconnected. The service takes only the durable
+        // source slot, so a live foreign lease still refuses as busy.
+        const result = await context.service.manageProblems(
+          {
+            accountId: account.id,
+            action: input.action,
+            items: input.items.map((item) => ({
+              problemKey: item.problemKey,
+              // active is the public spelling of "no durable disposition".
+              expectedState: item.expectedState === 'active' ? null : item.expectedState,
+            })),
+          },
+          token,
+        );
+        return { changed: result.changed };
       },
     );
     return disposeLifetime;

@@ -208,7 +208,7 @@ const ALL_OPERATIONS = Object.values(LUOGU_API_OPERATIONS);
 
 void test('the Luogu route map is exact and every answer uses the versioned envelope', async () => {
   await withBench({}, async (bench) => {
-    assert.equal(ALL_OPERATIONS.length, 11);
+    assert.equal(ALL_OPERATIONS.length, 13);
     assert.deepEqual(
       [...bench.routes.keys()].sort(),
       ALL_OPERATIONS.map((operation) => `${API_PREFIX}${operation}`).sort(),
@@ -317,6 +317,13 @@ void test('malformed input is refused before any store, vault or platform side e
   await withBench({}, async (bench) => {
     const accountId = bench.account.id;
     const cookie = sfx.cookieFor('800001');
+    // Canonical key of this instance plus a parseable spelling that is NOT its own canonical
+    // re-encoding (`%20P9102` decodes to a leading space the composing factory trims away), so the
+    // full roundtrip — not just the parse — must refuse it at the boundary.
+    const managedKey = sfx.problemKeyOf(bench.instance, 'P9102');
+    const nonCanonicalManagedKey = managedKey.replace('|P9102', '|%20P9102');
+    const oversizeManagedKey = sfx.problemKeyOf(bench.instance, 'x'.repeat(600));
+
     const cases: readonly (readonly [string, unknown])[] = [
       ['luogu.status', { accountId, extra: 1 }],
       ['luogu.status', {}],
@@ -429,6 +436,40 @@ void test('malformed input is refused before any store, vault or platform side e
       [
         'luogu.supplementMetadata',
         { accountId, problemKey: 'not-a-canonical-key', title: '本地补全', statement: '用户题面。', expectedSnapshotId: null },
+      ],
+      // luogu.manageProblems: a key that parses but is not canonical, an unknown item field, a
+      // duplicate canonical key, an oversize key and a key of another instance are all refused here,
+      // before the handler reads the store or the service takes a lease.
+      [
+        'luogu.manageProblems',
+        { accountId, action: 'skip', items: [{ problemKey: nonCanonicalManagedKey, expectedState: 'active' }] },
+      ],
+      [
+        'luogu.manageProblems',
+        { accountId, action: 'skip', items: [{ problemKey: managedKey, expectedState: 'active', state: 'trashed' }] },
+      ],
+      [
+        'luogu.manageProblems',
+        {
+          accountId,
+          action: 'skip',
+          items: [
+            { problemKey: managedKey, expectedState: 'active' },
+            { problemKey: managedKey, expectedState: 'active' },
+          ],
+        },
+      ],
+      [
+        'luogu.manageProblems',
+        { accountId, action: 'skip', items: [{ problemKey: oversizeManagedKey, expectedState: 'active' }] },
+      ],
+      [
+        'luogu.manageProblems',
+        {
+          accountId,
+          action: 'skip',
+          items: [{ problemKey: 'codeforces%3Acodeforces.com||1234A', expectedState: 'active' }],
+        },
       ],
     ];
     for (const [operation, body] of cases) {

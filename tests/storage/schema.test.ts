@@ -29,6 +29,7 @@ import {
   SCHEMA_VERSION_V8,
   STORE_TABLES_V4,
   STORE_TABLES_V8,
+  STORE_TABLES_V10,
   applySchemaV1,
   applySchemaV3,
   initializeSchemaV2,
@@ -296,11 +297,11 @@ void test('a database from a newer schema is rejected before anything is written
   rawExec(paths.path, [
     'CREATE TABLE problems (x TEXT)',
     `INSERT INTO problems (x) VALUES ('foreign data')`,
-    // Explicitly verify a v10 database is refused by this build's v9 store before any write.
+    // Explicitly verify a v11 database is refused by this build's v10 store before any write.
     `PRAGMA user_version = ${STORE_SCHEMA_VERSION + 1}`,
   ]);
-  assert.equal(STORE_SCHEMA_VERSION, 9);
-  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 10);
+  assert.equal(STORE_SCHEMA_VERSION, 10);
+  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 11);
   const before = fingerprint(paths.path);
   const beforeBytes = readFileSync(paths.path);
   assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');
@@ -331,7 +332,7 @@ void test('a database from a newer schema is rejected before anything is written
  * frozen helper still writes the literal `user_version = 8` with exactly the v8 table set, and the
  * current store copies that file at v8 before migrating it to v9 without rewriting a row.
  */
-void test('a genuine v8 database is backed up at v8 and migrated to v9 with every row kept', async () => {
+void test('a genuine v8 database is backed up at v8 and migrated to the current schema with every row kept', async () => {
   const paths = fx.tempDatabase();
   const scope = fx.makeScope('codeforces', 'codeforces.com', 'carol', '3C');
   const db = new DatabaseSync(paths.path);
@@ -365,10 +366,10 @@ void test('a genuine v8 database is backed up at v8 and migrated to v9 with ever
   }
 
   const migrated = fingerprint(paths.path);
-  assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION, 'the genuine v8 file ends at the current v9');
+  assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION, 'the genuine v8 file ends at the current schema');
   assert.equal(migrated.marker, STORE_MARKER);
   assert.equal(migrated.integrity, 'ok');
-  assert.deepEqual(migrated.tables, [...STORE_TABLES_V8].sort(), 'v9 uses exactly the v8 table set');
+  assert.deepEqual(migrated.tables, [...STORE_TABLES_V10].sort(), 'current schema adds only disposition storage');
   assert.equal(rawScalar(paths.path, 'SELECT body FROM problems'), canonicalJson(scope.problem));
 
   const backups = readdirSync(paths.dir).filter((name) => name.includes('.backup-v8-') && name.endsWith('.sqlite'));

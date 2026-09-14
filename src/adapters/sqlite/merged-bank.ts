@@ -153,6 +153,7 @@ export function planMergedBrowse(input: MergedBrowsePlanInput): MergedBrowsePlan
       FROM submissions s
       JOIN selected sel ON sel.account_id = s.account_id AND sel.source_instance_id = s.source_instance_id
      WHERE ${MERGED_REF_KEY_FUNCTION}(s.source_instance_id, s.domain, s.external_key) = s.problem_key
+       AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = s.problem_key AND d.state = 'trashed')
   )`;
 
   // One canonical accepted evidence per (group, account, problem): the earliest accepted submission,
@@ -181,6 +182,7 @@ export function planMergedBrowse(input: MergedBrowsePlanInput): MergedBrowsePlan
            ${MERGED_GROUP_KEY_FUNCTION}(p.source_instance_id, p.domain, p.external_key) AS group_key
       FROM problems p
      WHERE ${MERGED_REF_KEY_FUNCTION}(p.source_instance_id, p.domain, p.external_key) = p.key
+       AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = p.key AND d.state = 'trashed')
   )`;
 
   // The external-key and title orders compare ONE display member per group, chosen the same way in
@@ -357,6 +359,7 @@ export function mergedMembersQuery(problemKeys: readonly string[]): MergedQuery 
     sql: `SELECT key, source_instance_id, domain, external_key, title, body
             FROM problems
            WHERE key IN (${mergedPlaceholders(problemKeys.length)})
+             AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = problems.key AND d.state = 'trashed')
            ORDER BY key ASC`,
     params: [...problemKeys],
   };

@@ -10,7 +10,7 @@
  * - **v0** means "no store tables yet": an empty file is initialized transactionally, a file
  *   with our marker table but no data tables is migrated after a consistent backup, and any
  *   other v0 layout is rejected instead of being migrated.
- * - **v1** … **v8** (the previous versions of this build) are recognized exactly — marker
+ * - **v1** … **v9** (the previous versions of this build) are recognized exactly — marker
  *   plus their own table set — copied consistently and then migrated to the current version in one
  *   transaction that only adds tables. Existing rows are retained.
  * - A failure while initializing or migrating rolls back, so the original file stays readable.
@@ -19,9 +19,8 @@
  * {@link SCHEMA_DDL_V2}/{@link applySchemaV2} and {@link SCHEMA_DDL_V3}/{@link applySchemaV3} keep
  * creating exactly their own version's tables **and write exactly their own literal
  * `user_version`**, so a fixture built with them is a real older database and the migration under
- * test is the real one. The current version, v9, adds **no table**: it uses exactly the v8 table set
- * and exists as a version marker because the stored JSON contract of `luogu_sync_states.body`
- * changed (durable per-key metadata diagnostics), so a v8 writer must not open a v9 database.
+ * test is the real one. Schema v9 changes only the Luogu diagnostics JSON contract. Schema v10 adds the
+ * recoverable problem_dispositions table; older writers must refuse this version.
  *
  * All metadata the adapter writes are immutable JSON bodies plus indexed identity columns.
  */
@@ -32,7 +31,8 @@ import { StorageError } from './errors.js';
 export const STORE_MARKER = 'dsh-icpc-workbench/training-store';
 
 /** Schema version this build reads and writes. */
-export const STORE_SCHEMA_VERSION = 9;
+export const STORE_SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION_V9 = 9;
 export const SCHEMA_VERSION_V8 = 8;
 export const SCHEMA_VERSION_V7 = 7;
 export const SCHEMA_VERSION_V6 = 6;
@@ -477,6 +477,33 @@ export const SCHEMA_DDL_V8: readonly string[] = [
   `CREATE INDEX ability_evaluation_attempts_by_account ON ability_evaluation_attempts (account_id, requested_at, id)`,
   `CREATE INDEX ability_evaluation_attempts_by_status ON ability_evaluation_attempts (status, expires_at, id)`,
 ];
+
+/**
+ * Schema v10 — recoverable local problem dispositions (Sprint 27a).
+ *
+ * One additive table. `problem_dispositions` holds at most one row per canonical **native** problem
+ * key and records the user's explicit `skipped`/`trashed` decision together with its provenance: the
+ * source instance the decision belongs to (every account of that instance shares it), the account
+ * that made it (a non-secret id, for the audit trail) and the instant it was taken. The canonical
+ * JSON `body` stays the source of truth for reads, exactly like every other table here.
+ *
+ * The table deliberately holds **no copy of the problem's content**: no title, no statement, no tag,
+ * no snapshot and no submission. A tombstone is a statement about a problem, not a second version of
+ * it, so a restore always exposes the original stored rows unchanged. The `luogu_*` synchronization
+ * tables, `problems`, `submissions`, `snapshots` and `retrospectives` are untouched by this version.
+ */
+export const STORE_TABLES_V10: readonly string[] = [...STORE_TABLES_V9, 'problem_dispositions'];
+export const SCHEMA_DDL_V10: readonly string[] = [
+  `CREATE TABLE problem_dispositions (
+     problem_key TEXT PRIMARY KEY NOT NULL,
+     state TEXT NOT NULL,
+     source_instance_id TEXT NOT NULL,
+     initiator_account_id TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     body TEXT NOT NULL
+   )`,
+  `CREATE INDEX problem_dispositions_by_state ON problem_dispositions (source_instance_id, state, problem_key)`,
+];
 export type SchemaState =
   | 'empty'
   | 'legacy_v0'
@@ -488,6 +515,7 @@ export type SchemaState =
   | 'v6'
   | 'v7'
   | 'v8'
+  | 'v9'
   | 'current';
 
 function pragmaRow(db: DatabaseSync, sql: string): Record<string, unknown> | undefined {
@@ -546,8 +574,13 @@ export function detectSchemaState(db: DatabaseSync): SchemaState {
   const tables = tableNames(db);
   if (version === STORE_SCHEMA_VERSION) {
     requireStoreMarker(db, version);
-    requireTables(tables, STORE_TABLES_V9, version);
+    requireTables(tables, STORE_TABLES_V10, version);
     return 'current';
+  }
+  if (version === SCHEMA_VERSION_V9) {
+    requireStoreMarker(db, version);
+    requireTables(tables, STORE_TABLES_V9, version);
+    return 'v9';
   }
   if (version === SCHEMA_VERSION_V8) {
     requireStoreMarker(db, version);
@@ -892,8 +925,24 @@ export function migrateToSchemaV9(db: DatabaseSync, from: number): void {
     if (from < 6) for (const statement of SCHEMA_DDL_V6) db.exec(statement);
     if (from < 7) for (const statement of SCHEMA_DDL_V7) db.exec(statement);
     if (from < 8) for (const statement of SCHEMA_DDL_V8) db.exec(statement);
-    db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+    db.exec('PRAGMA user_version = 9');
   }, 'schema v9 migration');
+}
+
+/** Additive v10 migration; the pre-migration backup is owned by the store opener. */
+export function migrateToSchemaV10(db: DatabaseSync, from: number): void {
+  inTransaction(db, () => {
+    if (from < 1) applySchemaV1(db);
+    if (from < 2) applySchemaV2(db);
+    if (from < 3) applySchemaV3(db);
+    if (from < 4) applySchemaV4(db);
+    if (from < 5) for (const statement of SCHEMA_DDL_V5) db.exec(statement);
+    if (from < 6) for (const statement of SCHEMA_DDL_V6) db.exec(statement);
+    if (from < 7) for (const statement of SCHEMA_DDL_V7) db.exec(statement);
+    if (from < 8) for (const statement of SCHEMA_DDL_V8) db.exec(statement);
+    if (from < 10) for (const statement of SCHEMA_DDL_V10) db.exec(statement);
+    db.exec('PRAGMA user_version = 10');
+  }, 'schema v10 migration');
 }
 
 function inTransaction(db: DatabaseSync, work: () => void, label: string): void {

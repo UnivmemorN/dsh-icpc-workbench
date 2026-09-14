@@ -71,11 +71,15 @@ import {
   DomainError,
   assertIsoTimestamp,
   createCancellationSource,
+  MAX_DISPOSITION_BATCH,
   invariant,
   parseProblemKey,
   throwIfCancelled,
+  validateDispositionBatch,
   type Account,
   type CancellationToken,
+  type ProblemDispositionAction,
+  type ProblemDispositionState,
   type ProblemRef,
   type SourceInstance,
 } from '../domain/index.js';
@@ -576,6 +580,17 @@ function requireAccountProfile(account: Account, sourceInstanceId: string, profi
   return displayName;
 }
 
+/** Default page size of the luogu.managedProblems read. */
+export const LUOGU_MANAGED_PROBLEMS_DEFAULT_PAGE_SIZE = 20;
+
+/**
+ * Maximum accepted pageSize of the luogu.managedProblems read.
+ *
+ * The store's disposition read refuses more than 50 rows, so the boundary and the service enforce
+ * exactly that bound instead of letting a caller ask for an unbounded recovery page.
+ */
+export const LUOGU_MANAGED_PROBLEMS_MAX_PAGE_SIZE = 50;
+
 /**
  * Durable, source-wide synchronization service for the official Luogu instance.
  *
@@ -939,6 +954,322 @@ export class LuoguSyncService {
     };
   }
 
+  // -------------------------------------------------------------------------------------
+  // Local problem management (Sprint 27b)
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * One bounded page of the durable problem dispositions of this source instance.
+   *
+   * This is a projection of stored tombstones plus the raw stored title: no platform read, no
+   * connection, no lease and no request, so it works on a disconnected account. A disposition is
+   * global to the canonical native key, so every account of this source sees the same entries.
+   * The title is the raw stored title even while a trash hides the row; the store's explicit
+   * recovery read is the only view allowed to return it.
+   */
+  async managedProblems(
+    accountId: string,
+    state: ProblemDispositionState,
+    page: number,
+    pageSize: number,
+  ): Promise<{
+    readonly items: readonly {
+      readonly problemKey: string;
+      readonly externalKey: string;
+      readonly title: string | null;
+      readonly state: ProblemDispositionState;
+      readonly updatedAt: string;
+    }[];
+    readonly total: number;
+    readonly page: number;
+    readonly pageSize: number;
+  }> {
+    await this.requireAccount(accountId);
+    invariant(
+      state === 'skipped' || state === 'trashed',
+      'invalid_input',
+      'unknown disposition state ' + String(state),
+    );
+    invariant(
+      Number.isSafeInteger(page) && page >= 1,
+      'invalid_input',
+      'managed problems page must be an integer >= 1',
+      { page },
+    );
+    invariant(
+      Number.isSafeInteger(pageSize) && pageSize >= 1 && pageSize <= LUOGU_MANAGED_PROBLEMS_MAX_PAGE_SIZE,
+      'invalid_input',
+      'managed problems pageSize must be an integer within 1..' + String(LUOGU_MANAGED_PROBLEMS_MAX_PAGE_SIZE),
+      { pageSize },
+    );
+    const stored = await this.store.listProblemDispositions({
+      sourceInstanceId: this.sourceInstance.id,
+      state,
+      page,
+      limit: pageSize,
+    });
+    return {
+      items: stored.items.map((item) => ({
+        problemKey: item.problemKey,
+        // The key was validated when the tombstone was written; parsing recovers the platform-facing
+        // key for the caller without exposing any raw platform value.
+        externalKey: parseProblemKey(item.problemKey).externalKey,
+        title: item.title,
+        state: item.state,
+        updatedAt: item.updatedAt,
+      })),
+      total: stored.totalItems,
+      page: stored.page,
+      pageSize: stored.pageSize,
+    };
+  }
+
+  /**
+   * Change the durable disposition of up to MAX_DISPOSITION_BATCH canonical native keys.
+   *
+   * A purely local operation: no connection, no cookie, no model and no platform request, so a
+   * disconnected account can still skip, trash or restore the problems it already knows. It still
+   * takes this service's one source slot and the durable source-wide lease through runConnectionOp
+   * and claim (purpose repair), so it can never race a pass or a live foreign lease; a foreign live
+   * lease is refused as busy before any write. The lease is released in the finally even when the
+   * batch is refused.
+   *
+   * One store transaction owns the whole mutation: it re-reads this operation's own state with a
+   * clock reading taken after that read (a lease that expired or was taken over while the store
+   * waited refuses), applies the domain's atomic CAS batch (active is the public spelling of the
+   * internal "no disposition"), and then removes every affected key from the queue and the per-key
+   * diagnostics of every account of this source, clearing a stored failure only when it names one
+   * of the affected keys. Watermarks, checkpoints, counters, other backlog keys and other failures
+   * are copied verbatim: nothing is advanced or fabricated and no raw row is deleted.
+   *
+   * A restore removes the tombstone first (so the store's hidden predicate no longer applies) and
+   * queues back only the affected keys whose problem row does not exist **or carries no usable
+   * statement** (absent or blank), into the initiating account's backlog. If the backlog cannot hold
+   * them the whole transaction, including the tombstone removal, rolls back. Cancellation and the
+   * initiator's own live lease are re-checked on both sides of every awaited store call — including
+   * after the queue cleanup, immediately before this transaction's write boundary — so a
+   * cancellation or a lease that expired while an awaited read was pending rolls the batch back
+   * completely instead of committing it on a reading taken before the wait.
+   */
+  async manageProblems(
+    request: {
+      readonly accountId: string;
+      readonly action: ProblemDispositionAction;
+      readonly items: readonly {
+        readonly problemKey: string;
+        readonly expectedState: ProblemDispositionState | null;
+      }[];
+    },
+    token: CancellationToken,
+  ): Promise<{ readonly changed: number }> {
+    this.assertUsable(token);
+    invariant(
+      request !== null && typeof request === 'object' && !Array.isArray(request),
+      'invalid_input',
+      'manage request must be an object',
+    );
+    const account = await this.requireAccount(request.accountId);
+    invariant(
+      Array.isArray(request.items) && request.items.length >= 1 && request.items.length <= MAX_DISPOSITION_BATCH,
+      'invalid_input',
+      'a disposition batch holds 1..' + String(MAX_DISPOSITION_BATCH) + ' keys',
+      { items: Array.isArray(request.items) ? request.items.length : null },
+    );
+    // The domain owns the closed batch contract (action vocabulary, distinct canonical keys,
+    // expected-state vocabulary); a key of another source instance is refused below, before any
+    // lease, store write or platform work.
+    const batch = validateDispositionBatch(request.action, request.items);
+    for (const key of batch.problemKeys) {
+      if (parseProblemKey(key).sourceInstanceId !== this.sourceInstance.id) {
+        throw new LuoguSyncError('account_foreign', 'problem ' + key + ' does not belong to this Luogu instance', {
+          problemKey: key,
+        });
+      }
+    }
+    const items = request.items.map((item) => ({
+      problemKey: item.problemKey,
+      expectedState: item.expectedState,
+    }));
+    return this.runConnectionOp(account.id, token, async (opToken) => {
+      let changed = 0;
+      try {
+        await this.claim(account, { purpose: 'repair', mode: 'resume' }, opToken);
+        changed = await this.store.transaction(async () => {
+          // The clock is read inside the helper, after the awaited state read: a lease that expired
+          // while the store waited is not accepted on the strength of a reading taken before it.
+          await this.requireLiveRepairLease(account, opToken, 'before the batch');
+          throwIfCancelled(opToken);
+          const count = await this.store.applyProblemDispositions({
+            accountId: account.id,
+            action: request.action,
+            items,
+          });
+          // A cancellation that landed while the CAS wrote must not commit it: throwing here rolls
+          // the batch and the queue cleanup back together.
+          throwIfCancelled(opToken);
+          await this.cleanupDispositionQueues(account.id, batch.problemKeys, request.action, opToken);
+          // The cleanup awaited per-account state reads and per-key problem reads, so this is the
+          // batch's real write boundary: the initiator's live lease is re-derived from a row read
+          // after that work, with a clock reading taken after the read. A lease that expired or was
+          // taken over while the cleanup waited refuses the commit here instead of validating the
+          // whole batch against the reading taken before the CAS.
+          await this.requireLiveRepairLease(account, opToken, 'before the batch commit');
+          throwIfCancelled(opToken);
+          return count;
+        });
+      } finally {
+        await this.releaseLease(account.id, false);
+      }
+      return { changed };
+    });
+  }
+
+  /**
+   * Re-assert this repair operation's own live lease from a row read at the write boundary.
+   *
+   * The state is read first and the clock is read **after** that awaited read, then the row must
+   * still be this account's state of this source instance, still owned by this service, with an
+   * unexpired deadline. Called before the CAS batch and again after the queue cleanup, so a lease
+   * that expired or was taken over while any of those awaited reads was pending refuses here
+   * instead of committing on a stale reading.
+   */
+  private async requireLiveRepairLease(
+    account: Account,
+    token: CancellationToken,
+    phase: string,
+  ): Promise<void> {
+    throwIfCancelled(token);
+    const record = await this.store.getLuoguSyncState(account.id);
+    throwIfCancelled(token);
+    const current = record === null ? null : record.value;
+    const at = this.nowIso();
+    if (
+      current === null ||
+      current.accountId !== account.id ||
+      current.sourceInstanceId !== this.sourceInstance.id ||
+      current.owner !== this.ownerId ||
+      !luoguLeaseLive(current, this.ownerId, at)
+    ) {
+      throw new LuoguSyncError('lease_lost', `the disposition lease was lost ${phase}`, {
+        accountId: account.id,
+      });
+    }
+  }
+
+  /**
+   * Remove affected keys from every account queue of this source and clear their diagnostics.
+   *
+   * Runs inside the caller's transaction, the one that already holds the CAS batch, so the durable
+   * disposition and the queue cleanup commit together or not at all. Every account of the source
+   * instance is scanned, not only the initiating one, because a disposition is global to the
+   * canonical native key: a key skipped or trashed from one account is never fetched for another.
+   * Only the affected keys are touched; every other backlog key keeps its order and its per-key
+   * diagnostic, and a stored failure is cleared only when it explicitly names one of them. History
+   * fields, checkpoints and counters are copied verbatim.
+   *
+   * For a restore the affected keys whose problem row does not exist, or whose stored statement is
+   * absent or blank, are queued back into the initiating account's backlog: a row without a usable
+   * statement is exactly the user's empty testcase, which still needs repair, while a retained
+   * non-blank statement needs nothing and is never re-queued. The tombstone was already removed by
+   * the CAS above, so the store's trash predicate no longer hides an existing raw row and the
+   * decision reads the now-visible raw statement. An overflow of the bounded backlog aborts the
+   * whole transaction.
+   */
+  private async cleanupDispositionQueues(
+    initiatingAccountId: string,
+    affected: readonly string[],
+    action: ProblemDispositionAction,
+    token: CancellationToken,
+  ): Promise<void> {
+    if (affected.length === 0) {
+      return;
+    }
+    const keys = new Set(affected);
+    const accounts = await this.store.listAccounts(this.sourceInstance.id);
+    throwIfCancelled(token);
+    for (const candidate of accounts) {
+      const record = await this.store.getLuoguSyncState(candidate.id);
+      throwIfCancelled(token);
+      if (record === null) {
+        continue;
+      }
+      const current = record.value;
+      const currentIssues = current.metadataIssues ?? [];
+      const missingMetadata = current.missingMetadata.filter((key) => !keys.has(key));
+      const metadataIssues = currentIssues.filter((issue) => !keys.has(issue.problemKey));
+      const failure =
+        current.failure !== null && current.failure.problemKey !== undefined && keys.has(current.failure.problemKey)
+          ? null
+          : current.failure;
+      let nextBacklog: readonly string[] = missingMetadata;
+      if (action === 'restore' && candidate.id === initiatingAccountId) {
+        const restored: string[] = [...missingMetadata];
+        for (const key of affected) {
+          if (restored.includes(key)) {
+            continue;
+          }
+          const stored = await this.store.getProblem(key);
+          throwIfCancelled(token);
+          // A stored row whose statement is absent or blank is exactly the problem the user's own
+          // empty testcases report: the raw row exists but carries no usable material, so a restore
+          // queues it for repair. Only a problem with a retained, non-blank statement needs nothing.
+          if (stored === null || stored.statement === null || stored.statement.trim().length === 0) {
+            restored.push(key);
+          }
+        }
+        if (restored.length > LUOGU_SYNC_MAX_METADATA_BACKLOG) {
+          throw new DomainError(
+            'invalid_transition',
+            'the missing-metadata backlog cannot hold the restored keys; the restore was rolled back',
+            {
+              reason: 'metadata_backlog_full',
+              backlog: restored.length,
+              max: LUOGU_SYNC_MAX_METADATA_BACKLOG,
+            },
+          );
+        }
+        nextBacklog = restored;
+      }
+      const sameBacklog =
+        nextBacklog.length === current.missingMetadata.length &&
+        nextBacklog.every((key, index) => key === current.missingMetadata[index]);
+      const changed =
+        !sameBacklog || metadataIssues.length !== currentIssues.length || failure !== current.failure;
+      if (!changed) {
+        // An account that never queued the key keeps its exact row: no write, no revision bump.
+        continue;
+      }
+      const next: LuoguSyncState = {
+        ...current,
+        missingMetadata: nextBacklog,
+        metadataIssues,
+        failure,
+        updatedAt: this.nowIso(),
+      };
+      throwIfCancelled(token);
+      await this.store.saveLuoguSyncState(next, record.revision);
+      throwIfCancelled(token);
+    }
+  }
+
+  /**
+   * Canonical native keys of the given keys that carry a durable disposition.
+   *
+   * Skip suppresses metadata fetching only; trash additionally hides every stored read. Neither may
+   * be enqueued by a later pass, retried or supplemented, so the history commit and the metadata
+   * loop consult this before they queue or fetch one of them. The decision is the durable tombstone
+   * of the canonical native key, which is shared by every account of this source instance.
+   */
+  private async suppressedProblemKeys(keys: readonly string[]): Promise<ReadonlySet<string>> {
+    const suppressed = new Set<string>();
+    for (const key of keys) {
+      if ((await this.store.getProblemDisposition(key)) !== null) {
+        suppressed.add(key);
+      }
+    }
+    return suppressed;
+  }
+
   /**
    * Retry **exactly one** currently queued metadata key through the ordinary repair path.
    *
@@ -980,6 +1311,14 @@ export class LuoguSyncService {
     // Exactly one currently queued key: a key that is not in this account's backlog is refused
     // before any lease, gate or platform work.
     const before = await this.store.getLuoguSyncState(account.id);
+    // A suppressed key is never retried or supplemented: the durable tombstone outranks the queue
+    // this operation read, and the store's CAS is the authority on the current state.
+    if ((await this.store.getProblemDisposition(key)) !== null) {
+      throw new LuoguSyncError('invalid_input', 'problem ' + key + ' is skipped or trashed by a local disposition', {
+        accountId: account.id,
+        problemKey: key,
+      });
+    }
     if (before === null || !before.value.missingMetadata.includes(key)) {
       throw new LuoguSyncError('invalid_input', `problem ${key} is not queued in the metadata backlog`, {
         accountId: account.id,
@@ -1120,6 +1459,14 @@ export class LuoguSyncService {
     // Exactly one currently queued key of this account: a key that is not in its backlog is refused
     // before any lease is taken or any store write is attempted.
     const before = await this.store.getLuoguSyncState(account.id);
+    // A suppressed key is never retried or supplemented: the durable tombstone outranks the queue
+    // this operation read, and the store's CAS is the authority on the current state.
+    if ((await this.store.getProblemDisposition(key)) !== null) {
+      throw new LuoguSyncError('invalid_input', 'problem ' + key + ' is skipped or trashed by a local disposition', {
+        accountId: account.id,
+        problemKey: key,
+      });
+    }
     if (before === null || !before.value.missingMetadata.includes(key)) {
       throw new LuoguSyncError('invalid_input', `problem ${key} is not queued in the metadata backlog`, {
         accountId: account.id,
@@ -1872,18 +2219,13 @@ export class LuoguSyncService {
    * The `syncPage` commit hook: progress and the missing-metadata backlog in the page transaction.
    *
    * Runs **inside** the page's transaction, performs no IO beyond the store, re-checks that this
-   * pass still owns a live lease, and refuses a page whose backlog keys would not fit — so a
-   * throw rolls the page rows, the checkpoint and this progress back together.
+   * pass still owns a live lease with a clock reading taken after **every** awaited read of this
+   * commit, and refuses a page whose backlog keys would not fit — so a throw rolls the page rows,
+   * the checkpoint and this progress back together. The per-key disposition lookups run before the
+   * lease judgement for exactly that reason: a lease that expired while one of them was pending
+   * must refuse the page instead of being validated against a reading taken before the wait.
    */
   private async commitPage(accountId: string, report: SyncPageReport): Promise<void> {
-    const at = this.nowIso();
-    const record = await this.store.getLuoguSyncState(accountId);
-    if (record === null || record.value.owner !== this.ownerId || !luoguLeaseLive(record.value, this.ownerId, at)) {
-      throw new DomainError('invalid_transition', 'the synchronization lease was lost before the page commit', {
-        reason: 'lease_lost',
-      });
-    }
-    const current = record.value;
     const counts = report.counts;
     const keys = counts.kind === 'submissions' ? counts.missingProblemKeys : [];
     if (counts.kind === 'submissions' && counts.missingProblemMetadata > keys.length) {
@@ -1893,9 +2235,21 @@ export class LuoguSyncService {
         { reason: 'metadata_keys_truncated', reported: counts.missingProblemMetadata, named: keys.length },
       );
     }
+    // A durable disposition is authoritative for every account of this source: a key the user
+    // skipped (metadata fetching suppressed) or trashed (hidden everywhere) is never enqueued by a
+    // later history pass, so raw submissions still import as evidence but can never resurrect it.
+    const suppressed = await this.suppressedProblemKeys(keys);
+    const record = await this.store.getLuoguSyncState(accountId);
+    const at = this.nowIso();
+    if (record === null || record.value.owner !== this.ownerId || !luoguLeaseLive(record.value, this.ownerId, at)) {
+      throw new DomainError('invalid_transition', 'the synchronization lease was lost before the page commit', {
+        reason: 'lease_lost',
+      });
+    }
+    const current = record.value;
     const backlog = [...current.missingMetadata];
     for (const key of keys) {
-      if (backlog.includes(key)) {
+      if (suppressed.has(key) || backlog.includes(key)) {
         continue;
       }
       if (backlog.length >= LUOGU_SYNC_MAX_METADATA_BACKLOG) {
@@ -2000,6 +2354,25 @@ export class LuoguSyncService {
       if (attempted.has(key)) {
         // Every remaining key was already tried in this pass; the rest wait for the next one.
         break;
+      }
+      // A durable disposition is authoritative: a key skipped or trashed (from any account of this
+      // source) is never fetched. A stale queue entry, for example a row written by another
+      // instance, is dequeued and persisted here instead of being requested.
+      throwIfCancelled(token);
+      if ((await this.store.getProblemDisposition(key)) !== null) {
+        backlog.shift();
+        issues = clearMetadataIssue(issues, key);
+        const saved = await this.saveMetadataProgress(
+          account.id,
+          { backlog, issues, resolved: 0, failed: 0, failure: null },
+          token,
+        );
+        if (!saved) {
+          throw new LuoguSyncError('lease_lost', 'another owner replaced the metadata pass lease', {
+            accountId: account.id,
+          });
+        }
+        continue;
       }
       attempted.add(key);
       fetches += 1;
@@ -2160,9 +2533,11 @@ export class LuoguSyncService {
    * Re-read the durable state and require one live lease of this source with the key still queued.
    *
    * Used both immediately before a retry request and again at the write boundary, inside whatever
-   * transaction the caller already owns. The clock is read **after** the awaited state read, so a
-   * store that queued this call behind another operation cannot validate a lease against a reading
-   * taken before the wait. The account, the source identity, the owner, the lease deadline and the
+   * transaction the caller already owns. The disposition read runs first and the clock is read
+   * **after** every awaited read of this check, so a store that queued this call behind another
+   * operation cannot validate a lease against a reading taken before the wait — nor can the
+   * disposition lookup extend the returned `at` past the lease judgement. The account, the source
+   * identity, the owner, the lease deadline and the
    * queued membership are all re-derived from the row just read; an expired or replaced lease, a
    * state that moved to another source, or a key that left the backlog is a `lease_lost` refusal.
    */
@@ -2172,6 +2547,18 @@ export class LuoguSyncService {
     token: CancellationToken,
     phase: string,
   ): Promise<{ readonly record: LuoguSyncStateRecord; readonly current: LuoguSyncState; readonly at: string }> {
+    throwIfCancelled(token);
+    // A durable disposition outranks this pass's earlier queue read: a key skipped or trashed while
+    // a request was in flight must never commit visible metadata on a stale claim. This awaited read
+    // runs BEFORE the clock is read and the lease is judged, so the `at` returned to the caller was
+    // taken after every awaited read of this check and cannot outlive the lease judgement.
+    if ((await this.store.getProblemDisposition(problemKeyValue)) !== null) {
+      throw new LuoguSyncError(
+        'lease_lost',
+        'problem ' + problemKeyValue + ' is suppressed by a local disposition ' + phase,
+        { accountId, problemKey: problemKeyValue },
+      );
+    }
     throwIfCancelled(token);
     const record = await this.store.getLuoguSyncState(accountId);
     throwIfCancelled(token);

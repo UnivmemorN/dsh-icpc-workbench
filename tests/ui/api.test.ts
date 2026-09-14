@@ -34,3 +34,17 @@ test('guidance and virtual performance operations reach authenticated browser tr
  await client.request('performance.delete',{accountId:'synthetic',expectedRevision:1,evidenceId:'example'});
  assert.deepEqual(calls,['guidance.catalog','performance.list','performance.save','performance.delete'].map(op=>'/api/icpc/v1/'+op));
 });
+
+test('problem management browser transport keeps explicit selection and expected state', async () => {
+  const calls: { input: RequestInfo | URL; init?: RequestInit }[] = [];
+  const client = new ApiClient(async (input, init) => { calls.push({ input, init }); return Response.json({ apiVersion: 1, ok: true, value: { changed: 1 } }); });
+  const controller = new AbortController();
+  const mutation = { accountId: 'synthetic', action: 'trash' as const, items: [{ problemKey: 'synthetic-key', expectedState: 'active' as const }] };
+  await client.request('luogu.manageProblems', mutation, controller.signal);
+  await client.request('luogu.managedProblems', { accountId: 'synthetic', state: 'trashed', page: 2, pageSize: 20 });
+  assert.equal(calls[0]?.input, '/api/icpc/v1/luogu.manageProblems');
+  assert.equal(calls[0]?.init?.credentials, 'same-origin'); assert.equal(calls[0]?.init?.signal, controller.signal);
+  assert.deepEqual(JSON.parse(String(calls[0]?.init?.body)), mutation);
+  assert.equal(calls[1]?.input, '/api/icpc/v1/luogu.managedProblems');
+  assert.deepEqual(JSON.parse(String(calls[1]?.init?.body)), { accountId: 'synthetic', state: 'trashed', page: 2, pageSize: 20 });
+});

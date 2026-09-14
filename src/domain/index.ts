@@ -433,3 +433,7 @@ export * from './assessment.js';
 // Two-cookie Luogu session normalization (Stage 19a): the single pure rule shared by the browser
 // half, the connect route, the connection adapter and the authenticated reader.
 export * from './luogu-session-cookie.js';
+// Local recoverable problem dispositions (Sprint 27a): the pure skip/trash rule set every layer
+// evaluates — the stored tombstone shape, the hidden-key predicate the SQL reads use and the
+// all-or-none batch/expected-state validation of one disposition request.
+export * from './problem-disposition.js';

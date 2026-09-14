@@ -5,6 +5,7 @@ import type {
   ApiLuoguStatusView,
 } from '../application/workbench-api.js';
 import { api, ApiClientError } from './api.js';
+import { LuoguManagedProblems, useLuoguManagement, type ManagementTarget } from './LuoguManagedProblems.js';
 import { Empty, ErrorNotice, ExternalLink, useRequest } from './common.js';
 import {
   LUOGU_METADATA_BACKLOG_PAGE_SIZE,
@@ -68,7 +69,17 @@ interface LuoguMetadataPanelProps {
  *   and a successful supplement additionally refresh the bank, while a deferred/failed retry or a
  *   conflict keeps the item queued and says so.
  */
-export function LuoguMetadataPanel({
+export function LuoguMetadataPanel(props: LuoguMetadataPanelProps) {
+  const [tab, setTab] = useState<'pending' | 'skipped' | 'trashed'>('pending');
+  return <>
+    <div className="icpc-actions" aria-label="题目处理分类">
+      {(['pending', 'skipped', 'trashed'] as const).map(value => <button type="button" key={value} className={tab === value ? 'icpc-primary' : undefined} aria-pressed={tab === value} onClick={() => setTab(value)}>{value === 'pending' ? '待补题目' : value === 'skipped' ? '已跳过' : '回收站'}</button>)}
+    </div>
+    {tab === 'pending' ? <LuoguPendingMetadataPanel key={props.accountId} {...props} /> : <LuoguManagedProblems key={`${props.accountId}:${tab}`} accountId={props.accountId} state={tab} status={props.status} onChange={() => { props.onStatusRefresh(); props.onBankChange(); }} />}
+  </>;
+}
+
+function LuoguPendingMetadataPanel({
   accountId,
   status,
   onStatusRefresh,
@@ -109,6 +120,13 @@ export function LuoguMetadataPanel({
     luoguMetadataBacklogRequest(accountId, page, pageSize, knownTotal),
   );
   const view = backlog.data;
+  const [selected, setSelected] = useState<string[]>([]);
+  const management = useLuoguManagement(accountId, luoguMetadataMutationReason(status, retryKey !== null || formBusy) !== null, () => {
+    setSelected([]); backlog.refresh(); onStatusRefresh(); onBankChange();
+  });
+  useEffect(() => { setSelected([]); }, [view, page, pageSize, accountId]);
+  const chosen = (view?.items ?? []).filter(item => selected.includes(item.problemKey));
+  const targets = (items: readonly ApiLuoguMetadataBacklogItem[]): ManagementTarget[] => items.map(item => ({ problemKey: item.problemKey, externalKey: item.externalKey, expectedState: 'active' }));
 
   // Adopt the answer's total and pull the page back into range when items were resolved meanwhile.
   useEffect(() => {
@@ -132,7 +150,7 @@ export function LuoguMetadataPanel({
     }
   }, [progressSignature, status.metadataBacklog, backlog.refresh]);
 
-  const gate = luoguMetadataMutationReason(status, retryKey !== null || formBusy);
+  const gate = luoguMetadataMutationReason(status, retryKey !== null || formBusy || management.busy);
   const hostFailure = luoguMetadataHostFailureLine(status);
   const pages = view === null ? 1 : luoguMetadataPageCount(view.total, pageSize);
   const first = page <= 1;
@@ -186,6 +204,8 @@ export function LuoguMetadataPanel({
   return (
     <>
       <p className="icpc-muted">{LUOGU_METADATA_MANUAL_NOTE}</p>
+      <p className="icpc-muted">出题测试等没有题面的题目，可以跳过补齐，或移入可恢复的回收站。不会按题号自动删除。</p>
+      {management.confirmation}
       {hostFailure !== null && (
         <p className="icpc-luogu-alert" role="status">
           {hostFailure}
@@ -223,9 +243,16 @@ export function LuoguMetadataPanel({
         )
       ) : (
         <>
+          <div className="icpc-actions">
+            <label className="icpc-check"><input type="checkbox" aria-label="选择本页全部待补题目" checked={view.items.length > 0 && chosen.length === view.items.length} disabled={gate !== null} onChange={event => setSelected(event.target.checked ? view.items.map(item => item.problemKey) : [])} />选择本页</label>
+            <span>已选 {chosen.length} 题</span>
+            <button type="button" disabled={gate !== null || chosen.length === 0} onClick={() => management.begin('skip', targets(chosen))}>跳过选中题目</button>
+            <button type="button" disabled={gate !== null || chosen.length === 0} onClick={() => management.begin('trash', targets(chosen))}>选中题目移入回收站</button>
+          </div>
           <ul className="icpc-luogu-backlog">
             {view.items.map((item) => (
               <li key={item.problemKey}>
+                <label className="icpc-check"><input type="checkbox" aria-label={`选择 ${item.externalKey}`} checked={selected.includes(item.problemKey)} disabled={gate !== null} onChange={event => setSelected(previous => event.target.checked ? [...previous, item.problemKey] : previous.filter(key => key !== item.problemKey))} /> {item.externalKey}</label>
                 <div className="icpc-luogu-backlog-title">
                   {item.title !== null ? item.title : '（本地还没有标题）'}
                 </div>
@@ -236,6 +263,8 @@ export function LuoguMetadataPanel({
                   {luoguMetadataIssueText(item.issue, view.unknownIssueLabel)}
                 </p>
                 <div className="icpc-luogu-backlog-row-actions">
+                  <button type="button" disabled={gate !== null} onClick={() => management.begin('skip', targets([item]))}>跳过此题</button>
+                  <button type="button" disabled={gate !== null} onClick={() => management.begin('trash', targets([item]))}>移入回收站</button>
                   <button
                     type="button"
                     disabled={gate !== null || retryKey === item.problemKey}

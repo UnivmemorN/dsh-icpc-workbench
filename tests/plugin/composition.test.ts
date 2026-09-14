@@ -33,11 +33,11 @@ function fixture(luogu?:ActivationEnvironment['luogu']) {
 test('host composition keeps activation free, persists settings/accounts and creates a restorable backup',async()=>{
  const f=fixture();let runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.calls(),0);assert.equal(f.routes.size,66); // 46 business/model/bootstrap + 11 typed Luogu + 3 virtual-performance + 6 assessment operations.
+  assert.equal(f.calls(),0);assert.equal(f.routes.size,68); // 46 business/model/bootstrap + 13 typed Luogu + 3 virtual-performance + 6 assessment operations.
   // The six durable ability-assessment routes are part of that count, so a registration regression
   // cannot hide behind a coincidentally unchanged total somewhere else.
   for(const operation of ['retro.list','retro.editPreview','retro.editApply','assessment.config','assessment.prepare','assessment.run','assessment.status','assessment.cancel','assessment.history'])assert.ok(f.routes.has('/api/icpc/v1/'+operation),'assessment route '+operation+' must be registered');
-  for (const operation of ['luogu.metadataBacklog', 'luogu.retryMetadata', 'luogu.supplementMetadata']) assert.ok(f.routes.has('/api/icpc/v1/' + operation), 'recovery route ' + operation + ' must be registered');
+  for (const operation of ['luogu.metadataBacklog', 'luogu.retryMetadata', 'luogu.supplementMetadata', 'luogu.managedProblems', 'luogu.manageProblems']) assert.ok(f.routes.has('/api/icpc/v1/' + operation), 'recovery route ' + operation + ' must be registered');
   assert.ok(f.routes.has('/api/icpc/v1/luogu.profile'),'the anonymous public-profile route must be registered');
   const boot=await f.call('bootstrap');assert.equal(boot.status,200);assert.equal(boot.body.value.settings.revision,1);assert.equal(boot.body.value.sources.length,2);assert.equal(boot.body.value.hydro.implemented,false);assert.equal(boot.body.value.hostVersion,'0.1.5-rc.2');
   assert.equal(f.calls(),0);
@@ -167,7 +167,7 @@ test('the luogu host recovers durable state, keeps defaults offline and owns its
  await seed.upsertSourceInstances([instance]);await seed.upsertAccounts([account]);await seed.close();
  const runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.routes.size,66);
+  assert.equal(f.routes.size,68);
   assert.equal(feed.calls.length,0,'default automation must not contact the platform on startup');
   assert.equal(timers.entries.length,1,'exactly one owned periodic timer');
   assert.equal(timers.entries[0]?.intervalMs,1000);

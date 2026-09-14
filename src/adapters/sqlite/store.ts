@@ -1,3 +1,6 @@
+import { parseProblemKey } from '../../domain/ids.js';
+import { canonicalProblemKey, canApplyDispositionAction, stateAfterAction, validateDispositionBatch, type ProblemDispositionRecord } from '../../domain/problem-disposition.js';
+import type { ProblemDispositionQuery, ProblemDispositionPage, ProblemDispositionChangeRequest } from '../../application/ports.js';
 import { validateOfficialRating, type OfficialRatingSnapshot } from '../../domain/official-rating.js';
 /**
  * SQLite implementation of the {@link TrainingStore} port, built on the built-in
@@ -218,6 +221,7 @@ import {
   SCHEMA_VERSION_V6,
   SCHEMA_VERSION_V7,
   SCHEMA_VERSION_V8,
+  SCHEMA_VERSION_V9,
   SCHEMA_VERSION_V1,
   SCHEMA_VERSION_V2,
   SCHEMA_VERSION_V3,
@@ -226,7 +230,7 @@ import {
   backupFileName,
   configureConnection,
   detectSchemaState,
-  migrateToSchemaV9,
+  migrateToSchemaV10,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -435,7 +439,7 @@ export class SqliteTrainingStore
       transactional: true,
       notes: [
         `node:sqlite DatabaseSync; schema marker ${STORE_MARKER}; one serialized connection`,
-        'Databases from a newer schema are rejected before any write; v0 through v8 databases are migrated after a verified consistent backup',
+        'Databases from a newer schema are rejected before any write; v0 through v9 databases are migrated after a verified consistent backup',
         'Snapshot/analysis/tag-decision/retrospective ids are immutable; jobs keep counters and leases',
         'Batches are revision-guarded with monotonic counters; model-call attempts move reserved -> uncertain|settled and settled rows are immutable',
         'Workbench settings are a singleton row saved under revision CAS',
@@ -833,7 +837,7 @@ export class SqliteTrainingStore
     return this.withRead(() => {
       const limit = pageLimit(query.limit);
       const cursor = query.cursor === null ? null : decodeCursor('problem', query.cursor);
-      const filters: string[] = [];
+      const filters: string[] = ["NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = problems.key AND d.state = 'trashed')"];
       const params: SqlValue[] = [];
       if (query.sourceInstanceId !== undefined && query.sourceInstanceId !== null) {
         filters.push('source_instance_id = ?');
@@ -912,7 +916,7 @@ export class SqliteTrainingStore
         'an attempt filter needs an explicit account id',
         {},
       );
-      const filters: string[] = [];
+      const filters: string[] = ["NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = problems.key AND d.state = 'trashed')"];
       const params: SqlValue[] = [];
       if (query.sourceInstanceId !== undefined && query.sourceInstanceId !== null) {
         filters.push('problems.source_instance_id = ?');
@@ -1144,8 +1148,61 @@ export class SqliteTrainingStore
   async getProblem(problemKeyValue: string): Promise<NormalizedProblem | null> {
     this.assertOpen();
     return this.withRead(() => {
-      const row = this.find('SELECT body FROM problems WHERE key = ?', [requireProblemKey(problemKeyValue)]);
+      const row = this.find("SELECT body FROM problems WHERE key = ? AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = problems.key AND d.state = 'trashed')", [requireProblemKey(problemKeyValue)]);
       return row === null ? null : entityFromRow<NormalizedProblem>('problems.body', row);
+    });
+  }
+
+
+  async getProblemDisposition(key: string): Promise<ProblemDispositionRecord | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find('SELECT body FROM problem_dispositions WHERE problem_key = ?', [canonicalProblemKey(key)]);
+      return row === null ? null : entityFromRow<ProblemDispositionRecord>('problem_dispositions.body', row);
+    });
+  }
+
+  async listProblemDispositions(query: ProblemDispositionQuery): Promise<ProblemDispositionPage> {
+    this.assertOpen();
+    return this.withRead(() => {
+      invariant(query.state === 'skipped' || query.state === 'trashed', 'invalid_input', 'invalid disposition state');
+      const limit = browsePageLimit(query.limit), requested = browsePageNumber(query.page);
+      invariant(limit <= 50, 'invalid_input', 'recovery page limit is 50');
+      const params = [requireId('source instance', query.sourceInstanceId), query.state];
+      const totalItems = intColumn(this.find('SELECT count(*) AS count FROM problem_dispositions WHERE source_instance_id = ? AND state = ?', params)!, 'count');
+      const totalPages = Math.ceil(totalItems / limit), page = Math.min(requested, Math.max(1, totalPages));
+      const rows = this.all('SELECT d.body, p.title FROM problem_dispositions d LEFT JOIN problems p ON p.key = d.problem_key WHERE d.source_instance_id = ? AND d.state = ? ORDER BY d.problem_key ASC LIMIT ? OFFSET ?', [...params, limit, (page - 1) * limit]);
+      return { items: rows.map(row => ({ ...entityFromRow<ProblemDispositionRecord>('problem_dispositions.body', row), title: nullableTextColumn(row, 'title') })), page, pageSize: limit, totalItems, totalPages };
+    });
+  }
+
+  async applyProblemDispositions(request: ProblemDispositionChangeRequest): Promise<number> {
+    this.assertOpen();
+    validateDispositionBatch(request.action, request.items);
+    return this.withWrite(() => {
+      const account = this.find('SELECT source_instance_id FROM accounts WHERE id = ?', [requireId('account id', request.accountId)]);
+      invariant(account !== null, 'invalid_input', 'unknown disposition account');
+      const source = textColumn(account, 'source_instance_id');
+      for (const item of request.items) {
+        invariant(parseProblemKey(item.problemKey).sourceInstanceId === source, 'invalid_input', 'foreign disposition key');
+        const old = this.find('SELECT state FROM problem_dispositions WHERE problem_key = ?', [item.problemKey]);
+        const state = old === null ? null : textColumn(old, 'state') as 'skipped' | 'trashed';
+        if (state !== item.expectedState) throw new DomainError('invalid_transition', 'problem disposition changed', { reason: 'disposition_conflict' });
+        invariant(canApplyDispositionAction(request.action, state), 'invalid_input', 'illegal disposition transition');
+        if (state === null) {
+          const known = this.find(`SELECT 1 AS known WHERE EXISTS (SELECT 1 FROM problems WHERE key = ?) OR EXISTS (SELECT 1 FROM submissions WHERE problem_key = ?) OR EXISTS (SELECT 1 FROM luogu_sync_states st, json_each(st.body, '$.missingMetadata') q WHERE st.source_instance_id = ? AND q.value = ?)`, [item.problemKey, item.problemKey, source, item.problemKey]);
+          invariant(known !== null, 'invalid_input', 'problem is not locally known');
+        }
+      }
+      const state = stateAfterAction(request.action);
+      for (const item of request.items) {
+        if (state === null) this.write('DELETE FROM problem_dispositions WHERE problem_key = ?', [item.problemKey]);
+        else {
+          const record: ProblemDispositionRecord = { problemKey: item.problemKey, state, sourceInstanceId: source, initiatorAccountId: request.accountId, updatedAt: this.clock() };
+          this.write('INSERT INTO problem_dispositions (problem_key, state, source_instance_id, initiator_account_id, updated_at, body) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(problem_key) DO UPDATE SET state=excluded.state, initiator_account_id=excluded.initiator_account_id, updated_at=excluded.updated_at, body=excluded.body', [record.problemKey, state, source, request.accountId, record.updatedAt, JSON.stringify(record)]);
+        }
+      }
+      return request.items.length;
     });
   }
 
@@ -1210,7 +1267,7 @@ export class SqliteTrainingStore
       const limit = pageLimit(query.limit);
       const cursor = query.cursor === null ? null : decodeCursor('submission', query.cursor);
       const params: SqlValue[] = [accountId];
-      let where = ' WHERE account_id = ?';
+      let where = " WHERE account_id = ? AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = submissions.problem_key AND d.state = 'trashed')";
       if (cursor !== null) {
         where += ' AND id > ?';
         params.push(cursor);
@@ -1236,7 +1293,7 @@ export class SqliteTrainingStore
   async getSubmission(submissionId: string): Promise<Submission | null> {
     this.assertOpen();
     return this.withRead(() => {
-      const row = this.find('SELECT body FROM submissions WHERE id = ?', [
+      const row = this.find("SELECT body FROM submissions WHERE id = ? AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = submissions.problem_key AND d.state = 'trashed')", [
         requireId('submission id', submissionId),
       ]);
       return row === null ? null : entityFromRow<Submission>('submissions.body', row);
@@ -1250,7 +1307,7 @@ export class SqliteTrainingStore
   async getCurrentSnapshotHead(ref: ProblemRef): Promise<SnapshotHead | null> {
     this.assertOpen();
     return this.withRead(() => {
-      const row = this.find('SELECT snapshot_id, content_hash, version FROM snapshot_heads WHERE problem_key = ?', [
+      const row = this.find("SELECT snapshot_id, content_hash, version FROM snapshot_heads WHERE problem_key = ? AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = snapshot_heads.problem_key AND d.state = 'trashed')", [
         problemKey(ref),
       ]);
       if (row === null) {
@@ -1267,7 +1324,7 @@ export class SqliteTrainingStore
   async getSnapshot(snapshotId: string): Promise<ProblemSnapshot | null> {
     this.assertOpen();
     return this.withRead(() => {
-      const row = this.find('SELECT body FROM snapshots WHERE snapshot_id = ?', [
+      const row = this.find("SELECT body FROM snapshots WHERE snapshot_id = ? AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = snapshots.problem_key AND d.state = 'trashed')", [
         requireId('snapshot id', snapshotId),
       ]);
       return row === null ? null : entityFromRow<ProblemSnapshot>('snapshots.body', row);
@@ -1589,7 +1646,7 @@ export class SqliteTrainingStore
   async listRetrospectives(accountId: string): Promise<readonly Retrospective[]> {
     this.assertOpen();
     return this.withRead(() =>
-      this.all('SELECT body FROM retrospectives WHERE account_id = ? ORDER BY recorded_at ASC, retrospective_id ASC', [
+      this.all("SELECT body FROM retrospectives WHERE account_id = ? AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = retrospectives.problem_key AND d.state = 'trashed') ORDER BY recorded_at ASC, retrospective_id ASC", [
         requireId('account id', accountId),
       ]).map((row) => entityFromRow<Retrospective>('retrospectives.body', row)),
     );
@@ -2727,7 +2784,7 @@ export class SqliteTrainingStore
 
   private writeSnapshot(snapshot: ProblemSnapshot): void {
     const key = requireValidSnapshot(snapshot);
-    const existing = this.find('SELECT body FROM snapshots WHERE snapshot_id = ?', [snapshot.snapshotId]);
+    const existing = this.find("SELECT body FROM snapshots WHERE snapshot_id = ? AND NOT EXISTS (SELECT 1 FROM problem_dispositions d WHERE d.problem_key = snapshots.problem_key AND d.state = 'trashed')", [snapshot.snapshotId]);
     if (existing !== null) {
       // Same content-addressed id: only observation timestamps may differ, and the first
       // capture is kept. Any semantic difference means a body that does not match its id.
@@ -3441,7 +3498,7 @@ export class SqliteTrainingStore
    *    so the backup is the database as it was found and switching the journal mode is not part
    *    of the pre-migration state. The copy is verified before migration starts, at the literal
    *    version the file was found in.
-   * 3. `migrateToSchemaV9` applies only the missing versions in one transaction and ends at the
+   * 3. `migrateToSchemaV10` applies only the missing versions in one transaction and ends at the
    *    current version; every existing row is retained, and exactly one pre-migration backup was
    *    already taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
@@ -3459,7 +3516,8 @@ export class SqliteTrainingStore
       state === 'v5' ||
       state === 'v6' ||
       state === 'v7' ||
-      state === 'v8'
+      state === 'v8' ||
+      state === 'v9'
     ) {
       // Keep a consistent copy of the database as found before any migration writes to it.
       const from =
@@ -3479,14 +3537,14 @@ export class SqliteTrainingStore
                       ? SCHEMA_VERSION_V6
                       : state === 'v7'
                         ? SCHEMA_VERSION_V7
-                        : SCHEMA_VERSION_V8;
+                        : state === 'v8' ? SCHEMA_VERSION_V8 : SCHEMA_VERSION_V9;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
       this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        migrateToSchemaV9(this.connection, readUserVersion(this.connection));
+        migrateToSchemaV10(this.connection, readUserVersion(this.connection));
       } catch (error) {
         if (error instanceof StorageError) {
           throw error;

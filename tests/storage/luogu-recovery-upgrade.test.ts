@@ -10,7 +10,7 @@ import {emptyLuoguSyncState} from '../../src/application/luogu-sync-types.js';
 import {officialInstance,problemKeyOf} from '../sync/fixtures.js';
 import {AT,tempDatabase,removeDirectory} from './fixtures.js';
 
-void test('genuine v8 Luogu backlog migrates to v9 with a verified v8 backup and byte-identical legacy rows',async()=>{
+void test('genuine v8 Luogu backlog migrates to the current schema with a verified v8 backup and byte-identical legacy rows',async()=>{
  const paths=tempDatabase();const source=officialInstance();const account=createLuoguAccount(source,'900001');
  const legacy={...emptyLuoguSyncState(account.id,source.id,AT)};delete legacy.metadataIssues;
  const state={...legacy,missingMetadata:[problemKeyOf(source,'U900000001')],metadataFailed:22,failure:{code:'changed_response',at:AT,retryAt:null,paused:true,stage:'metadata'}};
@@ -20,9 +20,9 @@ void test('genuine v8 Luogu backlog migrates to v9 with a verified v8 backup and
  raw.prepare('INSERT INTO accounts(id,source_instance_id,handle,display_name,profile_url,body) VALUES(?,?,?,?,?,?)').run(account.id,account.sourceInstanceId,account.handle,account.displayName,account.profileUrl,bodies.account);
  raw.prepare('INSERT INTO luogu_sync_states(account_id,source_instance_id,revision,body) VALUES(?,?,?,?)').run(account.id,source.id,1,bodies.state);
  }finally{raw.close();}
- try{const store=new SqliteTrainingStore({path:paths.path});try{assert.equal(store.capabilities().schemaVersion,9);const row=await store.getLuoguSyncState(account.id);assert.deepEqual(row?.value,state);assert.equal(Object.hasOwn(row!.value,'metadataIssues'),false);assert.equal(row?.revision,1);}finally{await store.close();}
- const db=new DatabaseSync(paths.path,{readOnly:true});let names:readonly string[];try{assert.equal(readUserVersion(db),9);assert.equal(db.prepare('SELECT body FROM luogu_sync_states').get()!['body'],bodies.state);assert.equal(db.prepare('SELECT body FROM source_instances').get()!['body'],bodies.source);assert.equal(db.prepare('SELECT body FROM accounts').get()!['body'],bodies.account);names=tableNames(db);}finally{db.close();}
- const backups=readdirSync(paths.dir).filter(x=>x.includes('.backup-v8-')&&x.endsWith('.sqlite'));assert.equal(backups.length,1);const backup=new DatabaseSync(join(paths.dir,backups[0]!),{readOnly:true});try{assert.equal(readUserVersion(backup),8);assert.deepEqual(tableNames(backup),names!);assert.equal(backup.prepare('SELECT body FROM luogu_sync_states').get()!['body'],bodies.state);}finally{backup.close();}
+ try{const store=new SqliteTrainingStore({path:paths.path});try{assert.equal(store.capabilities().schemaVersion,10);const row=await store.getLuoguSyncState(account.id);assert.deepEqual(row?.value,state);assert.equal(Object.hasOwn(row!.value,'metadataIssues'),false);assert.equal(row?.revision,1);}finally{await store.close();}
+ const db=new DatabaseSync(paths.path,{readOnly:true});let names:readonly string[];try{assert.equal(readUserVersion(db),10);assert.equal(db.prepare('SELECT body FROM luogu_sync_states').get()!['body'],bodies.state);assert.equal(db.prepare('SELECT body FROM source_instances').get()!['body'],bodies.source);assert.equal(db.prepare('SELECT body FROM accounts').get()!['body'],bodies.account);names=tableNames(db);}finally{db.close();}
+ const backups=readdirSync(paths.dir).filter(x=>x.includes('.backup-v8-')&&x.endsWith('.sqlite'));assert.equal(backups.length,1);const backup=new DatabaseSync(join(paths.dir,backups[0]!),{readOnly:true});try{assert.equal(readUserVersion(backup),8);assert.deepEqual(tableNames(backup),names!.filter(name=>name!=='problem_dispositions'));assert.ok(names!.includes('problem_dispositions'));assert.equal(backup.prepare('SELECT body FROM luogu_sync_states').get()!['body'],bodies.state);}finally{backup.close();}
  }finally{removeDirectory(paths.dir);}
 });
 

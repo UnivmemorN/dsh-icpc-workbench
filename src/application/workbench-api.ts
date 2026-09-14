@@ -236,6 +236,8 @@ export const LUOGU_API_OPERATIONS = {
   metadataBacklog: 'luogu.metadataBacklog',
   retryMetadata: 'luogu.retryMetadata',
   supplementMetadata: 'luogu.supplementMetadata',
+  managedProblems: 'luogu.managedProblems',
+  manageProblems: 'luogu.manageProblems',
 } as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
 
 // ---------------------------------------------------------------------------------------
@@ -832,6 +834,72 @@ export interface ApiLuoguProfileResult {
   readonly account: ApiAccountView;
 }
 
+/**
+ * Request of luogu.managedProblems: one bounded page of the durable local problem dispositions.
+ *
+ * state selects what the user skipped (metadata fetching suppressed while the bank stays intact) or
+ * trashed (hidden from the bank, statistics and ability input). The read is a projection of stored
+ * tombstones plus the raw stored title: it needs no connection and performs no request.
+ */
+export interface ApiLuoguManagedProblemsRequest {
+  readonly accountId: string;
+  /** 1-based page number; default 1. */
+  readonly page?: number;
+  /** Page size within 1..50 (the store's recovery read bound); default 20. */
+  readonly pageSize?: number;
+  readonly state: 'skipped' | 'trashed';
+}
+
+/** One durable local disposition; title is the raw stored title, or null when no row exists. */
+export interface ApiLuoguManagedProblemsItem {
+  readonly problemKey: string;
+  /** Platform-facing key of the reference (for example P900000001). */
+  readonly externalKey: string;
+  readonly title: string | null;
+  readonly state: 'skipped' | 'trashed';
+  readonly updatedAt: string;
+}
+
+/** One page of durable dispositions. A disposition is global to the canonical key of this source. */
+export interface ApiLuoguManagedProblemsView {
+  readonly items: readonly ApiLuoguManagedProblemsItem[];
+  readonly total: number;
+  readonly page: number;
+  readonly pageSize: number;
+}
+
+/**
+ * One requested disposition change: the state the caller believes the key is in.
+ *
+ * active is the public spelling of "no durable disposition" (the service's internal null);
+ * expectedState must equal the durable state or the whole batch is refused.
+ */
+export interface ApiLuoguManageProblemsItem {
+  readonly problemKey: string;
+  readonly expectedState: 'active' | 'skipped' | 'trashed';
+}
+
+/**
+ * Request of luogu.manageProblems: one action over 1..50 distinct canonical keys of this source.
+ *
+ * skip suppresses only metadata fetching and leaves the bank and analytics intact; trash additionally
+ * hides the problem from every stored read; restore removes the tombstone and exposes the retained
+ * raw rows again. trash may replace skipped, skip only an active key and restore only a skipped or
+ * trashed one; every rule is checked against the durable state inside one all-or-none transaction.
+ * The keys must be locally known (a stored problem, a local submission or a queued backlog key); an
+ * arbitrary remote identity is refused.
+ */
+export interface ApiLuoguManageProblemsRequest {
+  readonly accountId: string;
+  readonly action: 'skip' | 'trash' | 'restore';
+  readonly items: readonly ApiLuoguManageProblemsItem[];
+}
+
+/** Result of luogu.manageProblems: how many keys the atomic CAS batch changed. */
+export interface ApiLuoguManageProblemsResult {
+  readonly changed: number;
+}
+
 // ---------------------------------------------------------------------------------------
 // Workbench read/review/plan operations (delegated to the accepted services)
 // ---------------------------------------------------------------------------------------
@@ -986,6 +1054,8 @@ export interface WorkbenchApiMap {
   'luogu.metadataBacklog': ApiEndpoint<ApiLuoguMetadataBacklogRequest, ApiLuoguMetadataBacklogView>;
   'luogu.retryMetadata': ApiEndpoint<ApiLuoguRetryMetadataRequest, ApiLuoguRetryMetadataResult>;
   'luogu.supplementMetadata': ApiEndpoint<ApiLuoguSupplementMetadataRequest, ApiLuoguSupplementMetadataResult>;
+  'luogu.managedProblems': ApiEndpoint<ApiLuoguManagedProblemsRequest, ApiLuoguManagedProblemsView>;
+  'luogu.manageProblems': ApiEndpoint<ApiLuoguManageProblemsRequest, ApiLuoguManageProblemsResult>;
   'assessment.config': ApiEndpoint<Record<string,never>,AssessmentConfigView>;
   'assessment.prepare': ApiEndpoint<AssessmentPrepareRequest,ApiAssessmentView>;
   'assessment.run': ApiEndpoint<AssessmentRunRequest,{readonly started:boolean;readonly attempt:ApiAssessmentView}>;

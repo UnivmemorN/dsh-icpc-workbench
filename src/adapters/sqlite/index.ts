@@ -22,4 +22,6 @@ export {
   STORE_TABLES_V3,
   STORE_TABLES_V8,
   STORE_TABLES_V9,
+  STORE_TABLES_V10,
+  SCHEMA_VERSION_V9,
 } from './schema.js';

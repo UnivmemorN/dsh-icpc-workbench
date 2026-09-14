@@ -34,6 +34,9 @@ import type {
   ManualTagDecision,
   ModelUsage,
   NormalizedProblem,
+  ProblemDispositionAction,
+  ProblemDispositionRecord,
+  ProblemDispositionState,
   ProblemRef,
   ProblemSnapshot,
   ReasoningDraft,
@@ -838,6 +841,35 @@ export interface TrainingStore {
 
   /** Release the store's resources. Safe to call more than once. */
   close(): Promise<void>;
+
+  /** Durable local state, shared by native problem key across accounts. */
+  getProblemDisposition(problemKey: string): Promise<ProblemDispositionRecord | null>;
+  /** A bounded raw-title recovery read; includes hidden rows only in this explicit view. */
+  listProblemDispositions(query: ProblemDispositionQuery): Promise<ProblemDispositionPage>;
+  /** Atomic CAS batch. Does not delete original evidence; caller coordinates source leases. */
+  applyProblemDispositions(request: ProblemDispositionChangeRequest): Promise<number>;
+}
+export interface ProblemDispositionQuery {
+  readonly sourceInstanceId: string;
+  readonly state: ProblemDispositionState;
+  readonly page: number;
+  readonly limit: number;
+}
+export interface ProblemDispositionPage {
+  readonly items: readonly (ProblemDispositionRecord & { readonly title: string | null })[];
+  readonly page: number;
+  readonly pageSize: number;
+  readonly totalItems: number;
+  readonly totalPages: number;
+}
+export interface ProblemDispositionChangeItem {
+  readonly problemKey: string;
+  readonly expectedState: ProblemDispositionState | null;
+}
+export interface ProblemDispositionChangeRequest {
+  readonly accountId: string;
+  readonly action: ProblemDispositionAction;
+  readonly items: readonly ProblemDispositionChangeItem[];
 }
 
 /** Cancellation-aware sleep used by adapters to honour platform rate limits. */

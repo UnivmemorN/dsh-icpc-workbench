@@ -563,7 +563,7 @@ export function LuoguSyncPanel({
             }
           }}
         >
-          <summary>{luoguMetadataDisclosureLabel(value.metadataBacklog)}</summary>
+          <summary>{luoguMetadataDisclosureLabel(value.metadataBacklog)} · 已跳过 / 回收站</summary>
           <div className="icpc-luogu-detail-body">
             {metadataOpen && (
               <LuoguMetadataPanel

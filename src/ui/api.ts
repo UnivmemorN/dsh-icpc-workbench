@@ -57,6 +57,8 @@ const OPERATIONS={
  'luogu.metadataBacklog':true,
  'luogu.retryMetadata':true,
  'luogu.supplementMetadata':true,
+ 'luogu.managedProblems':true,
+ 'luogu.manageProblems':true,
  'assessment.config':true,
  'assessment.prepare':true,
  'assessment.run':true,
