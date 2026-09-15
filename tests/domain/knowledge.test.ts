@@ -37,6 +37,8 @@ const LATER = '2026-11-02T08:00:00.000Z';
 const INSTANCE = 'codeforces:codeforces.com';
 const ACCOUNT = `${INSTANCE}|alice`;
 const OTHER_ACCOUNT = `${INSTANCE}|bob`;
+/** Independence threshold the shared default uses; the report echoes its own value. */
+const THRESHOLD = 5;
 
 function node(
   id: string,
@@ -537,9 +539,21 @@ void test('the same raw text from two source instances stays two mappings', () =
 
   const numeric = report.sourceTagMappings.find((entry) => entry.raw === 'luogu-tag:42');
   assert.ok(numeric);
-  assert.equal(numeric.relation, 'reference');
+  assert.equal(
+    numeric.relation,
+    'unmapped',
+    'the official id resolves to dictionary 线段树, which this small catalog has no node for',
+  );
   assert.equal(numeric.vocabulary, 'luogu');
-  assert.equal(report.unmatchedAlgorithmLabels.includes('luogu-tag:42'), false, 'a platform id is no algorithm gap');
+  // The dictionary step is chained in front of the name rule; 线段树 exists in the bundled
+  // dictionary but no rule of this small catalog maps it to a node, so the name rule is `unmapped`.
+  assert.equal(numeric.ruleId, 'luogu.tag-id.42.luogu.unmapped');
+  assert.equal(numeric.explanation.includes('线段树'), true, 'the platform name survives even without a node');
+  assert.equal(
+    report.unmatchedAlgorithmLabels.includes('luogu-tag:42'),
+    true,
+    'a named id with no node in this catalog is explicit coverage, not a silent reference',
+  );
 
   const stack = nodeOf(report, 'ds.stack');
   assert.equal(stack.platformAttemptedDistinct, 2);
@@ -565,11 +579,13 @@ void test('composite constituents and platform references are honest coverage ga
   assert.equal(nodeOf(report, 'ds.dsu').platformAttemptedDistinct, 1, 'a plain synonym still counts');
   assert.deepEqual(
     report.unmatchedAlgorithmLabels,
-    ['单调队列'],
-    'a constituent of the frozen monotonic stack/queue node is not silently counted',
+    ['luogu-tag:7', '单调队列'],
+    'a numeric id whose dictionary name has no node here and a frozen-node constituent are both honest gaps',
   );
-  assert.equal(report.coverage.unmatchedAlgorithmProblemDistinct, 1);
-  assert.equal(report.sourceTagMappings.find((mapping) => mapping.raw === 'luogu-tag:7')?.relation, 'reference');
+  assert.equal(report.coverage.unmatchedAlgorithmProblemDistinct, 1, 'one problem carries both gaps, counted once');
+  const numeric = report.sourceTagMappings.find((mapping) => mapping.raw === 'luogu-tag:7');
+  assert.equal(numeric?.relation, 'unmapped', 'dictionary 贪心 resolves to no node of this small catalog');
+  assert.equal(numeric?.explanation.includes('贪心'), true, 'the readable platform name is preserved');
   assert.equal(
     report.nodes.some((node) => node.taxonomyId.includes('monotonic')),
     false,
@@ -677,4 +693,121 @@ void test('five independent problems qualify only in their own band and empty re
   assert.equal(report.difficultyBands.length, 1);
   assert.equal(report.difficultyBands[0]!.nodes.find(n => n.taxonomyId === 'ds.stack')!.status, 'independent_evidence');
   assert.equal(report.difficultyBands[0]!.nodes.find(n => n.taxonomyId === 'ds.stack')!.platformSolvedDistinct, 0);
+});
+
+/** Sprint 32 bridge catalog: the dictionary names must resolve to these custom ids. */
+const BRIDGE_INDEX = createTaxonomyIndex(
+  createTaxonomy({
+    version: 'test.32.1',
+    nodes: [
+      node('ds', null, 'category', 'Data structures', '数据结构'),
+      node('ds.bit', 'ds', 'technique', 'Fenwick tree', '树状数组', ['fenwick', '树状数组']),
+      node('ds.segment-tree', 'ds', 'technique', 'Segment tree', '线段树', ['segment-tree', '线段树']),
+      node('dp', null, 'category', 'Dynamic programming', '动态规划'),
+    ],
+  }),
+);
+
+void test('numeric-only Luogu rows bridge to provisional counts, once per distinct problem', () => {
+  const luoguInstance = 'luogu:www.luogu.com.cn';
+  const luoguAccount = `${luoguInstance}|alice`;
+  const make = (key: string, rawTags: readonly string[], ratings: readonly PlatformRating[] = []) =>
+    createNormalizedProblem({
+      ref: { sourceInstanceId: luoguInstance, domain: null, externalKey: key },
+      title: key,
+      url: `https://www.luogu.com.cn/problem/${key}`,
+      statement: null,
+      fetchedAt: AT,
+      ratings,
+      rawTags,
+    });
+  // An old stored row with nothing but ids, a row that also carries the platform name, and a
+  // category id: all three must reach the provisional platform channel through the dictionary.
+  const p1 = make('L1', ['luogu-tag:53'], [rating(3, 'difficulty')]);
+  const p2 = make('L2', ['luogu-tag:53', '树状数组'], [rating(3, 'difficulty')]);
+  const p3 = make('L3', ['luogu-tag:3'], [rating(7, 'difficulty')]);
+  const report = computeKnowledgeEvidence({
+    taxonomy: BRIDGE_INDEX,
+    accountId: luoguAccount,
+    problems: [p1, p2, p3],
+    submissions: [
+      submission(p1.ref, 'l1a', 'accepted', luoguAccount),
+      submission(p1.ref, 'l1b', 'accepted', luoguAccount),
+      submission(p2.ref, 'l2a', 'accepted', luoguAccount),
+      submission(p3.ref, 'l3a', 'wrong_answer', luoguAccount),
+    ],
+    decisions: [],
+    retrospectives: [],
+    minimumIndependentProblems: THRESHOLD,
+  });
+
+  const evidence = (taxonomyId: string): KnowledgeNodeEvidence => {
+    const found = report.nodes.find((entry) => entry.taxonomyId === taxonomyId);
+    assert.ok(found, `taxonomy node ${taxonomyId} is missing from the report`);
+    return found;
+  };
+  assert.equal(evidence('ds.bit').platformAttemptedDistinct, 2, 'two distinct problems, never three labels');
+  assert.equal(evidence('ds.bit').platformSolvedDistinct, 2, 'a repeated accepted submission never inflates');
+  assert.equal(evidence('ds.bit').verifiedAttemptedDistinct, 0, 'a raw mapping never becomes a verified tag');
+  assert.equal(evidence('ds.bit').retrospectiveIndependentDistinct, 0, 'no retrospective was recorded');
+  assert.equal(evidence('ds.bit').status, 'unconfirmed');
+  assert.equal(evidence('dp').platformAttemptedDistinct, 1, 'the category id counts once on the category');
+  assert.equal(evidence('dp').status, 'category_summary');
+  assert.equal(report.coverage.relatedAttemptedDistinct, 3);
+  assert.equal(report.coverage.verifiedAttemptedDistinct, 0);
+  assert.deepEqual(report.unmatchedAlgorithmLabels, [], 'a bridged dictionary name leaves no coverage gap');
+
+  const numeric = report.sourceTagMappings.find((entry) => entry.raw === 'luogu-tag:53');
+  assert.ok(numeric);
+  assert.equal(numeric.relation, 'exact');
+  assert.equal(numeric.ruleId, 'luogu.tag-id.53.shared.safe-exact');
+  assert.equal(numeric.attemptedDistinct, 2);
+  assert.equal(numeric.solvedDistinct, 2);
+
+  // Native difficulty bands keep their own scoped counts and never borrow the total.
+  const low = report.difficultyBands.find((band) => band.band.value === 3);
+  const high = report.difficultyBands.find((band) => band.band.value === 7);
+  assert.ok(low);
+  assert.ok(high);
+  assert.equal(low.nodes.find((entry) => entry.taxonomyId === 'ds.bit')?.platformAttemptedDistinct, 2);
+  assert.equal(low.nodes.find((entry) => entry.taxonomyId === 'dp') ?? null, null);
+  assert.equal(high.nodes.find((entry) => entry.taxonomyId === 'dp')?.platformAttemptedDistinct, 1);
+  assert.equal(high.nodes.find((entry) => entry.taxonomyId === 'ds.bit') ?? null, null);
+});
+
+void test('an unmapped Codeforces label keeps exact diagnostics beside mapped tags and across bands', () => {
+  const p1 = problem('C1', { ratings: [rating(1600)], rawTags: ['stack', 'divide and conquer'] });
+  const p2 = problem('C2', { ratings: [rating(2200)], rawTags: ['divide and conquer'] });
+  const report = run({
+    problems: [p1, p2],
+    submissions: [submission(p1.ref, 'c1', 'accepted'), submission(p2.ref, 'c2', 'wrong_answer')],
+  });
+
+  const unknown = report.sourceTagMappings.filter((entry) => entry.raw === 'divide and conquer');
+  assert.equal(unknown.length, 1, 'one distinct raw label stays one diagnostic row');
+  assert.equal(unknown[0]!.relation, 'unmapped');
+  assert.equal(unknown[0]!.ruleId, 'codeforces.unmapped');
+  assert.deepEqual(unknown[0]!.targetIds, []);
+  assert.equal(unknown[0]!.attemptedDistinct, 2, 'both distinct problems carry the unknown label');
+  assert.equal(unknown[0]!.solvedDistinct, 1, 'only the accepted one counts as solved');
+  assert.ok(unknown[0]!.explanation.length > 0, 'the mapping keeps its reason');
+
+  // The same problem's mapped label is still collected: an unknown label blocks nothing.
+  assert.equal(nodeOf(report, 'ds.stack').platformAttemptedDistinct, 1);
+  assert.equal(nodeOf(report, 'ds.stack').platformSolvedDistinct, 1);
+  assert.equal(nodeOf(report, 'ds.stack').verifiedAttemptedDistinct, 0, 'no verified decision was provided');
+  assert.equal(nodeOf(report, 'ds.stack').retrospectiveIndependentDistinct, 0, 'no retrospective was provided');
+  assert.deepEqual(report.unmatchedAlgorithmLabels, ['divide and conquer']);
+  assert.equal(report.coverage.unmatchedAlgorithmProblemDistinct, 2);
+
+  const low = report.difficultyBands.find((band) => band.band.value === 1600);
+  const high = report.difficultyBands.find((band) => band.band.value === 2200);
+  assert.ok(low);
+  assert.ok(high);
+  assert.equal(low.nodes.find((entry) => entry.taxonomyId === 'ds.stack')?.platformAttemptedDistinct, 1);
+  assert.equal(
+    high.nodes.find((entry) => entry.taxonomyId === 'ds.stack') ?? null,
+    null,
+    'the higher band has no mapped tag, so it fabricates no node evidence',
+  );
 });

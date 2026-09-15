@@ -22,6 +22,7 @@ import {
   KNOWLEDGE_CATEGORY_SUMMARY_NOTE,
   KNOWLEDGE_NO_OBSERVATION_NOTE,
   KNOWLEDGE_PAGE_SIZE,
+  KNOWLEDGE_PENDING_TAG_MAPPING_NOTE,
   KNOWLEDGE_SORTS,
   KNOWLEDGE_SORT_LABELS,
   KNOWLEDGE_STATUS_LABELS,
@@ -50,6 +51,8 @@ import {
   matchesKnowledgeQuery,
   moveKnowledgePage,
   moveTagMappingPage,
+  openPendingTagMappings,
+  pendingTagMappingSummary,
   reconcileKnowledgeCategory,
   reconcileTagMappingSource,
   selectKnowledgeTechniques,
@@ -701,4 +704,57 @@ void test('reference links carry short visible titles, never raw URLs', () => {
     'a URL that merely mentions oi-wiki.org stays a platform page',
   );
   assert.equal(sourceTagMappingReferenceTitle('not a url'), '平台标签说明', 'a malformed URL still gets a title');
+});
+
+void test('the pending-mapping action counts unresolved label rows and opens the one existing table', () => {
+  const rows: readonly SourceTagMappingDiagnostic[] = [
+    mapping('栈', { targetIds: ['math.number-theory.gcd'], attemptedDistinct: 4, solvedDistinct: 3 }),
+    mapping('hash', { relation: 'ambiguous', candidateIds: ['math.number-theory.gcd'], attemptedDistinct: 2 }),
+    mapping('divide and conquer', { relation: 'unmapped', attemptedDistinct: 3, solvedDistinct: 1 }),
+    mapping('luogu-tag:53', {
+      sourceInstanceId: 'luogu:www.luogu.com.cn',
+      vocabulary: 'luogu',
+      targetIds: ['math.number-theory.gcd'],
+      attemptedDistinct: 9,
+      solvedDistinct: 9,
+    }),
+    mapping('2021', { relation: 'non_algorithm', attemptedDistinct: 9 }),
+  ];
+  // Two unresolved labels, both from the Codeforces instance, one mapped and one counted label each.
+  assert.deepEqual(pendingTagMappingSummary(rows), { pending: 2, sources: 1 });
+  assert.deepEqual(
+    pendingTagMappingSummary([
+      mapping('hash', { relation: 'ambiguous', attemptedDistinct: 5 }),
+      mapping('tarjan', { relation: 'ambiguous', attemptedDistinct: 5 }),
+    ]),
+    { pending: 2, sources: 1 },
+    'two labels on one problem stay two rows; per-label counters are never summed into a problem total',
+  );
+  assert.deepEqual(pendingTagMappingSummary([]), { pending: 0, sources: 0 }, 'a clean report reports nothing pending');
+  assert.equal(KNOWLEDGE_PENDING_TAG_MAPPING_NOTE.includes('按原样保留'), true, 'the copy says records are retained');
+  assert.equal(KNOWLEDGE_PENDING_TAG_MAPPING_NOTE.includes('待人工核对'), true, 'the copy says mapping is pending');
+  assert.equal(KNOWLEDGE_PENDING_TAG_MAPPING_NOTE.includes('不是已复核的掌握程度'), true, 'counts are not mastery');
+
+  const conflicting: TagMappingViewState = {
+    sourceInstanceId: 'luogu:www.luogu.com.cn',
+    relation: 'reference',
+    issuesOnly: false,
+    page: 4,
+  };
+  const opened = openPendingTagMappings(conflicting);
+  assert.deepEqual(
+    opened,
+    { sourceInstanceId: null, relation: 'all', issuesOnly: true, page: 1 },
+    'the action clears source and relation, keeps only issues and returns to page 1',
+  );
+  assert.deepEqual(
+    selectSourceTagMappings(rows, opened).map((row) => row.raw),
+    ['divide and conquer', 'hash'],
+    'the one existing table then shows exactly the unresolved rows, re-sorted by source then raw text',
+  );
+  assert.equal(
+    selectSourceTagMappings(rows, { ...opened, sourceInstanceId: 'codeforces:codeforces.com' }).length,
+    2,
+    'the cleared source filter still allows the reader to narrow the opened view again',
+  );
 });

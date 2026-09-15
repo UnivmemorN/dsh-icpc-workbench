@@ -173,9 +173,11 @@ export interface KnowledgeEvidenceReport {
   readonly nodes: readonly KnowledgeNodeEvidence[];
   /**
    * Distinct raw labels that stayed unresolved algorithm coverage under the crosswalk: relation
-   * `ambiguous`, `composite`, `narrower` or `unmapped`. Provenance metadata, Luogu numeric tag ids
-   * and OI Wiki reference titles are deliberately not listed, and no taxonomy id is ever fabricated
-   * for a label. Each affected distinct problem is counted once in
+   * `ambiguous`, `composite`, `narrower` or `unmapped`. Provenance metadata, OI Wiki reference
+   * titles and numeric platform ids that stayed references are deliberately not listed; an official
+   * Luogu numeric id is listed when its dictionary name resolves to no node of the current catalog
+   * or the snapshot has no name for it, because that is a real coverage gap. No taxonomy id is ever
+   * fabricated for a label, and each affected distinct problem is counted once in
    * {@link KnowledgeCoverage.unmatchedAlgorithmProblemDistinct}.
    */
   readonly unmatchedAlgorithmLabels: readonly string[];
@@ -424,8 +426,9 @@ function computeEvidence(input: ComputeKnowledgeEvidenceInput): Omit<KnowledgeEv
           direct.add(taxonomyId);
         }
       } else if (isUnresolvedAlgorithmRelation(mapping.relation)) {
-        // Only unresolved algorithm-looking labels are a coverage gap; provenance metadata, Luogu
-        // numeric tag ids and OI Wiki reference titles are deliberately not listed.
+        // Only unresolved algorithm-looking labels are a coverage gap; provenance metadata, OI Wiki
+        // reference titles and numeric platform ids that stayed references are deliberately not
+        // listed, while an official Luogu id whose dictionary name resolves to nothing is one.
         unmatchedLabels.add(mapping.raw);
         unmatched = true;
       }

@@ -581,6 +581,14 @@ export const TAG_VOCABULARY_LABELS = {
 export const KNOWLEDGE_TAG_MAPPING_NOTE =
   '来源标签对照是试行规则：它只说明平台原始标签大致对应哪个知识点，不代表你实际用过该方法，也不构成掌握证明；较早的合并知识点仍然只概括一个粗粒度大类，不能据此认为其中每一项都已掌握。';
 
+/**
+ * Copy of the compact pending-mapping action (Sprint 32). It is deliberately explicit about three
+ * things a reader could otherwise misread: the original labels and records are retained, the mapping
+ * is still pending manual review, and the per-label problem counters are not verified mastery.
+ */
+export const KNOWLEDGE_PENDING_TAG_MAPPING_NOTE =
+  '这些平台原始标签与对应题目记录都按原样保留，只是尚未确定可计入的知识点，对照仍待人工核对，标签上的题目计数是平台原始记录，不是已复核的掌握程度。';
+
 /** Relations a reader should review by hand: nothing here is counted as an exact match. */
 export const TAG_MAPPING_ISSUE_RELATIONS: readonly TagMappingRelation[] = [
   'ambiguous',
@@ -592,6 +600,48 @@ export const TAG_MAPPING_ISSUE_RELATIONS: readonly TagMappingRelation[] = [
 /** True when a mapping stayed unresolved and therefore deserves manual review. */
 export function isTagMappingIssue(mapping: SourceTagMappingDiagnostic): boolean {
   return TAG_MAPPING_ISSUE_RELATIONS.includes(mapping.relation);
+}
+
+/** Pending source labels of one whole report, as the compact heading action reports them. */
+export interface PendingTagMappingSummary {
+  /** Unresolved mapping rows (`ambiguous`/`composite`/`narrower`/`unmapped`) of the whole report. */
+  readonly pending: number;
+  /** Distinct source instances those rows came from. */
+  readonly sources: number;
+}
+
+/**
+ * Summary of the unresolved source labels that wait for manual review.
+ *
+ * It counts **label rows**, never the per-label problem counters: several labels can sit on the same
+ * problem, so those counters overlap and must not be summed into a "pending problems" total. The
+ * input is the report's total (all difficulty bands) mapping list, which is what the action copy
+ * says; a scoped difficulty band never replaces it.
+ */
+export function pendingTagMappingSummary(
+  mappings: readonly SourceTagMappingDiagnostic[],
+): PendingTagMappingSummary {
+  let pending = 0;
+  const sources = new Set<string>();
+  for (const mapping of mappings) {
+    if (!isTagMappingIssue(mapping)) {
+      continue;
+    }
+    pending += 1;
+    sources.add(mapping.sourceInstanceId);
+  }
+  return { pending, sources: sources.size };
+}
+
+/**
+ * Mapping view state of the pending-mapping action: only unresolved rows, every conflicting source
+ * and relation filter cleared, page 1.
+ *
+ * It is a pure state transition over the one confirmed report, so the action opens the existing
+ * table in place — no second table, no API read and no model call.
+ */
+export function openPendingTagMappings(state: TagMappingViewState): TagMappingViewState {
+  return changeTagMappingFilter(state, { sourceInstanceId: null, relation: 'all', issuesOnly: true });
 }
 
 /** Stable React key of one mapping row: source + exact raw + relation + rule, never the display name. */

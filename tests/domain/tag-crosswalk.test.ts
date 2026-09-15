@@ -5,9 +5,10 @@
  * catalogs. They pin the externally meaningful guarantees: vocabulary is inferred only from a
  * canonical source instance, source-specific rules outrank shared spellings, broad Codeforces
  * categories never populate children, high-risk spellings never claim a node, constituents of frozen
- * composite nodes stay uncounted candidates, Luogu numeric ids stay platform references, OI Wiki
- * titles are reference-only, the matching key never merges punctuation-sensitive labels, and a
- * missing target is `unmapped` instead of falling back to a historical alias.
+ * composite nodes stay uncounted candidates, official Luogu numeric ids bridge through the bundled
+ * dictionary while mirror, foreign and explicit-vocabulary instances stay references, OI Wiki titles
+ * are reference-only, the matching key never merges punctuation-sensitive labels, and a missing
+ * target is `unmapped` instead of falling back to a historical alias.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -136,7 +137,7 @@ void test('Codeforces broad categories map to categories and never to a child te
   assert.equal(map('C++').relation, 'non_algorithm');
 });
 
-void test('Luogu bilingual labels map once and numeric platform ids stay references', () => {
+void test('Luogu bilingual labels map once and official numeric ids bridge through the dictionary', () => {
   const bilingual = map('动态规划 DP', LUOGU);
   assert.equal(bilingual.vocabulary, 'luogu');
   assert.equal(bilingual.relation, 'broader');
@@ -144,13 +145,29 @@ void test('Luogu bilingual labels map once and numeric platform ids stay referen
   assert.equal(bilingual.ruleId, 'luogu.dp-bilingual');
   assert.deepEqual(map('动态规划', LUOGU).targetIds, ['dp'], 'the plain Chinese name comes from the shared list');
 
-  const numeric = map('luogu-tag:42', LUOGU);
-  assert.equal(numeric.relation, 'reference');
-  assert.equal(numeric.ruleId, 'luogu.numeric-tag-id');
-  assert.deepEqual(numeric.targetIds, [], 'a numeric id is never guessed into an algorithm');
-  assert.deepEqual(numeric.candidateIds, []);
-  assert.equal(isUnresolvedAlgorithmRelation(numeric.relation), false, 'a numeric id is not an algorithm gap');
-  assert.equal(map('luogu-tag:-2', LUOGU).relation, 'reference', 'negative ids are legal platform ids');
+  // A strict numeric id of the official instance is named by the bundled snapshot and then resolved
+  // by the same conservative rules its textual form gets; the raw id, source and name stay visible.
+  const bit = map('luogu-tag:53', LUOGU);
+  assert.equal(bit.relation, 'exact');
+  assert.equal(bit.ruleId, 'luogu.tag-id.53.shared.safe-exact');
+  assert.deepEqual(bit.targetIds, ['data-structure.bit'], 'dictionary 树状数组 is the Fenwick-tree node');
+  assert.equal(bit.explanation.includes('luogu-tag:53'), true, 'the exact raw id stays in the explanation');
+  assert.equal(bit.explanation.includes(LUOGU), true, 'the original source instance stays in the explanation');
+  assert.equal(bit.explanation.includes('树状数组'), true, 'the platform dictionary name stays in the explanation');
+  assert.equal(bit.referenceUrls.includes('https://www.luogu.com.cn/_lfe/tags'), true, 'the dictionary is cited');
+  assert.equal(bit.mappingVersion, TAG_MAPPING_VERSION);
+  assert.equal(isDeeplyFrozen(bit), true);
+
+  const category = map('luogu-tag:3', LUOGU);
+  assert.equal(category.relation, 'broader');
+  assert.deepEqual(category.targetIds, ['dp'], 'category id 3 lands on the dp category only');
+  assert.deepEqual(category.candidateIds, [], 'a category never spreads down to a child skill');
+
+  assert.deepEqual(map('luogu-tag:42', LUOGU).targetIds, ['data-structure.segment-tree']);
+  const broad = map('luogu-tag:74', LUOGU);
+  assert.equal(broad.relation, 'broader');
+  assert.deepEqual(broad.targetIds, ['data-structure'], 'the 数据结构 category counts as a category only');
+  assert.equal(broad.targetIds.includes('data-structure.bit'), false);
 
   assert.deepEqual(map('线段树', LUOGU).targetIds, ['data-structure.segment-tree']);
 
@@ -163,6 +180,68 @@ void test('Luogu bilingual labels map once and numeric platform ids stay referen
   assert.equal(dfs.relation, 'narrower');
   assert.deepEqual(dfs.targetIds, []);
   assert.deepEqual(dfs.candidateIds, ['search.traversal']);
+});
+
+void test('Luogu dictionary hits stay provisional and unknown ids become explicit coverage', () => {
+  // A name the unchanged conservative rules do not map stays an honest gap with its readable name.
+  const known = map('luogu-tag:133', LUOGU);
+  assert.equal(known.relation, 'unmapped');
+  assert.equal(known.ruleId, 'luogu.tag-id.133.luogu.unmapped');
+  assert.deepEqual(known.targetIds, []);
+  assert.equal(known.explanation.includes('Dancing Links'), true);
+
+  // Negative ids are legal platform ids the snapshot names; an unmapped name stays an honest gap.
+  const negative = map('luogu-tag:-2', LUOGU);
+  assert.equal(negative.relation, 'unmapped');
+  assert.equal(negative.explanation.includes('语言入门'), true);
+
+  // A strict official id the snapshot does not name is explicit unmapped coverage, not a reference.
+  const unknown = map('luogu-tag:999999', LUOGU);
+  assert.equal(unknown.relation, 'unmapped');
+  assert.equal(unknown.ruleId, 'luogu.tag-id.999999.dictionary-missing');
+  assert.deepEqual(unknown.targetIds, []);
+  assert.deepEqual(unknown.candidateIds, []);
+  assert.equal(isUnresolvedAlgorithmRelation(unknown.relation), true);
+  assert.equal(
+    unknown.referenceUrls.includes('https://www.luogu.com.cn/_lfe/tags'),
+    true,
+    'the dictionary-missing explanation cites the snapshot it checked',
+  );
+
+  // A dictionary name the unchanged provenance rules recognise stays metadata, never an id guess.
+  const contest = map('luogu-tag:46', LUOGU);
+  assert.equal(contest.relation, 'non_algorithm');
+  assert.equal(contest.ruleId, 'luogu.tag-id.46.metadata.event');
+  assert.equal(isUnresolvedAlgorithmRelation(contest.relation), false);
+
+  assert.deepEqual(
+    map('luogu-tag:53', 'luogu:luogu.com.cn').targetIds,
+    ['data-structure.bit'],
+    'the bare official host is one of the two official instances',
+  );
+});
+
+void test('malformed, non-strict and unsafe Luogu ids stay uncounted and unnamed', () => {
+  const uncounted: readonly string[] = [
+    'luogu-tag:abc',
+    'luogu-tag:',
+    'luogu-tag: 53',
+    'luogu-tag:53 ',
+    'luogu-tag:+53',
+    'luogu-tag:53.0',
+    'luogu-tag:0x35',
+    'luogu-tag:9e2',
+    'LUOGU-TAG:53',
+    'luogu-tag:9007199254740993',
+    'luogu-tag:99999999999999999999',
+  ];
+  for (const raw of uncounted) {
+    const mapping = map(raw, LUOGU);
+    assert.deepEqual(mapping.targetIds, [], `${raw} must never count`);
+    assert.deepEqual(mapping.candidateIds, [], `${raw} keeps no candidate either`);
+    assert.equal(mapping.explanation.includes('官方标签字典把'), false, `${raw} must not be named by the dictionary`);
+    assert.equal(mapping.ruleId.startsWith('luogu.tag-id.'), false, `${raw} is not a dictionary id`);
+  }
 });
 
 void test('Nowcoder composites never fan out and safe synonyms still resolve', () => {

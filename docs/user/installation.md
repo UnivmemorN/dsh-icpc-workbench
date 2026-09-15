@@ -5,7 +5,7 @@
 ## 前置条件
 
 - 已经安装并能正常使用 dsh。测试基线是 **0.1.5-rc.2**。插件在激活时会校验宿主版本与能力，不兼容时会在创建数据目录之前拒绝激活并给出原因。
-- 准备好插件的本地安装包，例如 `dsh-icpc-workbench-0.1.24.tgz`。本文按已有本地 tgz 说明安装；需要自行生成安装包时，请按开发文档从源码构建。请确认文件名与版本一致，并在升级时使用新的文件名（安装器可能缓存同一路径与版本的文件）。
+- 准备好插件的本地安装包，例如 `dsh-icpc-workbench-0.1.25.tgz`。本文按已有本地 tgz 说明安装；需要自行生成安装包时，请按开发文档从源码构建。请确认文件名与版本一致，并在升级时使用新的文件名（安装器可能缓存同一路径与版本的文件）。
 - 系统与插件版本：
   - Node 声明为 `^22.19.0 || >=24.0.0`；运行环境需满足该版本要求。
   - **Windows**：洛谷本机会话连接可用，凭据保存在 Windows 凭据管理器。
@@ -20,7 +20,7 @@
 dsh --profile icpc-training --from-default-profile web --help
 
 # 2) 把本地 tgz 装进这个 profile
-dsh plugin --profile icpc-training add .\dsh-icpc-workbench-0.1.24.tgz
+dsh plugin --profile icpc-training add .\dsh-icpc-workbench-0.1.25.tgz
 ```
 
 - 把 tgz 路径换成真实路径；相对路径请确认当前目录正确。

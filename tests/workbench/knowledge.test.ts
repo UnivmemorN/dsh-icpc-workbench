@@ -58,6 +58,18 @@ const TAXONOMY = createTaxonomyIndex(
   }),
 );
 
+/** Sprint 32 bridge catalog: the bundled Luogu dictionary names must resolve to these nodes. */
+const BRIDGE_TAXONOMY = createTaxonomyIndex(
+  createTaxonomy({
+    version: 'test.32.bridge.1',
+    nodes: [
+      node('ds', null, 'category', 'Data structures', '数据结构'),
+      node('ds.bit', 'ds', 'technique', 'Fenwick tree', '树状数组', ['fenwick', '树状数组']),
+      node('dp', null, 'category', 'Dynamic programming', '动态规划'),
+    ],
+  }),
+);
+
 interface Bench {
   readonly store: SqliteTrainingStore;
   readonly service: WorkbenchService;
@@ -66,13 +78,14 @@ interface Bench {
 async function withBench(
   run: (bench: Bench) => Promise<void>,
   wrap: (store: SqliteTrainingStore) => TrainingStore = (store) => store,
+  taxonomy: typeof TAXONOMY = TAXONOMY,
 ): Promise<void> {
   const paths = fx.tempDatabase();
   const store = new SqliteTrainingStore({ path: paths.path, now: () => AT });
   let minted = 0;
   const service = new WorkbenchService({
     store: wrap(store),
-    taxonomy: TAXONOMY,
+    taxonomy,
     now: () => AT,
     uniqueId: () => `id-${(minted += 1)}`,
   });
@@ -341,6 +354,31 @@ function countingStore(real: SqliteTrainingStore, counts: ReadCounts): TrainingS
   }) as TrainingStore;
 }
 
+/**
+ * A real store proxy that records every mutating call. The knowledge projection only shapes a
+ * report, so a `weakness` call must never write a problem row, a submission, a tag decision or a
+ * retrospective — the assertion on the recorded names proves it instead of trusting the source.
+ */
+function noWriteStore(real: SqliteTrainingStore, writes: string[]): TrainingStore {
+  const mutating = /^(upsert|save|delete|set|clear|remove|replace|put|write|mark|touch)/iu;
+  return new Proxy(real as TrainingStore, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver) as unknown;
+      if (typeof property === 'string' && typeof value === 'function') {
+        const bound = (value as (...args: unknown[]) => unknown).bind(target);
+        if (mutating.test(property)) {
+          return async (...args: unknown[]) => {
+            writes.push(property);
+            return bound(...args);
+          };
+        }
+        return bound;
+      }
+      return value;
+    },
+  }) as TrainingStore;
+}
+
 void test('the knowledge projection reuses the single evidence read and cancellation still wins', async () => {
   const counts: ReadCounts = { listSubmissions: 0, listProblems: 0, getProblem: 0, getSourceInstance: 0 };
   await withBench(
@@ -379,5 +417,125 @@ void test('the knowledge projection reuses the single evidence read and cancella
       'cancelled',
     );
     assert.equal(failure.details['reason'], null, 'no evidence is read for a cancelled call');
+  });
+});
+
+void test('numeric-only Luogu records bridge provisionally and no stored input is written', async () => {
+  const writes: string[] = [];
+  await withBench(
+    async ({ store, service }) => {
+      const scope = fx.makeScope('luogu', 'www.luogu.com.cn', 'alice', 'L1');
+      const luoguProblem = (externalKey: string, rawTags: readonly string[], difficulty: number): NormalizedProblem =>
+        createNormalizedProblem({
+          ref: { sourceInstanceId: scope.instance.id, domain: null, externalKey },
+          title: `Problem ${externalKey}`,
+          url: `https://www.luogu.com.cn/problem/${externalKey}`,
+          statement: null,
+          fetchedAt: AT,
+          ratings: [rating(difficulty, 'difficulty')],
+          rawTags,
+        });
+      // Old stored rows carry nothing but the numeric id; the second row also stores the official
+      // name, and the third stores a category id. All three must reach the provisional channel.
+      const p1 = luoguProblem('L1', ['luogu-tag:53'], 3);
+      const p2 = luoguProblem('L2', ['luogu-tag:53', '树状数组'], 3);
+      const p3 = luoguProblem('L3', ['luogu-tag:3'], 7);
+      await store.upsertSourceInstances([scope.instance]);
+      await store.upsertAccounts([scope.account]);
+      await store.upsertProblems([p1, p2, p3]);
+      await store.upsertSubmissions([
+        fx.makeSubmission(scope.account, p1.ref, 'L1a', 'accepted'),
+        fx.makeSubmission(scope.account, p1.ref, 'L1b', 'accepted'),
+        fx.makeSubmission(scope.account, p2.ref, 'L2a', 'accepted'),
+        fx.makeSubmission(scope.account, p3.ref, 'L3a', 'wrong_answer'),
+      ]);
+
+      const result = await service.weakness({ accountId: scope.account.id }, TOKEN);
+
+      const bit = nodeOf(result.knowledge, 'ds.bit');
+      assert.equal(bit.platformAttemptedDistinct, 2, 'the id and the stored name count the problem once');
+      assert.equal(bit.platformSolvedDistinct, 2, 'a repeated accepted submission never inflates');
+      assert.equal(bit.verifiedAttemptedDistinct, 0, 'a platform label never becomes a verified tag');
+      assert.equal(bit.retrospectiveIndependentDistinct, 0, 'no retrospective was recorded');
+      assert.equal(bit.status, 'unconfirmed');
+      assert.equal(nodeOf(result.knowledge, 'dp').platformAttemptedDistinct, 1);
+      assert.equal(nodeOf(result.knowledge, 'dp').platformSolvedDistinct, 0);
+      assert.equal(result.knowledge.coverage.relatedAttemptedDistinct, 3);
+      assert.equal(result.knowledge.coverage.verifiedAttemptedDistinct, 0);
+      assert.deepEqual(result.knowledge.unmatchedAlgorithmLabels, [], 'the bridge leaves no coverage gap');
+
+      const bridged = result.knowledge.sourceTagMappings.find((entry) => entry.raw === 'luogu-tag:53');
+      assert.ok(bridged);
+      assert.equal(bridged.relation, 'exact');
+      assert.equal(bridged.ruleId, 'luogu.tag-id.53.shared.safe-exact');
+      assert.equal(bridged.attemptedDistinct, 2);
+      assert.equal(bridged.solvedDistinct, 2);
+      const category = result.knowledge.sourceTagMappings.find((entry) => entry.raw === 'luogu-tag:3');
+      assert.equal(category?.relation, 'broader');
+      assert.deepEqual(category?.targetIds, ['dp']);
+
+      // Native difficulty bands keep their own scoped counts and never borrow the total.
+      const low = result.knowledge.difficultyBands.find((band) => band.band.value === 3);
+      const high = result.knowledge.difficultyBands.find((band) => band.band.value === 7);
+      assert.ok(low);
+      assert.ok(high);
+      assert.equal(low.nodes.find((entry) => entry.taxonomyId === 'ds.bit')?.platformAttemptedDistinct, 2);
+      assert.equal(high.nodes.find((entry) => entry.taxonomyId === 'dp')?.platformAttemptedDistinct, 1);
+      assert.equal(high.nodes.find((entry) => entry.taxonomyId === 'ds.bit') ?? null, null);
+
+      // The projection shapes a report: the stored rows and every evidence channel stay untouched.
+      assert.deepEqual(writes, [], 'weakness performs no write of any kind');
+      assert.deepEqual(await store.getProblem(p1.key), p1, 'the stored id-only row is returned unchanged');
+      assert.deepEqual(await store.listTagDecisions(p1.key), [], 'no tag decision was created');
+      assert.deepEqual(await store.listRetrospectives(scope.account.id), [], 'no retrospective was created');
+    },
+    (real) => noWriteStore(real, writes),
+    BRIDGE_TAXONOMY,
+  );
+});
+
+void test('an unknown Codeforces raw label stays visible beside mapped tags and across bands', async () => {
+  await withBench(async ({ store, service }) => {
+    const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', 'C1');
+    const p1 = problem(scope, 'C1', { ratings: [rating(1600)], rawTags: ['stack', 'divide and conquer'] });
+    const p2 = problem(scope, 'C2', { ratings: [rating(2200)], rawTags: ['divide and conquer'] });
+    await store.upsertSourceInstances([scope.instance]);
+    await store.upsertAccounts([scope.account]);
+    await store.upsertProblems([p1, p2]);
+    await store.upsertSubmissions([
+      fx.makeSubmission(scope.account, p1.ref, 'C1a', 'accepted'),
+      fx.makeSubmission(scope.account, p2.ref, 'C2a', 'wrong_answer'),
+    ]);
+
+    const result = await service.weakness({ accountId: scope.account.id }, TOKEN);
+
+    const unknown = result.knowledge.sourceTagMappings.filter((entry) => entry.raw === 'divide and conquer');
+    assert.equal(unknown.length, 1, 'one distinct raw label stays one diagnostic row');
+    assert.equal(unknown[0]!.relation, 'unmapped');
+    assert.equal(unknown[0]!.ruleId, 'codeforces.unmapped');
+    assert.deepEqual(unknown[0]!.targetIds, []);
+    assert.equal(unknown[0]!.attemptedDistinct, 2, 'both distinct problems carry the unknown label');
+    assert.equal(unknown[0]!.solvedDistinct, 1, 'only the accepted problem counts as solved');
+    assert.ok(unknown[0]!.explanation.length > 0, 'the diagnostic keeps its reason');
+
+    const stack = nodeOf(result.knowledge, 'ds.stack');
+    assert.equal(stack.platformAttemptedDistinct, 1, 'the unknown label blocks no mapped tag of the same problem');
+    assert.equal(stack.platformSolvedDistinct, 1);
+    assert.equal(stack.verifiedAttemptedDistinct, 0, 'no verified decision was provided');
+    assert.equal(stack.retrospectiveIndependentDistinct, 0, 'no retrospective was provided');
+    assert.equal(stack.status, 'unconfirmed');
+    assert.deepEqual(result.knowledge.unmatchedAlgorithmLabels, ['divide and conquer']);
+    assert.equal(result.knowledge.coverage.unmatchedAlgorithmProblemDistinct, 2);
+
+    const low = result.knowledge.difficultyBands.find((band) => band.band.value === 1600);
+    const high = result.knowledge.difficultyBands.find((band) => band.band.value === 2200);
+    assert.ok(low);
+    assert.ok(high);
+    assert.equal(low.nodes.find((entry) => entry.taxonomyId === 'ds.stack')?.platformAttemptedDistinct, 1);
+    assert.equal(
+      high.nodes.find((entry) => entry.taxonomyId === 'ds.stack') ?? null,
+      null,
+      'the higher band has no mapped tag, so it fabricates no node evidence',
+    );
   });
 });

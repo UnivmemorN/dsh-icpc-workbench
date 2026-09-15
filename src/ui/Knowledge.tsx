@@ -21,6 +21,7 @@ import {
   KNOWLEDGE_CATEGORY_SUMMARY_NOTE,
   KNOWLEDGE_NO_OBSERVATION_NOTE,
   KNOWLEDGE_OVERLAP_NOTE,
+  KNOWLEDGE_PENDING_TAG_MAPPING_NOTE,
   KNOWLEDGE_SELF_REPORT_NOTE,
   KNOWLEDGE_SORTS,
   KNOWLEDGE_SORT_LABELS,
@@ -44,6 +45,8 @@ import {
   knowledgeUnknownCatalogIds,
   moveKnowledgePage,
   moveTagMappingPage,
+  openPendingTagMappings,
+  pendingTagMappingSummary,
   reconcileKnowledgeCategory,
   reconcileTagMappingSource,
   selectKnowledgeTechniques,
@@ -79,9 +82,12 @@ export type KnowledgeOuterCoverage = ApiWeaknessResult['coverage'];
  *
  * Every filter change resets to page 1, an account change resets the whole view, a shrinking result
  * clamps the page to the last one that exists, and a category a refreshed catalog dropped falls back
- * to all categories. Technique rows carry their verified OI Wiki links, a selected category shows
- * its own links beside its subtree summary, and the footer credits the presentation and learning
- * references without implying that any external page certifies the user's knowledge.
+ * to all categories. A compact action beside the heading opens the one existing source-label table on
+ * its unresolved rows (all difficulty bands) without a second table or an extra request, and an
+ * account change closes that opened state again. Technique rows carry their verified OI Wiki links, a
+ * selected category shows its own links beside its subtree summary, and the footer credits the
+ * presentation and learning references without implying that any external page certifies the user's
+ * knowledge.
  */
 export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewData; coverage: KnowledgeOuterCoverage }) {
   const { boot, navigate } = useWorkbench();
@@ -89,13 +95,17 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
   const [mappingState, setMappingState] = useState<TagMappingViewState>(initialTagMappingViewState);
   const [jump, setJump] = useState('');
   const results = useRef<HTMLDivElement | null>(null);
+  const mappingDetails = useRef<HTMLDetailsElement | null>(null);
 
   // A new account shows its own default view state instead of the previous account's filters; the
-  // source-label filters and their page belong to the account as well.
+  // source-label filters, their page and the opened pending-mapping state belong to the account too.
   useEffect(() => {
     setState(initialKnowledgeViewState());
     setMappingState(initialTagMappingViewState());
     setJump('');
+    if (mappingDetails.current !== null) {
+      mappingDetails.current.open = false;
+    }
   }, [knowledge.accountId]);
 
   const catalog = boot.taxonomy.nodes;
@@ -135,6 +145,9 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
   const mappingRows = selectSourceTagMappings(knowledge.sourceTagMappings, mappingState);
   const mappingPage = tagMappingPage(mappingRows, mappingState.page);
   const mappingSources = tagMappingSourceOptions(knowledge.sourceTagMappings);
+  // Pending labels are counted over the report's total mapping list (all difficulty bands), never
+  // over a scoped band and never by summing the per-label problem counters.
+  const pendingMappings = pendingTagMappingSummary(knowledge.sourceTagMappings);
   // Readable display form of one mapping row. A name resolves only through that row's own source
   // instance, looked up in the boot catalog: an absent/unknown instance or a non-Luogu host keeps the
   // exact stored raw text, and the mapping result, filters and evidence never change.
@@ -177,6 +190,23 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
       // of forcing a scroll back to the top.
       results.current?.scrollIntoView({ block: 'start' });
       results.current?.focus();
+    }
+  }
+
+  /**
+   * Open the one existing source-label table on its unresolved rows.
+   *
+   * This only changes local view state and the DOM open state: it clears the conflicting source and
+   * relation filters, returns to page 1, scrolls the very same `<details>` into view and never
+   * issues an API read, a model call or a second table.
+   */
+  function showPendingMappings(): void {
+    setMappingState((previous) => openPendingTagMappings(previous));
+    const details = mappingDetails.current;
+    if (details !== null) {
+      details.open = true;
+      details.scrollIntoView({ block: 'start' });
+      details.focus();
     }
   }
 
@@ -297,6 +327,15 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
         选择难度后，下方状态分布、分类汇总与知识点计数只统计该档。CF 按 200 分一档；洛谷按原生等级；其他来源保留原生数值。
         未知难度单列。不同来源与难度维度不换算，多维度计数不能相加。每档独立判断是否达到证据阈值，低难度记录不能证明高难度能力。
       </p>
+      {pendingMappings.pending > 0 && (
+        <p className="icpc-muted">
+          待核对来源标签（全部难度）：<strong>{pendingMappings.pending}</strong> 个，来自{' '}
+          {pendingMappings.sources} 个来源实例。{KNOWLEDGE_PENDING_TAG_MAPPING_NOTE}{' '}
+          <button type="button" onClick={showPendingMappings}>
+            查看待核对标签
+          </button>
+        </p>
+      )}
       <div className="icpc-knowledge-summary">
         <div>
           <span>知识点总数</span>
@@ -565,7 +604,7 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
         </p>
       </details>
 
-      <details className="icpc-tag-mapping">
+      <details className="icpc-tag-mapping" ref={mappingDetails} tabIndex={-1}>
         <summary>
           来源标签对照（试行）：{knowledge.sourceTagMappings.length} 条映射 · 对照版本{' '}
           {knowledge.tagMappingVersion}
@@ -738,12 +777,13 @@ export function Knowledge({ knowledge, coverage }: { knowledge: KnowledgeViewDat
               <p className="icpc-muted">
                 洛谷数字编号的显示名来自官方标签字典快照（
                 <ExternalLink href={LUOGU_TAG_DICTIONARY_SOURCE_URL}>官方标签数据</ExternalLink>
-                ，核对日期 {LUOGU_TAG_DICTIONARY_RETRIEVED_AT}）；字典只提供平台显示名，不改变上方的对照结果与“未匹配”判定。
+                ，核对日期 {LUOGU_TAG_DICTIONARY_RETRIEVED_AT}）；官方编号先解析为平台名称，再按保守规则对照知识点；未匹配或有歧义时仍待核对，不构成掌握证明。
               </p>
             )}
             <p className="icpc-muted" aria-live="polite">
               筛选后 {mappingPage.totalItems} 条映射 · 第 {mappingPage.page} / {mappingPage.totalPages}{' '}
-              页；同一标签来自不同来源时分别列出，不按显示名合并。
+              页；同一标签来自不同来源时分别列出，不按显示名合并。该表是全部难度的汇总，同一道题可以带多个标签，
+              各行“通过 / 尝试”只统计该标签自己的去重题数，不能相加当作题目总数。
             </p>
           </>
         )}

@@ -30,7 +30,14 @@
  *   node stays `unmapped` instead of inventing one — there is deliberately **no** legacy fallback;
  * - a shared result carries the vocabulary's own public terminology page plus the OI Wiki definition
  *   of the node it names, because those pages support *term existence*, never an official
- *   cross-platform equivalence claim.
+ *   cross-platform equivalence claim;
+ * - a strict numeric Luogu id of the **official** instance (`luogu:luogu.com.cn` /
+ *   `luogu:www.luogu.com.cn`) is named by the bundled public dictionary snapshot and then resolved by
+ *   the *same* conservative Luogu/name rules a textual label uses. The raw id, source instance and
+ *   platform name stay in the explanation, and the rule id names both the dictionary resolution and
+ *   the name rule. An id the snapshot does not contain becomes explicit `unmapped` coverage instead
+ *   of a silent reference; malformed or unsafe ids stay uncounted, and a mirror host or an explicit
+ *   vocabulary override on a foreign source never borrows the dictionary (Sprint 32).
  *
  * The matching key normalises only case and whitespace (`A*` stays distinct from `A`, `C++` from
  * `C`) and never splits a label on `/`, `,` or `+`, so a composite label can never fan out into
@@ -43,10 +50,16 @@ import { decodeIdPart, encodeIdPart } from '../ids.js';
 import { deepFreeze } from '../immutable.js';
 import { knowledgeResourcesFor } from '../knowledge-resources.js';
 import { nonAlgorithmTagReason, type NonAlgorithmReason } from './classify.js';
+import {
+  LUOGU_TAG_DICTIONARY_ENTRY_COUNT,
+  LUOGU_TAG_DICTIONARY_RETRIEVED_AT,
+  LUOGU_TAG_DICTIONARY_SOURCE_URL,
+  LUOGU_TAG_NAME_BY_ID,
+} from './luogu-tag-dictionary.js';
 import type { TaxonomyIndex } from './types.js';
 
 /** Version of the crosswalk rules; changes whenever a rule or the matching key changes. */
-export const TAG_MAPPING_VERSION = '2026.09.13.1';
+export const TAG_MAPPING_VERSION = '2026.09.15.1';
 
 /**
  * Tag vocabulary of a source instance. It is deliberately **separate** from `SourcePlatform`:
@@ -402,7 +415,7 @@ const NOWCODER_COMPOSITE_PATTERNS: readonly { readonly pattern: RegExp; readonly
   },
 ];
 
-/** Luogu rules plus its numeric platform-tag identifiers. */
+/** Luogu source-specific rules; numeric ids are resolved separately through the bundled dictionary. */
 const LUOGU_RULES = lookupTable({
   '动态规划 dp': rule(
     'luogu.dp-bilingual',
@@ -413,8 +426,99 @@ const LUOGU_RULES = lookupTable({
   ),
 });
 
-/** `luogu-tag:<integer>` is a preserved platform identifier, never an algorithm guess. */
-const LUOGU_NUMERIC_TAG = /^luogu-tag:-?\d+$/u;
+/**
+ * Strict numeric Luogu platform identifier, parsed exactly like the UI reads it
+ * (`raw-tag-view.ts`): lowercase prefix, plain optional-minus decimal integer, no surrounding text.
+ * The **exact raw label** is parsed rather than the normalised key, so the crosswalk and a rendered
+ * dictionary name can never disagree about whether a label is an id; a syntactically numeric value
+ * outside the safe-integer range is not an id either.
+ */
+const STRICT_LUOGU_TAG_ID = /^luogu-tag:(-?\d+)$/u;
+
+/**
+ * Hosts of the official Luogu deployment the bundled snapshot was taken from. Only these two names
+ * may name a numeric id: a mirror/subdomain, a lookalike host and an explicit `luogu` vocabulary on
+ * a foreign source instance keep the id unnamed, so a coincidental or foreign number can never be
+ * relabelled with an official platform name.
+ */
+const LUOGU_OFFICIAL_HOSTS: readonly string[] = deepFreeze(['luogu.com.cn', 'www.luogu.com.cn']);
+
+/** Official host of one source instance, or `null` when the instance is not that deployment. */
+function officialLuoguHost(sourceInstanceId: string): string | null {
+  const text = typeof sourceInstanceId === 'string' ? sourceInstanceId.trim() : '';
+  const separator = text.indexOf(':');
+  if (separator <= 0 || text.slice(0, separator) !== 'luogu') {
+    return null;
+  }
+  const domain = canonicalPartOf(text.slice(separator + 1));
+  if (domain === null) {
+    return null;
+  }
+  const host = domain.toLowerCase();
+  return LUOGU_OFFICIAL_HOSTS.includes(host) ? host : null;
+}
+
+/**
+ * Resolve one strict numeric Luogu platform id through the bundled public dictionary.
+ *
+ * Returns `null` when the raw label is not a strict safe-integer id (the caller then keeps the
+ * ordinary rule order, so malformed and overflow ids stay uncounted). A non-official instance gets
+ * a `reference` result: mirrors, alternate ports and an explicit `luogu` vocabulary on a foreign
+ * source never borrow the snapshot. Otherwise
+ * the dictionary name is resolved by {@link resolveRecognisedLabel} — the very same conservative
+ * rules a textual Luogu label uses — and the raw id, source instance and platform name stay in the
+ * explanation while the rule id names both the dictionary resolution and the name rule.
+ *
+ * This only produces the provisional platform projection: no accepted {@link TagDecision}, guessed
+ * label, retrospective or persisted edit is created, and the dictionary resolution cannot recurse
+ * because {@link resolveRecognisedLabel} has no numeric branch.
+ */
+function resolveLuoguNumericTag(index: TaxonomyIndex, base: MappingIdentity, raw: string): SourceTagMapping | null {
+  const digits = STRICT_LUOGU_TAG_ID.exec(raw)?.[1];
+  if (digits === undefined) {
+    return null;
+  }
+  const id = Number(digits);
+  if (!Number.isSafeInteger(id)) {
+    return null;
+  }
+  if (officialLuoguHost(base.sourceInstanceId) === null) {
+    return finalize(
+      base,
+      index,
+      rule(
+        'luogu.numeric-tag-id',
+        'reference',
+        {},
+        '洛谷数字标签 ID（luogu-tag:…）是平台标识；该来源实例不是官方站点，因此不套用官方标签字典，也不猜测其含义。',
+        LUOGU_REFERENCES,
+      ),
+    );
+  }
+  const name = LUOGU_TAG_NAME_BY_ID.get(id);
+  if (name === undefined) {
+    return finalize(
+      base,
+      index,
+      rule(
+        `luogu.tag-id.${id}.dictionary-missing`,
+        'unmapped',
+        {},
+        `官方标签字典快照（${LUOGU_TAG_DICTIONARY_SOURCE_URL}，共 ${LUOGU_TAG_DICTIONARY_ENTRY_COUNT} 条，检索日期 ${LUOGU_TAG_DICTIONARY_RETRIEVED_AT}）中没有编号 ${id} 的名称：${raw} 保持未匹配，不猜测它对应哪个平台标签或知识点。`,
+        [LUOGU_TAG_DICTIONARY_SOURCE_URL, ...LUOGU_REFERENCES],
+      ),
+    );
+  }
+  const named = finalize(base, index, resolveRecognisedLabel(index, 'luogu', name, sourceTagKey(name)));
+  return deepFreeze({
+    ...named,
+    ruleId: `luogu.tag-id.${id}.${named.ruleId}`,
+    explanation: `官方标签字典把 ${raw}（来源 ${base.sourceInstanceId}）解析为平台标签名“${name}”，再按既有保守名称规则处理：${named.explanation}`,
+    referenceUrls: [LUOGU_TAG_DICTIONARY_SOURCE_URL, ...named.referenceUrls].filter(
+      (url, position, urls) => urls.indexOf(url) === position,
+    ),
+  });
+}
 
 /**
  * High-risk shared spellings and combined-node constituents. These intercept every alias path for
@@ -710,8 +814,14 @@ function existingIds(index: TaxonomyIndex, ids: readonly string[]): string[] {
   return kept;
 }
 
+/** Identity fields every mapping of one raw label carries; a rule may change none of them. */
+type MappingIdentity = Omit<
+  SourceTagMapping,
+  'relation' | 'targetIds' | 'candidateIds' | 'ruleId' | 'explanation' | 'referenceUrls'
+>;
+
 /** Turn a resolved rule into a frozen mapping; a counted rule without a live target is unmapped. */
-function finalize(base: Omit<SourceTagMapping, 'relation' | 'targetIds' | 'candidateIds' | 'ruleId' | 'explanation' | 'referenceUrls'>, index: TaxonomyIndex, outcome: ResolvedRule): SourceTagMapping {
+function finalize(base: MappingIdentity, index: TaxonomyIndex, outcome: ResolvedRule): SourceTagMapping {
   const targets = existingIds(index, outcome.targetIds);
   const candidates = existingIds(index, outcome.candidateIds).filter((id) => !targets.includes(id));
   if (isCountedTagRelation(outcome.relation) && targets.length === 0) {
@@ -775,6 +885,93 @@ function asReference(outcome: ResolvedRule): ResolvedRule {
 }
 
 /**
+ * Resolve one raw label of an **already recognised** vocabulary to its rule outcome.
+ *
+ * This is exactly the shared half of {@link mapSourceTag}: source-specific rules first, then the
+ * high-risk and review-corrected spellings, the hand-reviewed allowlist, the unchanged provenance
+ * rules and finally an honest `unmapped`. It deliberately contains **no** numeric-id branch, so
+ * resolving a name that came *out of* the Luogu dictionary can never re-enter the dictionary (the
+ * resolution cannot loop), and it never sees vocabulary `unknown` — that one fails closed in
+ * `mapSourceTag` before any shared spelling rule.
+ */
+function resolveRecognisedLabel(
+  index: TaxonomyIndex,
+  vocabulary: TagVocabulary,
+  raw: string,
+  key: string,
+): ResolvedRule {
+  // 1. Explicit source-specific rules outrank every shared spelling.
+  if (vocabulary === 'codeforces') {
+    const sourced = CODEFORCES_RULES.get(key);
+    if (sourced !== undefined) {
+      return sourced;
+    }
+  }
+  if (vocabulary === 'luogu') {
+    const sourced = LUOGU_RULES.get(key);
+    if (sourced !== undefined) {
+      return sourced;
+    }
+  }
+  if (vocabulary === 'nowcoder') {
+    const sourced = NOWCODER_RULES.get(key);
+    if (sourced !== undefined) {
+      return sourced;
+    }
+    for (const composite of NOWCODER_COMPOSITE_PATTERNS) {
+      if (composite.pattern.test(key)) {
+        return composite.outcome;
+      }
+    }
+  }
+
+  // 2. High-risk spellings and review-corrected spellings intercept the historical alias table.
+  const shared = SHARED_RISK_RULES.get(key) ?? SHARED_OVERRIDE_RULES.get(key);
+  if (shared !== undefined) {
+    return vocabulary === 'oi-wiki' ? asReference(shared) : attachSharedReferences(shared, vocabulary);
+  }
+
+  // 3. Hand-reviewed shared allowlist, resolved through the supplied index (never invented).
+  const safeSpelling = SHARED_SAFE_BY_KEY.get(key);
+  if (safeSpelling !== undefined) {
+    const resolved = index.resolveAlias(safeSpelling);
+    if (resolved !== null && index.has(resolved.taxonomyId)) {
+      const node = index.node(resolved.taxonomyId);
+      const categoryLevel = node !== null && node.kind === 'category';
+      const outcome = categoryLevel
+        ? rule(
+            'shared.safe-category',
+            'broader',
+            { targets: [resolved.taxonomyId] },
+            '该标签是目录分类（或其已复核共享拼写），只累计到分类，不推断任何子技巧。',
+          )
+        : rule(
+            'shared.safe-exact',
+            'exact',
+            { targets: [resolved.taxonomyId] },
+            '共享安全拼写：与目录节点同名或为已复核的直接同义拼写。',
+          );
+      return vocabulary === 'oi-wiki' ? asReference(outcome) : attachSharedReferences(outcome, vocabulary);
+    }
+  }
+
+  // 4. Unchanged provenance rules: a source/event/year/difficulty/language/noise label is metadata.
+  const reason = nonAlgorithmTagReason(raw);
+  if (reason !== null) {
+    return rule(`metadata.${reason}`, 'non_algorithm', {}, METADATA_EXPLANATIONS[reason]);
+  }
+
+  // 5. Unmatched OI Wiki titles stay reference material instead of becoming algorithm gaps.
+  if (vocabulary === 'oi-wiki') {
+    return rule('oi-wiki.unrecognized', 'reference', {}, 'OI Wiki 是学习资料目录；未匹配到目录条目的标题只作资料，不作为解题证据。', OI_WIKI_REFERENCES);
+  }
+
+  // 6. Everything else stays honestly unmapped; no legacy alias fallback exists.
+  const references = SHARED_VOCABULARY_REFERENCES[vocabulary] ?? [];
+  return rule(`${vocabulary}.unmapped`, 'unmapped', {}, '该来源标签不在当前保守对照表中，保持未匹配，等待人工核对。', references);
+}
+
+/**
  * Resolve one raw platform label against the supplied taxonomy.
  *
  * Pure, total and deterministic: malformed input is refused as `unmapped` instead of throwing, and
@@ -813,41 +1010,13 @@ export function mapSourceTag(index: TaxonomyIndex, input: MapSourceTagInput): So
     return finalize(base, index, rule('raw.empty', 'unmapped', {}, '空标签没有语义，保持未匹配。'));
   }
 
-  // 1. Explicit source-specific rules outrank every shared spelling.
-  if (vocabulary === 'codeforces') {
-    const sourced = CODEFORCES_RULES.get(key);
-    if (sourced !== undefined) {
-      return finalize(base, index, sourced);
-    }
-  }
+  // 1. A strict numeric Luogu id of the official instance is named by the bundled public dictionary
+  //    and then resolved by the same conservative rules a textual Luogu label uses. Every other
+  //    instance, a malformed id and an unsafe integer fall through unchanged.
   if (vocabulary === 'luogu') {
-    const sourced = LUOGU_RULES.get(key);
-    if (sourced !== undefined) {
-      return finalize(base, index, sourced);
-    }
-    if (LUOGU_NUMERIC_TAG.test(key)) {
-      return finalize(
-        base,
-        index,
-        rule(
-          'luogu.numeric-tag-id',
-          'reference',
-          {},
-          '洛谷数字标签 ID（luogu-tag:…）是平台标识，不猜测其含义；标签名由平台字典另行提供，两者是彼此独立的原始标签。',
-          LUOGU_REFERENCES,
-        ),
-      );
-    }
-  }
-  if (vocabulary === 'nowcoder') {
-    const sourced = NOWCODER_RULES.get(key);
-    if (sourced !== undefined) {
-      return finalize(base, index, sourced);
-    }
-    for (const composite of NOWCODER_COMPOSITE_PATTERNS) {
-      if (composite.pattern.test(key)) {
-        return finalize(base, index, composite.outcome);
-      }
+    const numeric = resolveLuoguNumericTag(index, base, raw);
+    if (numeric !== null) {
+      return numeric;
     }
   }
 
@@ -876,65 +1045,7 @@ export function mapSourceTag(index: TaxonomyIndex, input: MapSourceTagInput): So
     );
   }
 
-  // 3. High-risk spellings and review-corrected spellings intercept the historical alias table.
-  const shared = SHARED_RISK_RULES.get(key) ?? SHARED_OVERRIDE_RULES.get(key);
-  if (shared !== undefined) {
-    return finalize(
-      base,
-      index,
-      vocabulary === 'oi-wiki' ? asReference(shared) : attachSharedReferences(shared, vocabulary),
-    );
-  }
-
-  // 4. Hand-reviewed shared allowlist, resolved through the supplied index (never invented).
-  const safeSpelling = SHARED_SAFE_BY_KEY.get(key);
-  if (safeSpelling !== undefined) {
-    const resolved = index.resolveAlias(safeSpelling);
-    if (resolved !== null && index.has(resolved.taxonomyId)) {
-      const node = index.node(resolved.taxonomyId);
-      const categoryLevel = node !== null && node.kind === 'category';
-      const outcome = categoryLevel
-        ? rule(
-            'shared.safe-category',
-            'broader',
-            { targets: [resolved.taxonomyId] },
-            '该标签是目录分类（或其已复核共享拼写），只累计到分类，不推断任何子技巧。',
-          )
-        : rule(
-            'shared.safe-exact',
-            'exact',
-            { targets: [resolved.taxonomyId] },
-            '共享安全拼写：与目录节点同名或为已复核的直接同义拼写。',
-          );
-      return finalize(
-        base,
-        index,
-        vocabulary === 'oi-wiki' ? asReference(outcome) : attachSharedReferences(outcome, vocabulary),
-      );
-    }
-  }
-
-  // 5. Unchanged provenance rules: a source/event/year/difficulty/language/noise label is metadata.
-  const reason = nonAlgorithmTagReason(raw);
-  if (reason !== null) {
-    return finalize(base, index, rule(`metadata.${reason}`, 'non_algorithm', {}, METADATA_EXPLANATIONS[reason]));
-  }
-
-  // 6. Unmatched OI Wiki titles stay reference material instead of becoming algorithm gaps.
-  if (vocabulary === 'oi-wiki') {
-    return finalize(
-      base,
-      index,
-      rule('oi-wiki.unrecognized', 'reference', {}, 'OI Wiki 是学习资料目录；未匹配到目录条目的标题只作资料，不作为解题证据。', OI_WIKI_REFERENCES),
-    );
-  }
-
-  // 7. Everything else stays honestly unmapped; no legacy alias fallback exists. An unknown
-  //    vocabulary already returned at step 2, so only the recognised platforms remain here.
-  const references = SHARED_VOCABULARY_REFERENCES[vocabulary] ?? [];
-  return finalize(
-    base,
-    index,
-    rule(`${vocabulary}.unmapped`, 'unmapped', {}, '该来源标签不在当前保守对照表中，保持未匹配，等待人工核对。', references),
-  );
+  // 3. Source-specific rules, shared risk/override/allowlist spellings and the unchanged provenance
+  //    rules, in the order documented at the top of this module.
+  return finalize(base, index, resolveRecognisedLabel(index, vocabulary, raw, key));
 }

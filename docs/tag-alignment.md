@@ -3,7 +3,7 @@
 > **开发参考** · [开发文档索引](development/README.md) · 日常操作请看[用户手册](user/README.md)。本文保留既有地址，供实现与排错核对。
 
 
-状态：Sprint 10 已实现，规则版本 `TAG_MAPPING_VERSION = 2026.09.13.1`（每次随统计报告一起返回）。
+状态：Sprint 32 已接通洛谷编号字典，并提供 CF 待核对标签入口；规则版本 `TAG_MAPPING_VERSION = 2026.09.15.1`（每次随统计报告一起返回）。
 
 平台原始标签是**平台自己的说法**，不是本项目的知识分类。Codeforces 的 `dfs and similar`、`hashing`
 是宽泛或含糊的英文标签；洛谷同时给出双语分类名和 `luogu-tag:<数字>` 平台标识；牛客把
@@ -67,7 +67,7 @@ URL 猜测平台，也不会借用其它平台的专属规则，并且**在共�
 | `composite` | 标签本身列出多种方法 | 否 | 保留最接近的大类 |
 | `unmapped` | 保守对照表没有结论 | 否 | 通常为空 |
 | `non_algorithm` | 来源/年份/难度/语言等元数据 | 否 | 空 |
-| `reference` | 平台标识（`luogu-tag:<id>`）或 OI Wiki 资料条目 | 否 | 识别到的目录条目 |
+| `reference` | 非官方洛谷实例的数字平台标识或 OI Wiki 资料条目 | 否 | 识别到的目录条目 |
 
 只有 `exact` / `broader` 计入"平台原始（未复核）"题数；`unmapped`、`ambiguous`、`composite`、`narrower`
 会汇总到 `unmatchedAlgorithmLabels`（每个受影响题目只计一次）；`non_algorithm` 与 `reference` 不属于算法缺口。
@@ -123,8 +123,11 @@ URL 猜测平台，也不会借用其它平台的专属规则，并且**在共�
 - Codeforces 宽泛标签映射到分类（`dp`、`data structures`、`graphs`、`trees`、`dfs and similar`、
   `probabilities`、`string suffix structures`）；`binary search` 保守落到搜索分类；`sortings` 落到排序；
   `hashing` 与 `bitmasks` 保持 `ambiguous`；未列出的 CF 标签保持 `unmapped`。
-- 洛谷：`动态规划 DP` 落到动态规划分类；`luogu-tag:<整数>` 一律保留为平台标识（`reference`，负数也合法），
-  不猜含义、不产生算法缺口。当前洛谷原始标签里名称与数字 ID 是彼此独立的标签，本模块不把它们当作配对字典。
+- 洛谷：官方实例的严格数字编号通过共享的 505 项公开字典解析名称，再走既有名称规则。例如 `luogu-tag:53`
+  → 树状数组 → `data-structure.bit`；`luogu-tag:3` → 动态规划 DP → `dp` 分类，不推断子技巧。
+  原始编号、来源和字典出处保留；同题的编号与名称不会重复累计知识点题数。字典未收录或名称没有对照规则时
+  保持 `unmapped`；歧义与粒度限制仍保留。只接受官方 `luogu:luogu.com.cn` / `luogu:www.luogu.com.cn`
+  实例，镜像、额外端口与显式指定词汇的其他来源不借用字典；畸形或非安全整数编号不计入知识点。
 - 牛客：组合标签（多项式算法、筛法、`gcd(裴蜀定理)`、`概率期望`）保持 `composite`/`ambiguous`，`tarjan`
   与"强连通分量"分开，`树状数组` 等普通同义词照常解析。
 - OI Wiki：即使标题被识别，也只返回 `reference`、零计数。
@@ -137,12 +140,15 @@ URL 猜测平台，也不会借用其它平台的专属规则，并且**在共�
 - 诊断：报告包含 `tagMappingVersion` 与 `sourceTagMappings`，每行含来源实例、词汇、原始标签、关系、
   计数目标、候选、规则、中文说明、参考链接，以及去重后的尝试/通过题目数；同一标签来自不同来源时分行列出。
 
+知识点页顶部显示「待核对来源标签（全部难度）」及「查看待核对标签」入口，打开既有对照表并清空冲突筛选。
+CF 的 `divide and conquer`、`schedules` 等未映射标签保留原文和每标签去重的尝试/通过数，
+`hashing`、`bitmasks` 保留歧义候选；不会阻断同题其他有效标签，也不会据此伪造知识点或掌握证据。
+这里的标签行数不是题目总数，各行题数不能相加。
+
 后续工作（不在本 Sprint）：
 
-- 洛谷字典交叉表：洛谷适配器已能把平台字典抓取为原始标签（`luogu-tag:<id>` 数字标识与名称标签
-  并存，既有导入的 ID/名称原样保留）；本 Sprint 尚未验证一份完整、按 id 索引的“数字标识→名称→
-  本项目知识点”交叉表，因此 `luogu-tag:<id>` 仍只作平台标识、不猜含义。未来接入字典版本与
-  id→概念对照时应作为**新增规则**，而不是改写 `luogu-tag:<id>` 的既有含义。
+- 定期核对洛谷公开字典并独立审核新的名称对照规则；当前编号桥接已实现，但字典完整不代表知识点映射完整。
+  规则与字典随版本发布，不改写平台原始标识、AI/人工标签决定或复盘。
 - 牛客导入适配器与账号界面（未来 OJ 导入；当前只有词汇与标签解析）。OI Wiki 只是学习资料目录，
   不做导入适配器，也不会有 OI Wiki 账号或提交导入界面。
 - taxonomy 版本迁移：新增节点是新的词表版本；重命名 id 必须显式迁移，不能靠本模块的对照表隐式改名。
@@ -152,7 +158,7 @@ URL 猜测平台，也不会借用其它平台的专属规则，并且**在共�
 
 - Codeforces API 对象说明与标签页：<https://codeforces.com/apiHelp/objects#Problem>、
   <https://codeforces.com/problemset>
-- 洛谷题单页标签：<https://www.luogu.com.cn/problem/list>
+- 洛谷题单页标签与公开字典：<https://www.luogu.com.cn/problem/list>、<https://www.luogu.com.cn/_lfe/tags>
 - 牛客 ACM 模式技能练习：<https://ac.nowcoder.com/acm/skill/acm>
 - OI Wiki 及其定位说明：<https://oi-wiki.org/>、<https://oi-wiki.org/intro/what-oi-wiki-is-not/>
 
