@@ -501,6 +501,8 @@ test('a dead blog reference and an unusable section stay operational failures', 
   const missing = createHttpHarness({
     routes: {
       '/api/blogEntry.view': () => jsonResponse(blogEntryPayload({ id: 9005, content: missingSectionBlogHtml() })),
+      '/problemset/problem/455/A': () =>
+        htmlResponse(problemPageHtml({ index: 'A', title: 'Boredom', tutorialBlogId: 9005 })),
     },
   });
   const missingResult = await createCodeforcesAdapter({ transport: missing.transport }).fetchEditorial({

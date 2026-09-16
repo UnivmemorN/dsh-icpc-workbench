@@ -72,6 +72,10 @@ export function modelApiFailure(error: unknown): ApiTransportError {
     switch (error.code) {
       case 'invalid_input': case 'not_found': case 'conflict': case 'settings_changed':
       case 'model_busy': case 'model_invalid': case 'cancelled': return new ApiTransportError(error.code);
+      // The stored batch references material that cannot be analysed. The message is a fixed safe
+      // sentence that tells the caller to refresh the material and prepare a new batch, and the
+      // matching transport code keeps the refusal unambiguous for a direct API caller.
+      case 'materials_blocked': return new ApiTransportError('materials_blocked', error.message);
       case 'history_overflow': return new ApiTransportError('conflict', 'stored history exceeds the supported bound');
       // AI planning is intentionally absent from this composition (an old isolated fixture): the
       // caller gets a stable refusal instead of a retried request or a fabricated success.

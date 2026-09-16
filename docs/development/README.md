@@ -72,10 +72,10 @@ npm pack
 | --- | --- |
 | [manual-import.md](../manual-import.md) | Manual interchange v1 的 JSON/CSV 字段、校验、哈希与适配器接口 |
 | [luogu-sync.md](../luogu-sync.md) | 洛谷连接、同步语义、失败环节、凭据存放与生命周期 |
-| [luogu-sync-recovery.md](../luogu-sync-recovery.md) | 待补题目逐题重试、手工补充与逐题原因分类 |
+| [luogu-sync-recovery.md](../luogu-sync-recovery.md) | 待补题目逐题重试、手工补充与逐题原因分类；登录态题解读取的载荷结构与失败语义见 [Stage 33C 报告](../reports/stage-33c-luogu-editorial-read.md) |
 | [luogu-tag-names.md](../luogu-tag-names.md) | 洛谷数字标签编号到平台名称的显示快照与显示规则 |
 | [luogu-account-names.md](../luogu-account-names.md) | 洛谷公开昵称读取范围、UID 身份与界面出现位置 |
-| [merged-bank.md](../merged-bank.md) | 跨站去重读模型、映射边界与通过状态归属 |
+| [merged-bank.md](../merged-bank.md) | 跨站去重读模型、映射边界与通过状态归属；唯一的等价规则 `cfMirrorIdentity()` 与全部拒绝边界（也用于镜像题题解复用） |
 | [problem-recycle-bin.md](../problem-recycle-bin.md) | 跳过与可恢复回收站的语义、存储与批量操作边界 |
 | [completion-editing.md](../completion-editing.md) | 完成方式的单题/批量编辑、预览应用与保留规则 |
 

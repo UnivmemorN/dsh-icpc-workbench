@@ -495,7 +495,10 @@ test('unfamiliar successful authenticated payloads are changed_response, never a
   const editorial = await adapter.fetchEditorial({ problemRef: ref('P3374'), token, limits: LIMITS });
   assert.equal(editorial.status, 'changed_response');
   if (editorial.status === 'changed_response') {
-    assert.ok(editorial.sample !== null);
+    // The anonymous probe never quotes the body it received: a sample travels into stored notes and
+    // into DTOs, so if that surface ever answers material it must not be reproduced there.
+    assert.equal(editorial.sample, null);
+    assert.equal(editorial.detail.includes('"solutions"'), false);
   }
   await rejectsWithCode(
     adapter.listSubmissions({

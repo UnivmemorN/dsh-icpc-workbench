@@ -361,6 +361,41 @@ void test('an explicit absent declaration is recorded, a synthesized unavailable
   });
 });
 
+void test('a declaration note equal to its detail is stored once while different ones keep both', async () => {
+  await withStore(async (store) => {
+    const service = serviceFor(store);
+    const token = createCancellationSource().token;
+    const sentence = '已核实没有题解：官方题解列表为空';
+    const declaration = (scope: fx.Scope, note: string, detail: string): ManualMaterialInput => ({
+      problemKey: scope.problem.key,
+      result: { status: 'absent', detail },
+      url: 'https://blog.example.org/none',
+      title: 'Checked page',
+      note,
+    });
+
+    // One input in both fields — what an explicit absence declaration produces — with surrounding
+    // whitespace that must not defeat the comparison: the sentence is stored once.
+    const same = fx.makeScope('manual', 'local.example.org', 'alice', 'P3');
+    const one = await service.applyManual(manualBundle(same, [declaration(same, `  ${sentence}  `, sentence)]), token);
+    const oneSnapshot = await store.getSnapshot(one.snapshots[0]?.snapshotId ?? '');
+    assert.ok(oneSnapshot);
+    assert.equal(oneSnapshot.sources.length, 1);
+    assert.equal(oneSnapshot.sources[0]?.note, sentence, 'the repeated sentence is stored once');
+
+    // Two genuinely different fragments keep the existing format and their order.
+    const different = fx.makeScope('manual', 'local.example.org', 'alice', 'P4');
+    const two = await service.applyManual(
+      manualBundle(different, [declaration(different, 'user checked the blog index', 'checked by hand')]),
+      token,
+    );
+    const twoSnapshot = await store.getSnapshot(two.snapshots[0]?.snapshotId ?? '');
+    assert.ok(twoSnapshot);
+    assert.equal(twoSnapshot.sources[0]?.note, 'user checked the blog index | checked by hand');
+    assert.notEqual(twoSnapshot.snapshotId, oneSnapshot.snapshotId);
+  });
+});
+
 void test('a canceled final write rolls the whole manual document back', async () => {
   await withStore(async (store) => {
     const scope = fx.makeScope('manual', 'local.example.org', 'alice', 'P1');

@@ -311,6 +311,25 @@ function snapshotWithSource(problem: NormalizedProblem, availability: EditorialA
   return createProblemSnapshot({ problem, sources: [source], solutions: [], capturedAt: fx.AT });
 }
 
+/**
+ * A snapshot whose source answered `found` and retrieved a page, but no analysable write-up exists.
+ *
+ * This is the real shape of a "the editorial page loaded, the solution text was not extracted"
+ * observation: the source body is present, only the referenced solution is missing.
+ */
+function snapshotWithUnextractedBody(problem: NormalizedProblem): ProblemSnapshot {
+  const source = createEditorialSource({
+    id: 'editorial-1',
+    kind: 'editorial',
+    url: `https://editorial.example.org/${problem.ref.externalKey}`,
+    title: `Editorial for ${problem.title}`,
+    availability: 'found',
+    retrievedAt: fx.AT,
+    text: 'The editorial page was retrieved but no write-up was extracted from it.',
+  });
+  return createProblemSnapshot({ problem, sources: [source], solutions: [], capturedAt: fx.AT });
+}
+
 function snapshotWithoutSources(problem: NormalizedProblem): ProblemSnapshot {
   return createProblemSnapshot({ problem, sources: [], solutions: [], capturedAt: fx.AT });
 }
@@ -737,10 +756,50 @@ void test('operational failures, unknown sources and a missing statement never t
     assert.equal(gateway.analyzeRequests.length, 0);
     assert.equal(gateway.verifyRequests.length, 0);
     assert.equal(gateway.reasonRequests.length, 0);
+    // Every one of these jobs failed *before* a dispatch: no counter moved, no attempt row exists
+    // and no quota unit was consumed, so an unusable material set costs nothing.
+    assert.deepEqual(summary.counters, { analysisCalls: 0, reasoningCalls: 0, retries: 0 });
+    assert.deepEqual(await store.listModelCallAttempts({ batchId: batch.batchId }), []);
     const codes = await Promise.all(
       batch.jobs.map(async (spec) => (await store.getJob(spec.jobId))?.lastError?.code),
     );
     assert.deepEqual([...codes].sort(), ['editorial_unknown', 'missing_statement', 'source_unavailable']);
+    const statuses = await Promise.all(batch.jobs.map(async (spec) => (await store.getJob(spec.jobId))?.status));
+    assert.deepEqual(statuses, ['failed', 'failed', 'failed']);
+  });
+});
+
+void test('a found source without a usable body fails the job before any call is paid for', async () => {
+  await withFixture(async ({ store, clock }) => {
+    const problem = makeProblem('7D');
+    const snapshot = snapshotWithUnextractedBody(problem);
+    await seed(store, problem, snapshot);
+    const gateway = new FakeGateway({});
+    const pipeline = makePipeline(store, gateway, clock);
+    const prepared = await pipeline.prepareBatch([snapshot.snapshotId]);
+    const batch = prepared.batch;
+    assert.ok(batch);
+
+    const summary = await pipeline.run(batch.batchId);
+    assert.equal(summary.status, 'failed');
+    // The pipeline's own defence is untouched by the preparation gate: a snapshot that recorded a
+    // found source but no analysable body can never reach the model, not even through a batch that
+    // was created directly at this layer.
+    assert.equal(gateway.analyzeRequests.length, 0);
+    assert.equal(gateway.verifyRequests.length, 0);
+    assert.equal(gateway.reasonRequests.length, 0);
+    assert.deepEqual(summary.counters, { analysisCalls: 0, reasoningCalls: 0, retries: 0 });
+    assert.equal(summary.uncertainAttempts, 0);
+    const job = await store.getJob(analysisJobIdOf(snapshot.snapshotId));
+    assert.equal(job?.status, 'failed');
+    assert.equal(job?.lastError?.code, 'editorial_empty');
+    // `job.attempts` counts leases taken on the job, so this run really did claim it; what must
+    // stay at zero is every *paid* accounting: the batch counters, the call audit and the results.
+    assert.equal(job?.attempts, 1);
+    // Nothing was dispatched, so no attempt row and no adopted result can exist.
+    assert.deepEqual(await store.listModelCallAttempts({ batchId: batch.batchId }), []);
+    assert.deepEqual(await store.listAnalyses(problem.key), []);
+    assert.deepEqual(await store.listTagDecisions(problem.key), []);
   });
 });
 

@@ -34,6 +34,7 @@ import {
   createNormalizedProblem,
   createSourceInstance,
   createSubmission,
+  sha256Hex,
   sourceInstanceIdOf,
   type Account,
   type CancellationToken,
@@ -71,8 +72,26 @@ import {
   requireCatalogOffset,
   requireSubmissionCursor,
 } from './cursors.js';
-import { extractEditorialSection, parseCodeforcesBlogUrl } from './editorial.js';
-import { detectChallengePage, extractProblemPage, findTutorialBlogId, htmlToPlainText } from './html.js';
+import {
+  extractDivisionHeadingReferences,
+  extractEditorialSection,
+  parseCodeforcesBlogUrl,
+  type EditorialSection,
+} from './editorial.js';
+import { detectChallengePage, extractProblemPage, findTutorialBlogId, htmlToPlainText, parseHtml } from './html.js';
+import { isTag, type AnyNode } from 'domhandler';
+import {
+  CF_EDITORIAL_ALIAS_RULE_VERSION,
+  contestIdForDivision,
+  contestsFormDivisionPair,
+  divisionOfContestName,
+  divisionReferenceKey,
+  headingSpellingsFor,
+  normalizeOfficialTitle,
+  orderedContestIds,
+  type CfContestFacts,
+  type CfEditorialAlias,
+} from './editorial-alias.js';
 import {
   cfProblemExternalKey,
   cfSubmissionExternalKey,
@@ -90,8 +109,25 @@ export const CODEFORCES_MIN_REQUEST_INTERVAL_MS = 2000;
 const CATALOG_PATH = '/api/problemset.problems';
 const USER_STATUS_PATH = '/api/user.status';
 const BLOG_ENTRY_PATH = '/api/blogEntry.view';
+const CONTEST_STANDINGS_PATH = '/api/contest.standings';
 const CATALOG_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_LIMIT_VALUE = 10_000;
+/**
+ * Fixed request budget of one shared-round alias check.
+ *
+ * The check is strict on purpose: the blog may name at most {@link MAX_ALIAS_BLOG_CONTESTS} contests,
+ * and at most {@link MAX_ALIAS_CONTEST_LOOKUPS} contest-metadata reads may happen before the attempt
+ * is abandoned as an operational failure instead of continuing to spend the documented two-second
+ * request interval. Reaching either bound is reported, never silently truncated into a weaker check.
+ */
+const MAX_ALIAS_BLOG_CONTESTS = 4;
+const MAX_ALIAS_CONTEST_LOOKUPS = 4;
+/** Candidate budget: a Div.1/Div.2 pair has exactly two divisions, so two candidates is the bound. */
+const MAX_ALIAS_CANDIDATES = 2;
+/** One contest metadata answer is small; the bound keeps a broken endpoint from streaming forever. */
+const ALIAS_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+/** Official contest page paths that name a contest in a tutorial blog, bounded to the main set. */
+const OFFICIAL_CONTEST_HREF = /^\/(?:contest|gym)\/(\d{1,7})(?:\/|$)/u;
 /**
  * How long a catalog snapshot may serve a cursor continuation before it is re-fetched and its
  * fingerprint re-checked. Freshness is read from the injectable adapter clock.
@@ -107,6 +143,130 @@ const NOT_FOUND = /not found/iu;
 /** Domains that address the main problemset (`main`/`problemset` are aliases of no domain). */
 const MAIN_PROBLEM_DOMAINS: ReadonlySet<string> = new Set(['', 'main', 'problemset']);
 const GYM_PROBLEM_DOMAIN = 'gym';
+
+/**
+ * One resolved editorial target: the section that was extracted, the problem it belongs to, and the
+ * alias that justified the redirect (or `null` for a direct hit).
+ */
+interface ResolvedEditorialTarget {
+  readonly section: EditorialSection;
+  readonly target: ProblemTarget;
+  readonly alias: CfEditorialAlias | null;
+}
+
+/** Canonical fetch target of one already-validated contest/index pair on this instance. */
+function targetOf(contestId: number, index: string): ProblemTarget {
+  const [contestPath, problemsetPath] = officialProblemPaths(contestId, index);
+  return {
+    contestId,
+    index,
+    domain: null,
+    externalKey: cfProblemExternalKey(contestId, index),
+    url: new URL(problemsetPath ?? contestPath ?? '', CODEFORCES_BASE_URL).toString(),
+  };
+}
+
+/**
+ * Stable provenance note of one shared-round redirect.
+ *
+ * It is written in a fixed `key=value;` form so the mapping can be audited (and later migrated)
+ * without parsing prose, and it records *both* identities: what the user asked for and which section
+ * actually answered. `statementHash` is deliberately absent — the fingerprint is verification
+ * evidence, not something to persist.
+ */
+function aliasNote(alias: CfEditorialAlias, blogId: number, sectionKey: string): string {
+  return (
+    `${CF_EDITORIAL_ALIAS_RULE_VERSION}; requested=${alias.requestedKey}; section=${sectionKey}; ` +
+    `blog=${blogId}; method=${alias.method}`
+  );
+}
+
+/**
+ * Official contest ids one tutorial blog names, or `null` when the answer is not a bounded pair.
+ *
+ * Only official `codeforces.com/contest/<id>` links are read, and the whole blog must name at most
+ * {@link MAX_ALIAS_BLOG_CONTESTS} distinct main-problemset contests. A blog that names more contests
+ * than that cannot yield the unique pair the rule requires, so the caller reports it instead of
+ * pairing two of them. A foreign link is ignored entirely: it is never an identity source.
+ */
+function referencedContestIds(blogHtml: string): readonly number[] | null {
+  const document = parseHtml(blogHtml);
+  const ids: number[] = [];
+  const walk = (nodes: readonly AnyNode[]): void => {
+    for (const node of nodes) {
+      if (!isTag(node)) {
+        continue;
+      }
+      if (node.name.toLowerCase() === 'a') {
+        const id = contestIdFromHref(node.attribs.href ?? '');
+        if (id !== null && !ids.includes(id)) {
+          ids.push(id);
+        }
+      }
+      walk(node.children);
+    }
+  };
+  walk(document.children);
+  if (ids.length < 2 || ids.length > MAX_ALIAS_BLOG_CONTESTS) {
+    return null;
+  }
+  return ids;
+}
+
+/** Contest id of one official `codeforces.com/contest/<id>` link, or `null` for anything else. */
+function contestIdFromHref(href: string): number | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(href, CODEFORCES_BASE_URL);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return null;
+  }
+  if (parsed.username.length > 0 || parsed.password.length > 0 || parsed.port !== '') {
+    return null;
+  }
+  if (!isOfficialCodeforcesHost(parsed.hostname)) {
+    return null;
+  }
+  const match = OFFICIAL_CONTEST_HREF.exec(parsed.pathname);
+  if (match === null) {
+    return null;
+  }
+  const contestId = Number(match[1]);
+  return Number.isSafeInteger(contestId) && contestId > 0 ? contestId : null;
+}
+
+/**
+ * The accepted heading spellings of one candidate, derived only from verified contest placement.
+ *
+ * `div. 1 D` is accepted for the candidate exactly when the *official name of the candidate's own
+ * contest* declares Div. 1; the division is read, never computed from a letter offset. When both
+ * contestants of the pair happen to declare the same division the heading is not unique, so it is
+ * refused instead of being resolved by position.
+ */
+function aliasHeadingsFor(
+  candidate: { readonly key: string; readonly index: string; readonly contestId: number },
+  orderedPair: readonly CfContestFacts[],
+  allContestFacts: readonly CfContestFacts[],
+): readonly string[] {
+  const declared = allContestFacts
+    .filter((contest) => contest.contestId === candidate.contestId)
+    .map((contest) => divisionOfContestName(contest.name))
+    .filter((division): division is 1 | 2 => division !== null);
+  if (declared.length !== 1) {
+    return [];
+  }
+  const division = declared[0] as 1 | 2;
+  const contestIds = orderedPair
+    .filter((contest) => divisionOfContestName(contest.name) === division)
+    .map((contest) => contest.contestId);
+  if (contestIds.length !== 1 || contestIds[0] !== candidate.contestId) {
+    return [];
+  }
+  return headingSpellingsFor({ division, index: candidate.index });
+}
 
 const VERDICT_MAP: Readonly<Record<string, SubmissionVerdict>> = {
   OK: 'accepted',
@@ -811,13 +971,14 @@ export class CodeforcesAdapter implements PlatformAdapter {
       const target = parseProblemTarget(request.problemRef, this.sourceInstance, 'editorial');
       const supplied = request.officialTutorialUrl ?? null;
       let blogId: number;
+      let problemPageHtml: string | null = null;
       if (supplied !== null) {
         // Strictly validated before any request, so a caller-supplied URL never becomes an
         // arbitrary fetch target.
         blogId = parseCodeforcesBlogUrl(supplied);
       } else {
-        const page = await this.fetchOfficialHtml(target.url, request.token, limits, 'editorial');
-        const discovered = findTutorialBlogId(page);
+        problemPageHtml = await this.fetchOfficialHtml(target.url, request.token, limits, 'editorial');
+        const discovered = findTutorialBlogId(problemPageHtml);
         if (discovered === null) {
           // The problem page simply does not link a tutorial: discovery is incomplete, which is
           // not proof that no editorial exists anywhere.
@@ -832,6 +993,26 @@ export class CodeforcesAdapter implements PlatformAdapter {
       }
       const blog = await this.fetchBlogEntry(blogId, request.token, limits);
       const section = extractEditorialSection(blog.content, target);
+
+      if (!section.ok && section.reason === 'missing') {
+        // The section that was asked for is not in the blog at all. A shared Div.1/Div.2 round may
+        // still hold it under the other division's key, so the alias path runs: it is a bounded,
+        // evidence-only redirect, and every clause below must hold before anything is accepted.
+        // `ambiguous` and `empty` deliberately never reach it — those describe a section that *was*
+        // found, and a redirect must not paper over them.
+        const aliased = await this.resolveSharedRoundAlias({
+          requested: target,
+          blogId,
+          blogIdContent: blog.content,
+          problemPageHtml,
+          token: request.token,
+          limits,
+        });
+        if (aliased !== null) {
+          return this.adoptedEditorial(blog, aliased, target);
+        }
+      }
+
       if (!section.ok) {
         throw new PlatformError({
           code: 'changed_response',
@@ -841,40 +1022,354 @@ export class CodeforcesAdapter implements PlatformAdapter {
           sample: section.sample,
         });
       }
-      const retrievedAt = new Date().toISOString();
-      const sourceId = `cf-blog-${blog.id}`;
-      const sources = [
-        createEditorialSource({
-          id: sourceId,
-          kind: 'editorial',
-          url: this.blogUrl(blog.id),
-          title: blog.title,
-          author: blog.authorHandle,
-          language: blog.locale,
-          publishedAt: blog.publishedAt,
-          retrievedAt,
-          availability: 'found',
-          text: section.text,
-          note: `section ${target.externalKey} of blog ${blog.id}`,
-        }),
-      ];
-      const solutions = [
-        createEditorialSolution({
-          solutionId: `${sourceId}-${target.contestId}${target.index}`,
-          sourceId,
-          ordinal: 0,
-          title: section.headingText.length > 0 ? section.headingText : blog.title,
-          text: section.text,
-        }),
-      ];
-      request.token.throwIfCancelled();
-      return { status: 'found', sources, solutions, retrievedAt };
+      return this.adoptedEditorial(blog, { section, target, alias: null }, target);
     } catch (error) {
       if (isPlatformError(error)) {
         return editorialFailureFromPlatformError(error);
       }
       throw error;
     }
+  }
+
+  /**
+   * One optional shared-round alias: the verified redirect plus the target it resolves to.
+   *
+   * The evidence is kept only long enough to describe the source that is stored; the statement hash
+   * never leaves this adapter (it is compared, then dropped), and the alias object itself is not
+   * projected to any API, log or UI.
+   */
+  private async resolveSharedRoundAlias(args: {
+    readonly requested: ProblemTarget;
+    readonly blogId: number;
+    readonly blogIdContent: string;
+    /** The requested problem's page, when the blog was discovered from it rather than supplied. */
+    readonly problemPageHtml: string | null;
+    readonly token: CancellationToken;
+    readonly limits: PlatformLimits;
+  }): Promise<ResolvedEditorialTarget | null> {
+    const { requested, blogId, token, limits } = args;
+    try {
+      // (1) The requested problem's own page must link this blog. When the caller supplied the
+      // tutorial URL, the page was never fetched, so it is fetched here and the link is proven
+      // before anything else is consulted.
+      let requestedPageHtml = args.problemPageHtml;
+      if (requestedPageHtml === null) {
+        requestedPageHtml = await this.fetchOfficialHtml(requested.url, token, limits, 'editorial');
+      }
+      const requestedTutorial = findTutorialBlogId(requestedPageHtml);
+      token.throwIfCancelled();
+      if (requestedTutorial !== blogId) {
+        return null;
+      }
+      const requestedPage = extractProblemPage(requestedPageHtml);
+      if (!requestedPage.ok) {
+        return null;
+      }
+
+      // (2) The tutorial blog must name exactly one official Div.1/Div.2 contest pair.
+      const referenced = referencedContestIds(args.blogIdContent);
+      if (referenced === null) {
+        return null;
+      }
+      const contestFacts: CfContestFacts[] = [];
+      for (const contestId of referenced) {
+        const facts = await this.fetchContestFacts(contestId, token, limits);
+        if (facts === null) {
+          return null;
+        }
+        contestFacts.push(facts);
+      }
+      token.throwIfCancelled();
+
+      // (3) and (4) One round, two divisions: identical start time and duration, and the same core
+      // name once the canonical `(Div. N)` marker is removed. Inspect every bounded combination:
+      // choosing the first match would silently accept an ambiguous blog that names two shared
+      // rounds. The one proven pair must also contain the problem the caller actually requested.
+      const pairs: Array<readonly [CfContestFacts, CfContestFacts]> = [];
+      for (let left = 0; left < contestFacts.length; left += 1) {
+        for (let right = left + 1; right < contestFacts.length; right += 1) {
+          const first = contestFacts[left] as CfContestFacts;
+          const second = contestFacts[right] as CfContestFacts;
+          if (contestsFormDivisionPair(first, second)) {
+            pairs.push([first, second]);
+          }
+        }
+      }
+      if (pairs.length !== 1) {
+        return null;
+      }
+      const orderedPair: readonly CfContestFacts[] = pairs[0] as readonly CfContestFacts[];
+      const pairDivisions = new Set(orderedPair.map((contest) => divisionOfContestName(contest.name)));
+      if (
+        pairDivisions.size !== 2 ||
+        pairDivisions.has(null) ||
+        !orderedPair.some((contest) => contest.contestId === requested.contestId)
+      ) {
+        return null;
+      }
+
+      // The heading is the only source of the candidate's identity. A relative heading names the
+      // contest *by division* and the problem *by its own index*, so the candidate is that division's
+      // contest with that index — carrying the requested index across divisions would be the very
+      // letter-offset assumption this rule forbids, and it would look for a problem that need not
+      // exist. Every reference the heading lists is tried, and the count is bounded.
+      const headingReferences = extractDivisionHeadingReferences(args.blogIdContent);
+      if (headingReferences === null) {
+        return null;
+      }
+      interface Candidate {
+        readonly key: string;
+        readonly index: string;
+        readonly contestId: number;
+      }
+      const candidates: Candidate[] = [];
+      const seenKeys = new Set<string>();
+      for (const reference of headingReferences) {
+        const contestId = contestIdForDivision(orderedPair, reference.division);
+        if (contestId === null) {
+          continue;
+        }
+        const key = divisionReferenceKey(reference, contestId);
+        // A relative heading on the requested contest can identify only the requested index. A
+        // different index in that same contest is a different problem, not a cross-division alias.
+        if (
+          key === null ||
+          (contestId === requested.contestId && reference.index !== requested.index) ||
+          seenKeys.has(key)
+        ) {
+          continue;
+        }
+        seenKeys.add(key);
+        candidates.push({ key, index: reference.index, contestId });
+      }
+      if (candidates.length === 0 || candidates.length > MAX_ALIAS_CANDIDATES) {
+        return null;
+      }
+
+      const requestedTitle = normalizeOfficialTitle(requestedPage.page.title);
+      const requestedHash = this.statementFingerprint(requestedPage.page.intrinsicStatement);
+      const accepted: { readonly candidate: Candidate; readonly section: EditorialSection }[] = [];
+      for (const candidate of candidates) {
+        const acceptedCandidate = await this.verifyAliasCandidate({
+          candidate,
+          requested,
+          blogId,
+          orderedPair,
+          requestedTitle,
+          requestedHash,
+          allContestFacts: contestFacts,
+          blogContent: args.blogIdContent,
+          token,
+          limits,
+        });
+        if (acceptedCandidate !== null) {
+          accepted.push({ candidate, section: acceptedCandidate });
+        }
+      }
+      token.throwIfCancelled();
+      // (9) Exactly one candidate may hold.
+      if (accepted.length !== 1) {
+        return null;
+      }
+      const winner = accepted[0] as { readonly candidate: Candidate; readonly section: EditorialSection };
+      return {
+        section: winner.section,
+        target: targetOf(winner.candidate.contestId, winner.candidate.index),
+        alias: {
+          requestedKey: cfProblemExternalKey(requested.contestId, requested.index),
+          sectionKey: winner.candidate.key,
+          blogId,
+          pairedContestIds: orderedContestIds(orderedPair),
+          method: 'official_division_pair',
+          ruleVersion: CF_EDITORIAL_ALIAS_RULE_VERSION,
+          evidenceHash: requestedHash,
+        },
+      };
+    } catch (error) {
+      // Evidence that does not prove the mapping returns `null` at the clause that rejected it.
+      // A thrown error is operational (transport, parsing, cancellation, or invalid input) and must
+      // keep its typed meaning; rewriting it as a later "missing section" would give the caller the
+      // wrong recovery action and would make cancellation look like a platform response.
+      throw error;
+    }
+  }
+
+  /**
+   * Verify one candidate of a shared round, or refuse it.
+   *
+   * Every clause is official evidence; the candidate is accepted only when all of them hold:
+   * its page links the same tutorial blog, its official title equals the requested title exactly
+   * (NFC plus whitespace folding — never a fuzzy or case-insensitive comparison), its normalized
+   * statement fingerprint equals the requested one, and re-extracting the section under the
+   * candidate's own key yields exactly one non-empty section.
+   */
+  private async verifyAliasCandidate(args: {
+    readonly candidate: { readonly key: string; readonly index: string; readonly contestId: number };
+    readonly requested: ProblemTarget;
+    readonly blogId: number;
+    readonly orderedPair: readonly CfContestFacts[];
+    readonly requestedTitle: string;
+    readonly requestedHash: string;
+    readonly allContestFacts: readonly CfContestFacts[];
+    readonly blogContent: string;
+    readonly token: CancellationToken;
+    readonly limits: PlatformLimits;
+  }): Promise<EditorialSection | null> {
+    const { candidate, token, limits } = args;
+    const candidateTarget = targetOf(candidate.contestId, candidate.index);
+    const isRequested =
+      candidate.contestId === args.requested.contestId && candidate.index === args.requested.index;
+    if (!isRequested) {
+      const candidateHtml = await this.fetchOfficialHtml(candidateTarget.url, token, limits, 'editorial');
+      token.throwIfCancelled();
+      const candidatePage = extractProblemPage(candidateHtml);
+      if (!candidatePage.ok) {
+        return null;
+      }
+      // (8) The candidate must link the same blog.
+      if (candidatePage.page.tutorialBlogId !== args.blogId) {
+        return null;
+      }
+      // (6) Identical official titles under the same language, exactly.
+      if (normalizeOfficialTitle(candidatePage.page.title) !== args.requestedTitle) {
+        return null;
+      }
+      // (7) Identical normalized statements. A round whose divisions really do differ in a
+      // constraint or a sample produces a different fingerprint here and is refused.
+      if (this.statementFingerprint(candidatePage.page.intrinsicStatement) !== args.requestedHash) {
+        return null;
+      }
+    }
+    // (5) The division pair must place the candidate's *contest* at the division the heading names;
+    // the accepted heading spellings are derived from that verified placement only.
+    const headings = aliasHeadingsFor(candidate, args.orderedPair, args.allContestFacts);
+    if (headings.length === 0) {
+      return null;
+    }
+    // (10) Re-extract under the candidate's own key through the verified headings. It must be unique
+    // and carry body text; anything else leaves the request as `missing`.
+    const section = extractEditorialSection(args.blogContent, candidateTarget, [
+      { contestId: candidate.contestId, index: candidate.index, externalKey: candidate.key, headings },
+    ]);
+    return section.ok && section.sectionKey === candidate.key ? section : null;
+  }
+
+  /**
+   * Normalized fingerprint of one statement, for internal comparison only.
+   *
+   * NFC plus whitespace folding of the statement *body* — the title, limits and tags were already
+   * removed while the page was parsed, so the shell cannot contribute. Nothing else is normalized:
+   * a differing constraint or sample must change the hash, which is exactly what makes the hash
+   * usable as evidence. The value is compared inside this adapter and never stored or returned.
+   */
+  private statementFingerprint(statement: string): string {
+    return sha256Hex(statement.normalize('NFC').replace(/\s+/gu, ' ').trim());
+  }
+
+  /**
+   * Official contest metadata of one contest id, or `null` when it cannot be read.
+   *
+   * `contest.standings` is used because it answers for a *finished* round as well as a running one,
+   * and only the four fields the pairing rules need are read. A refusal (a missing contest, a rate
+   * limit, an unrecognized envelope) is `null`: it makes the alias unverifiable, never accepted.
+   */
+  private async fetchContestFacts(
+    contestId: number,
+    token: CancellationToken,
+    limits: PlatformLimits,
+  ): Promise<CfContestFacts | null> {
+    const query = new URLSearchParams({
+      contestId: String(contestId),
+      from: '1',
+      count: '1',
+      showUnofficial: 'false',
+    });
+    const response = await this.transport.request(`${CONTEST_STANDINGS_PATH}?${query.toString()}`, {
+      token,
+      operation: 'editorial',
+      // 400 is accepted so a refused contest is classified instead of becoming a transport failure.
+      acceptStatuses: [400],
+      limits: { ...this.httpLimits(limits), maxResponseBytes: ALIAS_MAX_RESPONSE_BYTES },
+    });
+    if (response.status === 400) {
+      return null;
+    }
+    const root = requireRecord(parseJson(response.body, 'editorial', 'contest.standings response'), 'contest.standings response', 'editorial');
+    if (root.status !== 'OK') {
+      return null;
+    }
+    // The API answers `result` as an object whose `contest` field owns the identity and timing
+    // fields. Anything else is an unrecognized envelope, which makes the alias unverifiable rather
+    // than accepted. `problems` and `rows` are intentionally ignored after the request limits them.
+    const answered = this.contestFactsFromResult(root.result);
+    if (answered === null || answered.contestId !== contestId) {
+      return null;
+    }
+    return answered;
+  }
+
+  /** The four pairing facts of one `contest.standings` result, or `null` for an unknown shape. */
+  private contestFactsFromResult(result: unknown): CfContestFacts | null {
+    if (!isRecord(result) || !isRecord(result.contest)) {
+      return null;
+    }
+    const contest = result.contest;
+    try {
+      return {
+        contestId: requireSafeCount(contest.id, 'contest id', 'editorial'),
+        name: requireString(contest.name, 'contest name', 'editorial'),
+        startTimeSeconds: requireSafeCount(contest.startTimeSeconds, 'contest startTimeSeconds', 'editorial'),
+        durationSeconds: requireSafeCount(contest.durationSeconds, 'contest durationSeconds', 'editorial'),
+      };
+    } catch {
+      // An unreadable row cannot verify anything; the caller treats the alias as unverifiable, so a
+      // malformed metadata answer never becomes an accepted redirect.
+      return null;
+    }
+  }
+
+  /** The stored source/solution pair of one accepted section, stamped with its provenance. */
+  private adoptedEditorial(
+    blog: BlogEntry,
+    resolved: ResolvedEditorialTarget,
+    requested: ProblemTarget,
+  ): EditorialFetchResult {
+    const { section, alias } = resolved;
+    // The identity is always the *requested* problem: a shared-round alias changes which section the
+    // text came from, never which problem the analysis is about. `requested` is passed separately
+    // from the resolved section for exactly that reason, so the two can never be confused.
+    const requestedKey = requested.externalKey;
+    const retrievedAt = new Date().toISOString();
+    const sourceId = `cf-blog-${blog.id}`;
+    const sources = [
+      createEditorialSource({
+        id: sourceId,
+        kind: 'editorial',
+        url: this.blogUrl(blog.id),
+        title: blog.title,
+        author: blog.authorHandle,
+        language: blog.locale,
+        publishedAt: blog.publishedAt,
+        retrievedAt,
+        availability: 'found',
+        text: section.text,
+        note:
+          alias === null
+            ? `section ${section.sectionKey} of blog ${blog.id}`
+            : aliasNote(alias, blog.id, section.sectionKey),
+      }),
+    ];
+    const solutions = [
+      createEditorialSolution({
+        // Bound to the requested problem, so two problems can never share a task identity.
+        solutionId: `${sourceId}-${requestedKey}`,
+        sourceId,
+        ordinal: 0,
+        title: section.headingText.length > 0 ? section.headingText : blog.title,
+        text: section.text,
+      }),
+    ];
+    return { status: 'found', sources, solutions, retrievedAt };
   }
 
   private requireLimits(limits: PlatformLimits): PlatformLimits {

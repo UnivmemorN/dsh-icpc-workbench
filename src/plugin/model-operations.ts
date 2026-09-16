@@ -78,9 +78,15 @@ import {
 } from '../domain/index.js';
 import {
   AnalysisPipeline,
-  classifySnapshotAvailability,
   type PreparedBatch,
 } from '../application/analysis-pipeline.js';
+import {
+  materialBlockedProblem,
+  materialIsRunnable,
+  materialKindOf,
+  type MaterialBlockedProblem,
+  type SnapshotMaterialKind,
+} from '../application/material-preflight.js';
 import type { AnalysisBatch, AnalysisBatchLimits, ModelCallAttempt } from '../application/batch-types.js';
 import {
   CoachingService,
@@ -307,20 +313,24 @@ interface OwnedOperation {
 interface ResolvedProblem {
   readonly problemKey: string;
   readonly snapshotId: string;
-  /** `null` when the head references a snapshot row that is not readable. */
-  readonly snapshot: ProblemSnapshot | null;
+  /** The stored current snapshot body; only a runnable entry is ever handed to the pipeline. */
+  readonly snapshot: ProblemSnapshot;
+  /** Material state that made this entry runnable (`editorial` or `absent`). */
+  readonly material: 'editorial' | 'absent';
 }
 
 /**
- * One selected problem that cannot be analysed yet because it has no material snapshot.
+ * The outcome of resolving one whole selection against its real current snapshots.
  *
- * It is reported as an explicit blocked entry rather than rejecting the whole selection or
- * fabricating an empty snapshot; the rest of the selection is still prepared.
+ * `runnable` is the only list a batch may be prepared from; `blocked` explains every problem that
+ * was left out, one stable reason plus one action each; `availability` counts the whole selection.
+ * The three are computed together so they cannot disagree — `availability.error` is exactly
+ * `blocked.length`, because every non-runnable problem is both an error count and a blocked entry.
  */
-interface BlockedProblem {
-  readonly problemKey: string;
-  readonly reason: 'material_missing';
-  readonly action: 'refresh_materials';
+interface ResolvedSelection {
+  readonly runnable: readonly ResolvedProblem[];
+  readonly blocked: readonly MaterialBlockedProblem[];
+  readonly availability: ModelBatchAvailabilitySummary;
 }
 
 /**
@@ -514,13 +524,20 @@ export class ModelOperations {
   // -------------------------------------------------------------------------------------
 
   /**
-   * Resolve real current snapshots and prepare a batch for them.
+   * Resolve real current snapshots, gate them on their material, and prepare a batch for the
+   * runnable ones only.
    *
-   * A missing problem (`not_found`) is refused before any batch state is written. A problem
-   * without a current snapshot head is **not** a whole-selection failure: it is reported in
-   * `blocked` with an explicit refresh action, no job is created for it and no model call can
-   * reach it. The remaining, resolvable problems are prepared normally, so no selection is
+   * A missing problem (`not_found`) is refused before any batch state is written. Any other problem
+   * whose **current** material cannot be analysed is **not** a whole-selection failure: it is
+   * reported in `blocked` with its stable reason and the one action that can fix it, no job is
+   * created for it and no model call can reach it — not as a dispatch, and not as an attempt row or
+   * a quota unit. The remaining, runnable problems are prepared normally, so no selection is
    * silently dropped and none is silently paid for.
+   *
+   * Only `editorial` (a found source with a referenced non-empty solution) and `absent` (every
+   * source explicitly absent, with a statement to reason over) are runnable. An empty source list is
+   * unknown, never absent: it is reported as `editorial_unknown` so the expensive statement-only
+   * reasoning path is never started from a guess.
    *
    * The batch captures the settings limits in force at this moment, and finished jobs are
    * reported as `alreadyDone` only while their stored success carries a current completeness
@@ -540,17 +557,17 @@ export class ModelOperations {
       await this.requireNoLivePlan(cancellation);
       const record = await this.effectiveSettings();
       cancellation.throwIfCancelled();
-      const { resolved, blocked } = await this.resolveCurrentSnapshots(problemKeys, cancellation);
+      const selection = await this.resolveCurrentSnapshots(problemKeys, cancellation);
       const limits = batchLimitsOf(record.value);
-      // Nothing analysable was selected: no batch is created, so nothing can be run or paid for.
+      // Nothing runnable was selected: no batch is created, so nothing can be run or paid for.
       const prepared: PreparedBatch =
-        resolved.length === 0
+        selection.runnable.length === 0
           ? { batch: null, alreadyDone: [], reruns: [] }
           : await this.createPipeline(record).prepareBatch(
-              resolved.map((entry) => entry.snapshotId),
+              selection.runnable.map((entry) => entry.snapshotId),
               { maxJobs, limits, reanalyze },
             );
-      return prepareResult(prepared, resolved, record, limits, blocked);
+      return prepareResult(prepared, selection, record, limits);
     } finally {
       this.gate.release();
     }
@@ -661,10 +678,11 @@ export class ModelOperations {
   /**
    * Redacted detail of one batch: persisted state plus this instance's own operation view.
    *
-   * The projection carries identity, status, counters, known usage, stable error codes and call
-   * correlation — never an attempt outcome, analysis, suggestion, reasoning draft or raw error. A
-   * batch whose attempt history would exceed the projection bound is refused instead of truncated,
-   * and its jobs are bounded by the batch's own `maxJobs` (at most 100).
+   * The projection carries identity, status, counters, known usage, stable error codes, call
+   * correlation and the free material preflight of the batch's own immutable snapshots — never an
+   * attempt outcome, analysis, suggestion, reasoning draft or raw error. A batch whose attempt
+   * history would exceed the projection bound is refused instead of truncated, and its jobs are
+   * bounded by the batch's own `maxJobs` (at most 100).
    */
   async batchDetail(request: ModelBatchIdRequest, token: CancellationToken): Promise<ModelBatchDetailResult> {
     const cancellation = requireToken(token);
@@ -684,7 +702,10 @@ export class ModelOperations {
     if (attempts.length > MAX_MODEL_ATTEMPT_HISTORY) {
       throw overflowFailure('the batch attempt history exceeds the projection bound');
     }
-    return { batch: await this.projectBatch(batch, attempts, cancellation), operation: this.operationStatusView(batchId) };
+    return {
+      batch: await this.projectBatch(batch, attempts, cancellation),
+      operation: this.operationStatusView(batchId),
+    };
   }
 
   /**
@@ -1191,7 +1212,7 @@ export class ModelOperations {
   // Start plumbing
   // -------------------------------------------------------------------------------------
 
-  /** Shared start path of `batch.run`/`batch.resume`: gate, CAS settings, model probe, owned run. */
+  /** Shared start path of `batch.run`/`batch.resume`: gate, material gate, CAS settings, model probe, owned run. */
   private async startBatchOperation(
     operation: 'batch.run' | 'batch.resume',
     batchId: string,
@@ -1213,6 +1234,20 @@ export class ModelOperations {
       token.throwIfCancelled();
       if (batch === null) {
         throw new ModelOperationError('not_found', 'the requested batch does not exist');
+      }
+      // The second material gate, and the first thing checked after existence: a stored batch may
+      // reference material that cannot be analysed (it was prepared by an earlier version, or the
+      // snapshot was damaged). Refusing here — before the model probe, the owned operation, any
+      // reservation and any counter movement — means such a batch cannot spend money, cannot move a
+      // counter and cannot change a job status. An API caller cannot bypass this either, because
+      // this is the only start path there is.
+      const blocks = await this.materialBlocksOf(batch, token);
+      token.throwIfCancelled();
+      if (blocks.length > 0) {
+        throw new ModelOperationError(
+          'materials_blocked',
+          'the stored batch references material that cannot be analysed; refresh or supplement the material and prepare a new batch',
+        );
       }
       const record = await this.requireCurrentSettings(revision, token);
       await this.requireValidModels(record.value, token);
@@ -1454,20 +1489,25 @@ export class ModelOperations {
   }
 
   /**
-   * Resolve every requested problem to its stored current snapshot.
+   * Resolve every requested problem to its stored current snapshot and decide its material state.
    *
-   * A missing problem is `not_found`; a problem whose material was never frozen is reported as
-   * a `blocked` entry (`material_missing` + `refresh_materials`) so the caller can keep the rest
-   * of the selection. The snapshot body is read only to summarise availability — a head whose
-   * row is unreadable is counted as an error and left for the pipeline's own
-   * `missing_reference` refusal.
+   * A missing problem is `not_found`. Every other problem lands in exactly one of two lists: a
+   * `runnable` entry (a readable current snapshot whose material is `editorial` or `absent`) that
+   * may become a job, or a `blocked` entry carrying the stable reason and the one action that can
+   * fix it. A head whose snapshot row is unreadable is `snapshot_unreadable`, not a fabricated
+   * empty snapshot and not an absence.
+   *
+   * The three answers are produced in one pass over the same read, so the counts, the runnable list
+   * and the blocked list can never describe different selections.
    */
   private async resolveCurrentSnapshots(
     problemKeys: readonly string[],
     token: CancellationToken,
-  ): Promise<{ readonly resolved: readonly ResolvedProblem[]; readonly blocked: readonly BlockedProblem[] }> {
-    const resolved: ResolvedProblem[] = [];
-    const blocked: BlockedProblem[] = [];
+  ): Promise<ResolvedSelection> {
+    const runnable: ResolvedProblem[] = [];
+    const blocked: MaterialBlockedProblem[] = [];
+    let ready = 0;
+    let absent = 0;
     for (const key of problemKeys) {
       const problem = await this.store.getProblem(key);
       if (problem === null) {
@@ -1475,20 +1515,71 @@ export class ModelOperations {
       }
       const head = await this.store.getCurrentSnapshotHead(problem.ref);
       token.throwIfCancelled();
-      if (head === null) {
-        // An honest, explicit block instead of a fabricated metadata-only snapshot: nothing was
-        // captured for this problem, so claiming a snapshot would invent material.
-        blocked.push({ problemKey: key, reason: 'material_missing', action: 'refresh_materials' });
+      const snapshot = head === null ? null : await this.store.getSnapshot(head.snapshotId);
+      token.throwIfCancelled();
+      // A head that exists but whose body cannot be read is a different fact from a problem that
+      // was never captured: the first asks for a refresh, the second for material to be created.
+      const kind: SnapshotMaterialKind = head !== null && snapshot === null ? 'unreadable' : materialKindOf(snapshot);
+      if (!materialIsRunnable(kind) || snapshot === null) {
+        // An honest, explicit block instead of a fabricated metadata-only snapshot or an inferred
+        // absence: the problem stays in the answer, but it is not a job and cannot be paid for.
+        blocked.push(this.blockedProblem(key, kind));
         continue;
       }
-      resolved.push({
-        problemKey: key,
-        snapshotId: head.snapshotId,
-        snapshot: await this.store.getSnapshot(head.snapshotId),
-      });
-      token.throwIfCancelled();
+      if (kind === 'editorial') {
+        ready += 1;
+        runnable.push({ problemKey: key, snapshotId: snapshot.snapshotId, snapshot, material: 'editorial' });
+      } else {
+        absent += 1;
+        runnable.push({ problemKey: key, snapshotId: snapshot.snapshotId, snapshot, material: 'absent' });
+      }
     }
-    return { resolved, blocked };
+    return { runnable, blocked, availability: { ready, absent, error: blocked.length } };
+  }
+
+  /** Blocked view of one non-runnable material state; the reasons are total, so this cannot fail. */
+  private blockedProblem(problemKey: string, kind: SnapshotMaterialKind): MaterialBlockedProblem {
+    const view = materialBlockedProblem(problemKey, kind);
+    if (view === null) {
+      throw new ModelOperationError('internal', 'a runnable material state was reported as blocked');
+    }
+    return view;
+  }
+
+  /**
+   * Free material preflight of a stored batch's own immutable snapshots.
+   *
+   * A batch prepared by an earlier version may already reference a snapshot that cannot be analysed.
+   * Reading the batch and classifying what it captured writes nothing, so this is safe on every
+   * read path — and it is the second gate: `batch.run`/`batch.resume` refuse with
+   * `materials_blocked` *before* the model probe, the owned operation, any reservation or any
+   * counter movement, which is what keeps a historical batch from spending money on material that
+   * cannot produce an adoptable result. Refreshing the problem's material later produces a new
+   * snapshot and therefore never clears this: only a new free preparation can.
+   */
+  private async materialBlocksOf(
+    batch: AnalysisBatch,
+    token: CancellationToken,
+  ): Promise<readonly MaterialBlockedProblem[]> {
+    const blocks: MaterialBlockedProblem[] = [];
+    for (const spec of batch.jobs) {
+      const job = await this.store.getJob(spec.jobId);
+      token.throwIfCancelled();
+      // A job this batch no longer needs to execute (a finished or cancelled one) is history, not
+      // work: it is never a reason to refuse, and it never counted toward the paid bound either.
+      if (job !== null && (job.status === 'succeeded' || job.status === 'cancelled')) {
+        continue;
+      }
+      const snapshot = await this.store.getSnapshot(spec.snapshotId);
+      token.throwIfCancelled();
+      // A batch job always names a snapshot the batch captured, so a body that cannot be read is
+      // `snapshot_unreadable` rather than "material was never created".
+      const kind: SnapshotMaterialKind = snapshot === null ? 'unreadable' : materialKindOf(snapshot);
+      if (!materialIsRunnable(kind)) {
+        blocks.push(this.blockedProblem(job?.problemKey ?? snapshotProblemKey(spec.snapshotId), kind));
+      }
+    }
+    return blocks;
   }
 
   /**
@@ -1582,6 +1673,7 @@ export class ModelOperations {
       counters: { ...batch.counters },
       uncertainAttempts,
       lastErrorCode: batch.lastError?.code ?? null,
+      materialBlocks: await this.materialBlocksOf(batch, token),
       jobs,
     };
   }
@@ -1977,6 +2069,21 @@ function serviceAsk(ask: ParsedCoachingAsk): CoachingAskRequest {
   };
 }
 
+/** Canonical owner of a stored snapshot id, without exposing the snapshot identity as a problem key. */
+function snapshotProblemKey(snapshotId: string): string {
+  const match = /^(.+)@[0-9a-f]{64}:v[1-9][0-9]*$/u.exec(snapshotId);
+  if (match === null) {
+    throw new ModelOperationError('internal', 'a stored batch contains an invalid snapshot identity');
+  }
+  const problemKey = match[1] as string;
+  try {
+    parseProblemKey(problemKey);
+  } catch {
+    throw new ModelOperationError('internal', 'a stored batch contains an invalid snapshot owner');
+  }
+  return problemKey;
+}
+
 /** Metadata view of an operation this instance owns; it never carries the hint text. */
 function ownedCoachingView(owned: OwnedOperation, identity: OwnedCoachingIdentity): ModelCoachingAskResult {
   return {
@@ -2029,30 +2136,32 @@ function replayView(result: CoachingAskResult): ModelCoachingAskResult {
 
 function prepareResult(
   prepared: PreparedBatch,
-  resolved: readonly ResolvedProblem[],
+  selection: ResolvedSelection,
   record: WorkbenchSettingsRecord,
   limits: AnalysisBatchLimits,
-  blocked: readonly BlockedProblem[],
 ): ModelBatchPrepareResult {
-  const keyBySnapshot = new Map(resolved.map((entry) => [entry.snapshotId, entry.problemKey] as const));
+  // Every entry here was verified runnable at preparation time, and its `material` records which of
+  // the two runnable states it was in; only these problems may appear as a job of the new batch.
+  const keyBySnapshot = new Map(
+    selection.runnable.map((entry) => [entry.snapshotId, { problemKey: entry.problemKey, material: entry.material }] as const),
+  );
   const batch = prepared.batch;
   const jobs: ModelBatchPreparedJobView[] = [];
   for (const job of batch?.jobs ?? []) {
-    const problemKey = keyBySnapshot.get(job.snapshotId);
-    if (problemKey === undefined) {
+    const entry = keyBySnapshot.get(job.snapshotId);
+    if (entry === undefined) {
       throw new ModelOperationError('internal', 'a prepared batch job could not be mapped to a requested problem');
     }
-    jobs.push({ jobId: job.jobId, snapshotId: job.snapshotId, problemKey });
+    jobs.push({ jobId: job.jobId, snapshotId: job.snapshotId, problemKey: entry.problemKey });
   }
-  const availability = availabilityOf(resolved);
   return {
     batchId: batch?.batchId ?? null,
     settingsRevision: record.revision === 0 ? null : record.revision,
     provider: record.value.provider,
     models: modelRolesOf(record.value),
     limits: batch === null ? { ...limits } : { ...batch.limits },
-    upperBoundCalls: upperBoundCalls(jobs.length, batch?.limits ?? limits),
-    availability,
+    upperBoundCalls: upperBoundCalls(jobs.length, batch?.limits ?? limits, selection.blocked.length),
+    availability: selection.availability,
     jobs,
     alreadyDone: (prepared.alreadyDone ?? []).map(alreadyDoneView),
     reruns: (prepared.reruns ?? []).map((entry) => ({
@@ -2062,7 +2171,7 @@ function prepareResult(
       previousStatus: entry.previousStatus,
       reason: entry.reason,
     })),
-    blocked: blocked.map((entry) => ({
+    blocked: selection.blocked.map((entry) => ({
       problemKey: entry.problemKey,
       reason: entry.reason,
       action: entry.action,
@@ -2070,35 +2179,23 @@ function prepareResult(
   };
 }
 
-/** Availability counts of the requested material; never a title, source or excerpt. */
-function availabilityOf(resolved: readonly ResolvedProblem[]): ModelBatchAvailabilitySummary {
-  let ready = 0;
-  let absent = 0;
-  let error = 0;
-  for (const entry of resolved) {
-    const kind = entry.snapshot === null ? 'unreadable' : classifySnapshotAvailability(entry.snapshot).kind;
-    if (kind === 'editorial') {
-      ready += 1;
-    } else if (kind === 'absent') {
-      absent += 1;
-    } else {
-      error += 1;
-    }
-  }
-  return { ready, absent, error };
-}
-
 /**
  * Conservative upper bound of the paid calls a batch with `jobCount` jobs can dispatch.
  *
  * The bound is the batch's own quota, not a prediction of what it will spend: every dispatch —
  * retries included — reserves and counts against the batch limits, so the analysis and reasoning
- * budgets are hard maxima. A batch with no job is never run and is bounded by zero.
+ * budgets are hard maxima. A batch with no job is never run and is bounded by zero. `blocked`
+ * problems are reported next to the bound because they are *not* jobs: they add nothing to either
+ * maximum, and counting them as new tasks would overstate both the workload and the possible cost.
  */
-function upperBoundCalls(jobCount: number, limits: AnalysisBatchLimits): ModelBatchCallUpperBound {
+function upperBoundCalls(
+  jobCount: number,
+  limits: AnalysisBatchLimits,
+  blocked: number,
+): ModelBatchCallUpperBound {
   return jobCount === 0
-    ? { analysisCalls: 0, reasoningCalls: 0 }
-    : { analysisCalls: limits.maxAnalysisCalls, reasoningCalls: limits.maxReasoningCalls };
+    ? { analysisCalls: 0, reasoningCalls: 0, blocked }
+    : { analysisCalls: limits.maxAnalysisCalls, reasoningCalls: limits.maxReasoningCalls, blocked };
 }
 
 function alreadyDoneView(entry: {

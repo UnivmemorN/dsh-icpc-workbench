@@ -12,7 +12,7 @@ export type PageName='today'|'bank'|'accounts'|'review'|'weakness'|'plans'|'sett
 export interface WorkbenchContextValue{boot:BootstrapResult;accountId:string|null;selectAccount:(accountId:string|null)=>void;refresh:()=>void;navigate:(page:PageName,problemKey?:string)=>void;problemKey:string|null;selectedKeys:string[];setSelectedKeys:(keys:string[])=>void;}
 export const WorkbenchContext=createContext<WorkbenchContextValue|null>(null);
 export function useWorkbench():WorkbenchContextValue{const value=useContext(WorkbenchContext);if(!value)throw Error('Workbench context missing');return value;}
-const messages:Record<string,string>={settings_changed:'设置已变化，请刷新后重新确认。',conflict:'数据已变化或任务状态冲突，请刷新后重试。',model_busy:'模型任务仍在运行，请等待或取消后再修改。',model_invalid:'模型配置暂不可用，请在设置页查看原因。',invalid_input:'输入不符合要求，请检查填写内容。',cancelled:'请求已取消。',internal:'操作失败，请查看本地 dsh 日志。',unauthorized:'登录已失效，请从 dsh 启动地址重新打开。'};
+const messages:Record<string,string>={settings_changed:'设置已变化，请刷新后重新确认。',conflict:'数据已变化或任务状态冲突，请刷新后重试。',model_busy:'模型任务仍在运行，请等待或取消后再修改。',model_invalid:'模型配置暂不可用，请在设置页查看原因。',invalid_input:'输入不符合要求，请检查填写内容。',cancelled:'请求已取消。',internal:'操作失败，请查看本地 dsh 日志。',unauthorized:'登录已失效，请从 dsh 启动地址重新打开。',materials_blocked:'该批次引用的材料不能分析。请刷新或补充题目材料，然后重新免费准备批次；旧批次不会产生新的模型调用。'};
 export function errorText(error:unknown):string{return error instanceof ApiClientError?messages[error.code]??error.message:error instanceof Error?error.message:'操作失败。';}
 export function ErrorNotice({error}:{error:unknown}){return error?<div className="icpc-notice icpc-error" role="alert">{errorText(error)}</div>:null;}
 export function Notice({children}:{children:ReactNode}){return <div className="icpc-notice">{children}</div>;}

@@ -56,11 +56,13 @@ import {
   createCancellationSource,
   createEditorialSource,
   createModelUsage,
+  createNormalizedProblem,
   createProblemSnapshot,
   createSuggestionVerification,
   createTaxonomy,
   type AiTagSuggestion,
   type CancellationToken,
+  type EditorialAvailability,
   type ModelUsage,
   type NormalizedProblem,
   type ProblemSnapshot,
@@ -74,6 +76,8 @@ const TAG = 'data-structure.segment-tree';
 const HINT = '先想清楚一次区间修改会影响哪些节点，不要急着写代码。';
 const EXCERPT = 'lazy propagation';
 const PROVIDER_FAILURE_TEXT = 'provider socket closed before usage was reported';
+/** The editorial body a runnable snapshot carries; it must never travel through a projection. */
+const SOLUTION_TEXT = 'The editorial uses lazy propagation: range updates stay O(log n) with a segment tree.';
 const USAGE = createModelUsage({ calls: 1, promptTokens: 120, completionTokens: 40 });
 /** A token nobody cancels: the "normal caller" of most cases. */
 const TOKEN = createCancellationSource().token;
@@ -306,6 +310,25 @@ function scopeOf(key: string): fx.Scope {
   return fx.makeScope('codeforces', 'codeforces.com', 'alice', key);
 }
 
+/**
+ * The same problem with an explicitly empty statement.
+ *
+ * The shared storage fixture treats an absent statement option as "use the default statement",
+ * so a missing statement has to be built through the domain factory: `null` here is a real,
+ * observed platform state ("the statement was never retrieved"), not a dropped option.
+ */
+function withoutStatement(world: fx.Scope, externalKey: string): NormalizedProblem {
+  return createNormalizedProblem({
+    ref: fx.makeRef(world.instance, externalKey),
+    title: `Problem ${externalKey}`,
+    url: `https://codeforces.com/problem/${externalKey}`,
+    statement: null,
+    fetchedAt: fx.AT,
+    ratings: [{ dimension: 'rating', value: 1800, scale: { min: 800, max: 3500 }, raw: '1800' }],
+    rawTags: ['data structures'],
+  });
+}
+
 function batchIdOf(prepared: ModelBatchPrepareResult): string {
   if (prepared.batchId === null) {
     assert.fail('expected a prepared batch');
@@ -396,7 +419,7 @@ void test('prepare resolves current snapshots into spoiler-free metadata and ref
       [ready.problem.key, bare.key].sort(),
     );
     // The bound is the batch's own quota: every dispatch, retries included, counts against it.
-    assert.deepEqual(prepared.upperBoundCalls, { analysisCalls: 50, reasoningCalls: 5 });
+    assert.deepEqual(prepared.upperBoundCalls, { analysisCalls: 50, reasoningCalls: 5, blocked: 0 });
     assert.deepEqual(prepared.alreadyDone, []);
     // No title, statement, source or excerpt travels through a prepare answer.
     const json = JSON.stringify(prepared);
@@ -420,7 +443,7 @@ void test('prepare resolves current snapshots into spoiler-free metadata and ref
     assert.deepEqual(blockedOnly.blocked, [
       { problemKey: neverFrozen.key, reason: 'material_missing', action: 'refresh_materials' },
     ]);
-    assert.deepEqual(blockedOnly.upperBoundCalls, { analysisCalls: 0, reasoningCalls: 0 });
+    assert.deepEqual(blockedOnly.upperBoundCalls, { analysisCalls: 0, reasoningCalls: 0, blocked: 1 });
   } finally {
     await bench.close();
   }
@@ -469,7 +492,7 @@ void test('the call upper bound is the batch quota and covers retries, not one p
 
     const prepared = await bench.controller.prepareBatch({ problemKeys: [world.problem.key] }, TOKEN);
     const batchId = batchIdOf(prepared);
-    assert.deepEqual(prepared.upperBoundCalls, { analysisCalls: 5, reasoningCalls: 1 });
+    assert.deepEqual(prepared.upperBoundCalls, { analysisCalls: 5, reasoningCalls: 1, blocked: 0 });
     await bench.controller.runBatch({ batchId, expectedSettingsRevision: revision }, TOKEN);
     await bench.controller.whenSettled();
 
@@ -484,7 +507,298 @@ void test('the call upper bound is the batch quota and covers retries, not one p
     // A batch with no job never runs: its bound is zero, not the settings quota.
     const again = await bench.controller.prepareBatch({ problemKeys: [world.problem.key] }, TOKEN);
     assert.equal(again.batchId, null);
-    assert.deepEqual(again.upperBoundCalls, { analysisCalls: 0, reasoningCalls: 0 });
+    assert.deepEqual(again.upperBoundCalls, { analysisCalls: 0, reasoningCalls: 0, blocked: 0 });
+  } finally {
+    await bench.close();
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Material preflight (Sprint 33A)
+// ---------------------------------------------------------------------------------------
+
+/** Snapshot with one `found` source that carries no solution body: nothing may be analysed. */
+function foundWithoutBody(problem: NormalizedProblem): ProblemSnapshot {
+  const source = createEditorialSource({
+    id: 'editorial-1',
+    kind: 'editorial',
+    url: `https://editorial.example.org/${problem.ref.externalKey}`,
+    title: `Editorial for ${problem.title}`,
+    availability: 'found',
+    retrievedAt: AT,
+    text: 'A retrieved page whose write-up was never extracted.',
+  });
+  return createProblemSnapshot({ problem, sources: [source], solutions: [], capturedAt: AT });
+}
+
+/** Snapshot with no source records at all: an unknown editorial state, never an absence. */
+function withoutSources(problem: NormalizedProblem): ProblemSnapshot {
+  return createProblemSnapshot({ problem, sources: [], solutions: [], capturedAt: AT });
+}
+
+/** Snapshot with one source that did not answer with an explicit absence. */
+function withSourceAvailability(
+  problem: NormalizedProblem,
+  availability: EditorialAvailability,
+): ProblemSnapshot {
+  const source = createEditorialSource({
+    id: 'editorial-1',
+    kind: 'editorial',
+    url: `https://editorial.example.org/${problem.ref.externalKey}`,
+    title: `Editorial for ${problem.title}`,
+    availability,
+    retrievedAt: AT,
+  });
+  return createProblemSnapshot({ problem, sources: [source], solutions: [], capturedAt: AT });
+}
+
+/**
+ * Store whose current head of one problem references a snapshot row an earlier version could have
+ * left unreadable. Only `getSnapshot` is affected: the head itself is real.
+ */
+class HiddenSnapshotStore extends SqliteTrainingStore {
+  private readonly hidden = new Set<string>();
+
+  hide(snapshotId: string): void {
+    this.hidden.add(snapshotId);
+  }
+
+  override async getSnapshot(snapshotId: string): Promise<ProblemSnapshot | null> {
+    return this.hidden.has(snapshotId) ? null : super.getSnapshot(snapshotId);
+  }
+}
+
+void test('only a usable editorial or a confirmed absence becomes a job, and every other state is an explicit free block', async () => {
+  const created: { store: HiddenSnapshotStore | null } = { store: null };
+  const bench = new Bench({
+    store: (path, now) => {
+      const store = new HiddenSnapshotStore({ path, now });
+      created.store = store;
+      return store;
+    },
+  });
+  const ready = scopeOf('2000A');
+  const bare = scopeOf('2001B');
+  const unknown = scopeOf('2002C');
+  const emptyBody = scopeOf('2003D');
+  const auth = scopeOf('2004E');
+  const noStatement = withoutStatement(ready, '2005F');
+  // A stored problem whose material was never persisted: no head, so no snapshot either.
+  const truncated = fx.makeProblem(fx.makeRef(ready.instance, '2006G'));
+  const unreadable = scopeOf('2007H');
+  const noEditorialUntouched = scopeOf('2008I');
+  try {
+    await bench.seed(ready, fx.makeSnapshot(ready.problem));
+    await bench.store.upsertProblems([
+      bare.problem,
+      unknown.problem,
+      emptyBody.problem,
+      auth.problem,
+      noStatement,
+      truncated,
+      unreadable.problem,
+      noEditorialUntouched.problem,
+    ]);
+    await bench.store.saveSnapshot(absentSnapshot(bare.problem));
+    await bench.store.saveSnapshot(withoutSources(unknown.problem));
+    await bench.store.saveSnapshot(foundWithoutBody(emptyBody.problem));
+    await bench.store.saveSnapshot(withSourceAvailability(auth.problem, 'auth_required'));
+    await bench.store.saveSnapshot(withSourceAvailability(noStatement, 'absent'));
+    const unreadableSnapshot = fx.makeSnapshot(unreadable.problem);
+    await bench.store.saveSnapshot(unreadableSnapshot);
+    assert.ok(created.store);
+    created.store.hide(unreadableSnapshot.snapshotId);
+
+    const request = [
+      ready.problem.key,
+      bare.problem.key,
+      unknown.problem.key,
+      emptyBody.problem.key,
+      auth.problem.key,
+      noStatement.key,
+      truncated.key,
+      unreadable.problem.key,
+    ];
+    const prepared = await bench.controller.prepareBatch({ problemKeys: request }, TOKEN);
+    const batchId = batchIdOf(prepared);
+
+    // Exactly the usable editorial and the confirmed absence became jobs.
+    assert.deepEqual(
+      prepared.jobs.map((job) => job.problemKey),
+      [ready.problem.key, bare.problem.key],
+    );
+    assert.deepEqual(prepared.availability, { ready: 1, absent: 1, error: 6 });
+    assert.deepEqual(
+      prepared.blocked,
+      [
+        { problemKey: unknown.problem.key, reason: 'editorial_unknown', action: 'refresh_materials' },
+        { problemKey: emptyBody.problem.key, reason: 'editorial_empty', action: 'supplement_editorial' },
+        { problemKey: auth.problem.key, reason: 'source_unavailable', action: 'refresh_materials' },
+        { problemKey: noStatement.key, reason: 'missing_statement', action: 'supplement_statement' },
+        { problemKey: truncated.key, reason: 'material_missing', action: 'refresh_materials' },
+        { problemKey: unreadable.problem.key, reason: 'snapshot_unreadable', action: 'refresh_materials' },
+      ],
+    );
+    // A blocked problem is not a new task: the bound only covers the two real jobs, and the
+    // blocked count is reported next to it instead of being folded into the workload.
+    assert.deepEqual(prepared.upperBoundCalls, { analysisCalls: 50, reasoningCalls: 5, blocked: 6 });
+    assert.equal(prepared.blocked.length, prepared.availability.error);
+
+    // No model call can reach a blocked problem.
+    assert.equal(bench.gateway.analyzeRequests.length, 0);
+    assert.equal(bench.gateway.verifyRequests.length, 0);
+    assert.equal(bench.gateway.reasonRequests.length, 0);
+
+    // A problem outside the selection is untouched: its own material was never read.
+    assert.equal(
+      (await bench.controller.prepareBatch({ problemKeys: [noEditorialUntouched.problem.key] }, TOKEN)).batchId,
+      null,
+    );
+
+    // The answer carries no statement, editorial body, source identity, title or classifier detail.
+    const json = JSON.stringify(prepared);
+    for (const leak of [
+      truncated.title,
+      'A retrieved page whose write-up was never extracted.',
+      'editorial.example.org',
+      'carry no referenced solution text',
+      'did not answer with an explicit absence',
+      'absence cannot be concluded',
+      SOLUTION_TEXT,
+      EXCERPT,
+    ]) {
+      assert.equal(json.includes(leak), false, `the prepare answer must not carry ${leak}`);
+    }
+    // The path to the only paid call is a job of the real batch, and it starts pending with nothing spent.
+    const detail = await bench.controller.batchDetail({ batchId }, TOKEN);
+    assert.equal(detail.batch.status, 'pending');
+    assert.deepEqual(detail.batch.counters, { analysisCalls: 0, reasoningCalls: 0, retries: 0 });
+    assert.deepEqual(detail.batch.materialBlocks, []);
+    assert.equal(detail.batch.jobs.length, 2);
+  } finally {
+    await bench.close();
+  }
+});
+
+void test('a selection whose material is entirely unusable creates no batch, no job and no bound', async () => {
+  const bench = new Bench();
+  const unknown = scopeOf('2100A');
+  const auth = scopeOf('2101B');
+  const noStatement = withoutStatement(unknown, '2102C');
+  const absentKeys = scopeOf('2103D');
+  const emptyBody = scopeOf('2104E');
+  try {
+    await bench.seed(unknown, withoutSources(unknown.problem));
+    await bench.store.upsertProblems([auth.problem, noStatement, emptyBody.problem]);
+    await bench.store.saveSnapshot(withSourceAvailability(auth.problem, 'rate_limited'));
+    await bench.store.saveSnapshot(withSourceAvailability(noStatement, 'absent'));
+    await bench.store.saveSnapshot(foundWithoutBody(emptyBody.problem));
+
+    const prepared = await bench.controller.prepareBatch(
+      { problemKeys: [unknown.problem.key, auth.problem.key, noStatement.key, emptyBody.problem.key] },
+      TOKEN,
+    );
+    assert.equal(prepared.batchId, null);
+    assert.deepEqual(prepared.jobs, []);
+    assert.deepEqual(prepared.upperBoundCalls, { analysisCalls: 0, reasoningCalls: 0, blocked: 4 });
+    assert.deepEqual(prepared.availability, { ready: 0, absent: 0, error: 4 });
+    assert.deepEqual(prepared.blocked.map((entry) => entry.reason), [
+      'editorial_unknown',
+      'source_unavailable',
+      'missing_statement',
+      'editorial_empty',
+    ]);
+    assert.equal(prepared.alreadyDone.length, 0);
+    assert.equal(prepared.reruns.length, 0);
+
+    // Nothing was written: no batch exists at all, and no paid call was reachable.
+    assert.deepEqual(await bench.store.listBatches(null), []);
+    assert.deepEqual(await bench.store.listJobs(null), []);
+    assert.deepEqual(await bench.store.listModelCallAttempts({}), []);
+    assert.equal(bench.gateway.analyzeRequests.length, 0);
+    assert.equal(bench.gateway.reasonRequests.length, 0);
+
+    // A problem whose own material was never frozen is reported exactly like the others.
+    await bench.store.upsertProblems([absentKeys.problem]);
+    const missing = await bench.controller.prepareBatch({ problemKeys: [absentKeys.problem.key] }, TOKEN);
+    assert.equal(missing.batchId, null);
+    assert.deepEqual(missing.blocked, [
+      { problemKey: absentKeys.problem.key, reason: 'material_missing', action: 'refresh_materials' },
+    ]);
+  } finally {
+    await bench.close();
+  }
+});
+
+void test('a mixed selection prepares only the runnable problems, and a rerun of them stays runnable', async () => {
+  const bench = new Bench();
+  const ready = scopeOf('2200A');
+  const broken = scopeOf('2201B');
+  try {
+    const seeded = await bench.seed(ready, fx.makeSnapshot(ready.problem));
+    await bench.store.upsertProblems([broken.problem]);
+    await bench.store.saveSnapshot(withoutSources(broken.problem));
+    const snapshot = fx.makeSnapshot(ready.problem);
+    bench.gateway.analyzeHandler = async () => okAnalyze(snapshot);
+    bench.gateway.verifyHandler = async (request) => {
+      const answer = await okVerify(request.suggestions, snapshot);
+      return answer.ok ? { ...answer, value: { ...answer.value, missingSuggestions: [] } } : answer;
+    };
+
+    const selection = [ready.problem.key, broken.problem.key];
+    const first = await bench.controller.prepareBatch({ problemKeys: selection }, TOKEN);
+    const firstBatchId = batchIdOf(first);
+    assert.equal(first.jobs.length, 1);
+    assert.equal(first.blocked.length, 1);
+    assert.deepEqual(first.upperBoundCalls, { analysisCalls: 50, reasoningCalls: 5, blocked: 1 });
+    await bench.controller.runBatch({ batchId: firstBatchId, expectedSettingsRevision: seeded.settingsRevision }, TOKEN);
+    await bench.controller.whenSettled();
+
+    // Finished and checked: the runnable problem is skipped, the blocked one is reported again.
+    const second = await bench.controller.prepareBatch({ problemKeys: selection }, TOKEN);
+    assert.equal(second.batchId, null);
+    assert.equal(second.alreadyDone.length, 1);
+    assert.deepEqual(second.upperBoundCalls, { analysisCalls: 0, reasoningCalls: 0, blocked: 1 });
+    assert.deepEqual(second.blocked.map((entry) => entry.reason), ['editorial_unknown']);
+
+    // An explicit rerun only reruns what is runnable; the blocked problem never becomes a job.
+    const rerun = await bench.controller.prepareBatch({ problemKeys: selection, reanalyze: true }, TOKEN);
+    const rerunBatchId = batchIdOf(rerun);
+    assert.equal(rerun.jobs.length, 1);
+    assert.equal(rerun.reruns.length, 1);
+    assert.equal(rerun.reruns[0]?.reason, 'reanalyze_requested');
+    assert.deepEqual(rerun.blocked.map((entry) => entry.reason), ['editorial_unknown']);
+    const detail = await bench.controller.batchDetail({ batchId: rerunBatchId }, TOKEN);
+    assert.equal(detail.batch.status, 'pending');
+    assert.deepEqual(detail.batch.counters, { analysisCalls: 0, reasoningCalls: 0, retries: 0 });
+    assert.deepEqual(detail.batch.materialBlocks, []);
+  } finally {
+    await bench.close();
+  }
+});
+
+void test('every operational source failure is blocked as unavailable and never becomes an absence', async () => {
+  const bench = new Bench();
+  const worlds = (['auth_required', 'forbidden', 'rate_limited', 'unavailable', 'changed_response'] as const).map(
+    (availability, index) => ({ availability, world: scopeOf(`230${index}A`) }),
+  );
+  try {
+    await bench.seed(worlds[0]!.world, withSourceAvailability(worlds[0]!.world.problem, worlds[0]!.availability));
+    for (const entry of worlds.slice(1)) {
+      await bench.store.upsertProblems([entry.world.problem]);
+      await bench.store.saveSnapshot(withSourceAvailability(entry.world.problem, entry.availability));
+    }
+    const prepared = await bench.controller.prepareBatch(
+      { problemKeys: worlds.map((entry) => entry.world.problem.key) },
+      TOKEN,
+    );
+    assert.equal(prepared.batchId, null);
+    assert.deepEqual(prepared.availability, { ready: 0, absent: 0, error: 5 });
+    assert.deepEqual(prepared.blocked.map((entry) => entry.reason), Array(5).fill('source_unavailable'));
+    assert.deepEqual(prepared.blocked.map((entry) => entry.action), Array(5).fill('refresh_materials'));
+    // Nothing could be mistaken for "the platform has no editorial", so no reasoning call was reachable.
+    assert.equal(bench.gateway.reasonRequests.length, 0);
+    assert.equal(prepared.upperBoundCalls.reasoningCalls, 0);
   } finally {
     await bench.close();
   }

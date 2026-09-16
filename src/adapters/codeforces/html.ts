@@ -202,9 +202,27 @@ export function sampleOfHtml(html: string, maxChars = 180): string {
 export interface ProblemPageContent {
   readonly title: string;
   readonly statement: string;
+  /**
+   * The statement body with the page *furniture* removed: no problem number, no title, no
+   * time/memory limit, no input/output file names and no tag boxes.
+   *
+   * Two divisions of one shared round render the same problem under different letters and their own
+   * titles, so a comparison of the whole statement would differ for reasons that say nothing about
+   * the problem. This member isolates what the problem actually asks — body, constraints,
+   * input/output and samples — and is the only part a shared-round equivalence check may compare.
+   */
+  readonly intrinsicStatement: string;
   readonly rawTags: readonly string[];
   /** Parsed from the `*NNNN` tag box; `null` when the page does not report a rating. */
   readonly rating: number | null;
+  /**
+   * The Tutorial blog this page links to, or `null` when it links none.
+   *
+   * It is read together with the statement so a caller can prove that two problem pages point at the
+   * *same* tutorial blog without a second parse. `null` is incomplete discovery — the page may simply
+   * not link a tutorial — and never evidence that no editorial exists.
+   */
+  readonly tutorialBlogId: number | null;
 }
 
 export type ProblemPageResult =
@@ -331,7 +349,42 @@ export function extractProblemPage(html: string): ProblemPageResult {
     };
   }
   const metadata = collectTagMetadata(document);
-  return { ok: true, page: { title, statement: statementText, rawTags: metadata.rawTags, rating: metadata.rating } };
+  return {
+    ok: true,
+    page: {
+      title,
+      statement: statementText,
+      intrinsicStatement: htmlToPlainText(intrinsicNodes(statement.children)),
+      rawTags: metadata.rawTags,
+      rating: metadata.rating,
+      tutorialBlogId: findTutorialBlogId(html),
+    },
+  };
+}
+
+/**
+ * The statement children with every page-furniture subtree removed.
+ *
+ * It is a *stronger* strip than {@link withoutMetadata}, which only drops tag boxes: the header,
+ * title, time/memory limit and input/output file rows go as well, because none of them is a fact
+ * about the problem. What remains is the body, the constraints, the input/output sections and the
+ * samples — the part two divisions of one shared round must spell identically.
+ */
+function intrinsicNodes(nodes: readonly AnyNode[]): readonly AnyNode[] {
+  const kept: AnyNode[] = [];
+  for (const node of nodes) {
+    if (isTag(node) && isFurniture(node)) {
+      continue;
+    }
+    const copy = cloneNode(node, true);
+    if (isTag(copy)) {
+      for (const box of findAll((element) => hasClass(element, 'tag-box'), [copy])) {
+        removeElement(box);
+      }
+    }
+    kept.push(copy);
+  }
+  return kept;
 }
 
 const BLOG_PATH = /^\/blog\/entry\/(\d{1,9})\/?$/u;

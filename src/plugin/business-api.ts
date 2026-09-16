@@ -35,6 +35,7 @@ import {
   createEditorialSource,
   invariant,
   problemKey as canonicalProblemKey,
+  type Account,
   type CancellationToken,
   type NormalizedProblem,
   type ProblemRef,
@@ -52,6 +53,8 @@ import {
 } from '../application/import-types.js';
 import { ImportService } from '../application/import-service.js';
 import { PlatformError, describePlatformError, isPlatformError } from '../application/platform-errors.js';
+import type { MirrorEditorialPort } from '../application/cf-mirror-editorial.js';
+import { CODEFORCES_MAIN_INSTANCE_ID } from '../domain/problem-equivalence.js';
 import type { PlatformAdapter, PlatformLimits } from '../application/ports.js';
 import type { SyncCheckpoint, SyncResource } from '../application/storage-types.js';
 import type { TrainingStore } from '../application/ports.js';
@@ -1073,6 +1076,19 @@ function snapshotWriteView(write: {
  * {@link RefreshMaterialReport} carries the merged problem (raw platform tags), the fetched problem
  * and the editorial result (source list and solution bodies). Those are spoilers, and a write endpoint
  * must not become a way to read them, so only identity, statuses, counts and retry metadata return.
+ *
+ * ## Exact Codeforces-mirror reuse
+ *
+ * A Luogu `CF<contest><index>` problem and the Codeforces main-problemset problem
+ * `<contest><index>` are the same problem, and only when the domain's own `luogu_cf_identifier`
+ * rule says so (see `src/domain/problem-equivalence.ts`). For such a target the service fetches the
+ * *editorial* from the equivalent Codeforces problem while the statement still comes from Luogu.
+ *
+ * The plugin supplies the port; it never lets the request choose a source. `sourceOfPlatform` picks
+ * the one configured Codeforces instance and `adapterOf` proves the resolved adapter is bound to it,
+ * so the Luogu adapter can never answer for Codeforces (and vice versa), and no caller-supplied
+ * problem number, contest id or URL participates: the reference the adapter is asked for is derived
+ * from the target's own stored identity inside the application service.
  */
 async function refreshMaterial(
   context: ApiContext,
@@ -1085,11 +1101,16 @@ async function refreshMaterial(
   token.throwIfCancelled();
   const limits = await platformLimits(context);
   token.throwIfCancelled();
+  // The caller's selected account is resolved from the store and must belong to the problem's own
+  // source instance, so a refresh can never authenticate as an account of another platform.
+  const account = await refreshAccount(context, input.accountId, ref.sourceInstanceId, token);
 
   const report = await context.imports.refreshMaterial(adapter, {
     problemRef: ref,
     fetchStatement: input.fetchStatement,
     ...(input.officialTutorialUrl === undefined ? {} : { officialTutorialUrl: input.officialTutorialUrl }),
+    mirrorEditorial: await mirrorEditorialPort(context, token),
+    ...(account === null ? {} : { account }),
     token,
     limits,
   });
@@ -1099,7 +1120,73 @@ async function refreshMaterial(
     snapshot: report.snapshot === null ? null : materialSnapshotView(report.snapshot, report.material),
     statement: statementStatusView(report),
     editorial: editorialStatusView(report),
+    mirror: { status: report.mirror.status, skippedReason: report.mirror.skippedReason, key: report.mirror.key },
     material: report.material === null ? null : materialView(report.material),
+  };
+}
+
+/**
+ * The account a material refresh may authenticate as, or `null` for an anonymous read.
+ *
+ * A supplied id is resolved from the store and must belong to the problem's own source instance: a
+ * caller cannot name an account of another platform, and an unknown id is a not-found rather than a
+ * silently anonymous read. `null`/absent stays anonymous, which is what every existing caller does and
+ * which can never report an absence.
+ */
+async function refreshAccount(
+  context: ApiContext,
+  accountId: string | null | undefined,
+  sourceInstanceId: string,
+  token: CancellationToken,
+): Promise<Account | null> {
+  if (accountId === undefined || accountId === null || accountId.length === 0) {
+    return null;
+  }
+  const account = await context.store.getAccount(accountId);
+  token.throwIfCancelled();
+  if (account === null) {
+    throw new DomainError('missing_reference', `account ${accountId} is not stored`, { accountId });
+  }
+  if (account.sourceInstanceId !== sourceInstanceId) {
+    throw new DomainError(
+      'missing_reference',
+      `account ${account.id} belongs to ${account.sourceInstanceId}, not ${sourceInstanceId}`,
+      { reason: 'account_source_mismatch', accountId: account.id, sourceInstanceId },
+    );
+  }
+  return account;
+}
+
+/**
+ * The Codeforces adapter to consult for an equivalent problem, or `null` when none is usable.
+ *
+ * `null` is a real answer, not a failure: a composition without the official Codeforces source still
+ * serves a Luogu refresh, and the service reports the skip as `cf_source_unavailable` instead of
+ * substituting another instance. The adapter is *resolved and verified* here rather than chosen by
+ * the service, so the "no source can impersonate another" boundary lives in the composition that
+ * owns the adapters.
+ */
+async function mirrorEditorialPort(
+  context: ApiContext,
+  token: CancellationToken,
+): Promise<MirrorEditorialPort | null> {
+  const instance = context.sources.find((source) => source.instance.id === CODEFORCES_MAIN_INSTANCE_ID);
+  if (instance === undefined) {
+    return null;
+  }
+  const adapter = await adapterOf(context, instance.instance);
+  token.throwIfCancelled();
+  // The reference is derived inside the service from the target's identity; the port only performs
+  // the fetch, so it cannot widen the request to another problem.
+  return {
+    fetchMirrorEditorial: async (request) => {
+      requireCallToken(request.token);
+      return adapter.fetchEditorial({
+        problemRef: request.cfRef,
+        token: request.token,
+        limits: request.limits,
+      });
+    },
   };
 }
 

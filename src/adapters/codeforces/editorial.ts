@@ -38,6 +38,13 @@ import {
   normalizeCfProblemIndex,
   parseOfficialProblemPath,
 } from './problem-index.js';
+import {
+  headingSelectsTarget,
+  headingSpellingsFor,
+  parseDivisionHeading,
+  type CfDivisionReference,
+  type CfEditorialSectionTarget,
+} from './editorial-alias.js';
 
 export interface EditorialTarget {
   readonly contestId: number;
@@ -56,6 +63,17 @@ export interface EditorialSection {
   readonly text: string;
   readonly headingText: string;
   readonly matchedReferences: readonly string[];
+  /**
+   * Canonical key of the section that was actually extracted.
+   *
+   * It equals the requested `<contestId><index>` for a direct hit, and the alias's `sectionKey` when
+   * the section was found through a verified shared-round alias. The caller records it as the
+   * provenance of the stored material, so "which problem's write-up is this" is never inferred from
+   * the request.
+   */
+  readonly sectionKey: string;
+  /** `explicit_reference` when the section named the requested problem; `null` for a direct hit. */
+  readonly aliasMethod: 'explicit_reference' | 'official_division_pair' | null;
 }
 
 export type EditorialSectionFailureReason = 'missing' | 'ambiguous' | 'empty';
@@ -307,6 +325,16 @@ interface Block {
   readonly boundary: boolean;
   /** Heading references, empty for any other block. */
   readonly refs: readonly HeadingRef[];
+  /**
+   * Normalized relative-division spellings this heading carries, e.g. `div.1d`.
+   *
+   * A heading is only *selectable* through an alias the adapter already verified; this member is the
+   * matching key, never an inference. It is filled for a pure division label (`Div. 1 D`) as well as
+   * for a label that mixes absolute references with a relative one (`Div. 2 E = Div. 1 D`).
+   */
+  readonly divisionHeadings: readonly string[];
+  /** The parsed division references behind {@link Block.divisionHeadings}. */
+  readonly divisionReferences: readonly CfDivisionReference[];
 }
 
 /** `true` when a parsed reference is an index the adapter can address. */
@@ -420,7 +448,104 @@ function analyzeBlock(element: Element): Block {
     isUsableIndex(first.index) &&
     isHeadingLabel(entries, tag, text, linkedRefs.length > 0);
   const boundary = !heading && isBareIndexHeading(tag, labelOf(entries, text));
-  return { element, tag, text, heading, boundary, refs: heading ? refs : [] };
+  return {
+    element,
+    tag,
+    text,
+    heading,
+    boundary,
+    refs: heading ? refs : [],
+    divisionHeadings: divisionHeadingsOf(entries, tag, text),
+    divisionReferences: divisionReferencesOf(entries, tag, text),
+  };
+}
+
+/**
+ * The parsed relative-division references of one block's label, or none.
+ *
+ * Two shapes are read, and both come from the platform's own writing:
+ *
+ * - a **pure** division label (`Div. 1 D`, `Div2 E / Div1 D`, `Div. 2 E = Div. 1 D`), accepted in any
+ *   heading tag because that is how a shared-round tutorial labels its sections; and
+ * - a label that **leads** with explicit absolute references and then offers the relative spelling
+ *   (`878C / Div. 1 C`, `878C = Div. 2 E`), which is the same section described twice.
+ *
+ * Prose never qualifies: the pure form must be division references only, and the mixed form must
+ * start at an absolute reference. A mention inside an author's note therefore cannot select a
+ * section.
+ */
+function divisionReferencesOf(
+  entries: readonly InlineEntry[],
+  tag: string,
+  text: string,
+): readonly CfDivisionReference[] {
+  const pure = parseDivisionHeading(text);
+  if (pure !== null) {
+    return pure;
+  }
+  if (!HEADING_TAGS.has(tag)) {
+    return [];
+  }
+  // The mixed form: references first, then a separator and one or more relative spellings.
+  const skeleton = skeletonOf(entries);
+  const match = /^\s*\u0001(?:\s*(?:[/,&+]|and)\s*\u0001)*\s*(?:[/,&+=]|and)\s*(.*)$/su.exec(skeleton);
+  if (match === null) {
+    return [];
+  }
+  return parseDivisionHeading(match[1] ?? '') ?? [];
+}
+
+/** Every normalized spelling of one parsed division reference list. */
+function divisionHeadingsOf(
+  entries: readonly InlineEntry[],
+  tag: string,
+  text: string,
+): readonly string[] {
+  return divisionSpellings(divisionReferencesOf(entries, tag, text));
+}
+
+/** Every normalized spelling of one parsed division reference list. */
+function divisionSpellings(references: readonly CfDivisionReference[]): readonly string[] {
+  const spellings: string[] = [];
+  for (const reference of references) {
+    for (const spelling of headingSpellingsFor(reference)) {
+      if (!spellings.includes(spelling)) {
+        spellings.push(spelling);
+      }
+    }
+  }
+  return spellings;
+}
+
+/**
+ * The relative-division references of the heading that marks a shared-round section, or `null`.
+ *
+ * The caller uses these to decide *which* problem to verify: a heading that says `Div. 1 C` names the
+ * contest by division and the problem by its own index, so the candidate is that division's contest
+ * with *that* index — the requested index is deliberately not carried across divisions. This is a
+ * lookup of the blog's own labels and says nothing about which of them is correct; the adapter still
+ * has to verify the candidate against the blog, the page and the contest pair.
+ *
+ * `null` means the blog has no relative-division heading at all, so there is nothing to resolve.
+ */
+export function extractDivisionHeadingReferences(html: string): readonly CfDivisionReference[] | null {
+  const document = parseHtml(html);
+  const elements: Element[] = [];
+  collectBlocks(document.children, elements);
+  const references: CfDivisionReference[] = [];
+  for (const element of elements) {
+    const block = analyzeBlock(element);
+    for (const reference of block.divisionReferences) {
+      if (
+        !references.some(
+          (known) => known.division === reference.division && known.index === reference.index,
+        )
+      ) {
+        references.push(reference);
+      }
+    }
+  }
+  return references.length > 0 ? references : null;
 }
 
 /**
@@ -430,7 +555,11 @@ function analyzeBlock(element: Element): Block {
  * extractor only looks for problem headings and their following blocks. The returned `text` is
  * plain text: markup, scripts and styles never reach the model.
  */
-export function extractEditorialSection(html: string, target: EditorialTarget): EditorialSectionResult {
+export function extractEditorialSection(
+  html: string,
+  target: EditorialTarget,
+  aliasTargets: readonly CfEditorialSectionTarget[] = [],
+): EditorialSectionResult {
   const wanted = normalizeCfProblemIndex(target.index);
   if (wanted === null || !Number.isSafeInteger(target.contestId) || target.contestId <= 0) {
     return {
@@ -442,6 +571,7 @@ export function extractEditorialSection(html: string, target: EditorialTarget): 
     };
   }
   const contestId = target.contestId;
+  const requestedKey = cfProblemExternalKey(contestId, wanted);
   const document = parseHtml(html);
   const elements: Element[] = [];
   collectBlocks(document.children, elements);
@@ -451,9 +581,13 @@ export function extractEditorialSection(html: string, target: EditorialTarget): 
     .slice(0, MAX_DIAGNOSTIC_HEADINGS)
     .map((block) => block.text);
   const sample = headings.length > 0 ? headings.join(' | ') : null;
-  const label = cfProblemExternalKey(contestId, wanted);
+  const label = requestedKey;
 
-  const matches: number[] = [];
+  // Direct hits first, and they are exclusive: a section that names the requested problem is the
+  // answer, and the verified aliases are never consulted (so a directly named section cannot be
+  // reinterpreted as the other division's). Aliases are a *fallback* for a heading that does not name
+  // the requested problem at all, which is why `ambiguous` and `empty` below never reach them.
+  const direct: number[] = [];
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index];
     if (
@@ -461,24 +595,33 @@ export function extractEditorialSection(html: string, target: EditorialTarget): 
       block.heading &&
       block.refs.some((ref) => ref.contestId === contestId && ref.index === wanted)
     ) {
-      matches.push(index);
+      direct.push(index);
     }
   }
-  const start = matches[0];
+  const selected =
+    direct.length > 0
+      ? { matches: direct, sectionKey: requestedKey, aliasMethod: null }
+      : selectAliasSection(blocks, aliasTargets);
+  const start = selected.matches[0];
   if (start === undefined) {
     return {
       ok: false,
       reason: 'missing',
-      detail: `the blog has no heading that names problem ${label}`,
+      detail: `the blog has no heading that names problem ${label}${
+        aliasTargets.length > 0 ? ' and no heading matches a verified shared-round alias' : ''
+      }`,
       sample,
       headings,
     };
   }
-  if (matches.length > 1) {
+  if (selected.matches.length > 1) {
     return {
       ok: false,
       reason: 'ambiguous',
-      detail: `${matches.length} headings name problem ${label}`,
+      detail:
+        selected.aliasMethod === null
+          ? `${selected.matches.length} headings name problem ${label}`
+          : `${selected.matches.length} headings match the alias section ${selected.sectionKey}`,
       sample,
       headings,
     };
@@ -502,7 +645,7 @@ export function extractEditorialSection(html: string, target: EditorialTarget): 
     return {
       ok: false,
       reason: 'empty',
-      detail: `the section heading for problem ${label} has no body text`,
+      detail: `the section heading for problem ${selected.sectionKey} has no body text`,
       sample,
       headings,
     };
@@ -512,5 +655,59 @@ export function extractEditorialSection(html: string, target: EditorialTarget): 
     text: normalizePlainText([startBlock.text, ...bodyTexts].join('\n\n')),
     headingText: startBlock.text,
     matchedReferences: startBlock.refs.map((ref) => referenceLabel(ref)),
+    sectionKey: selected.sectionKey,
+    aliasMethod: selected.aliasMethod,
+  };
+}
+
+/** One resolved section: the block indices that match plus the key they actually belong to. */
+interface SelectedSection {
+  readonly matches: readonly number[];
+  readonly sectionKey: string;
+  readonly aliasMethod: 'explicit_reference' | 'official_division_pair' | null;
+}
+
+/**
+ * Resolve the section through an already-verified alias list, or report no match.
+ *
+ * A block qualifies only when its normalized relative-division spelling is one the alias carries, and
+ * the alias carries only spellings the adapter derived from *verified* contest metadata. The
+ * extractor therefore compares strings; it never decides which contest a division is, and it can
+ * never widen the search beyond the aliases it was handed. Blocks that merely *contain* an absolute
+ * reference to the section problem are not matched here — those are the requested problem's business,
+ * and treating them as a section start would let an unrelated mention split the blog.
+ */
+function selectAliasSection(
+  blocks: readonly Block[],
+  aliasTargets: readonly CfEditorialSectionTarget[],
+): SelectedSection {
+  if (aliasTargets.length === 0) {
+    return { matches: [], sectionKey: '', aliasMethod: null };
+  }
+  const matches: number[] = [];
+  const keys = new Set<string>();
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index];
+    if (block === undefined || block.divisionHeadings.length === 0) {
+      continue;
+    }
+    const matched = aliasTargets.filter((alias) =>
+      block.divisionHeadings.some((heading) => headingSelectsTarget(heading, alias)),
+    );
+    if (matched.length === 0) {
+      continue;
+    }
+    // A heading that resolves to more than one alias is not a unique section: the caller reports
+    // `ambiguous` instead of picking one.
+    matches.push(index);
+    for (const alias of matched) {
+      keys.add(alias.externalKey);
+    }
+  }
+  const only = keys.size === 1 ? [...keys][0] : undefined;
+  return {
+    matches,
+    sectionKey: only ?? (keys.size === 0 ? '' : [...keys].join(',')),
+    aliasMethod: matches.length === 0 ? null : 'official_division_pair',
   };
 }

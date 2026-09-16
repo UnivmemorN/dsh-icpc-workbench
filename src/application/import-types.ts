@@ -26,6 +26,7 @@ import {
   type Submission,
 } from '../domain/index.js';
 import type { PlatformError } from './platform-errors.js';
+import type { MirrorEditorialPort, MirrorEditorialSkipReason } from './cf-mirror-editorial.js';
 import type {
   EditorialFetchResult,
   ListProblemsRequest,
@@ -411,6 +412,31 @@ export interface SyncPageReport {
 // Material refresh
 // ---------------------------------------------------------------------------------------
 
+/**
+ * Outcome of the exact Codeforces-mirror editorial reuse (Sprint 33B).
+ *
+ * It is a separate member of the report rather than a `skippedReason` of the ordinary editorial
+ * path, so the two facts stay distinguishable: `editorial` describes what the target's *own*
+ * platform answered, while `mirror` describes whether the equivalent Codeforces problem was
+ * consulted at all. `key` is the derived Codeforces identifier (public platform metadata, never a
+ * body), so a caller can say which problem the reuse was based on.
+ */
+export interface MirrorEditorialOutcome {
+  /** `skipped` means no Codeforces request was made; `fetched` means one was made and answered. */
+  readonly status: 'skipped' | 'fetched';
+  /**
+   * Why no request was made. `null` when one was.
+   *
+   * `mirror_not_applicable` is the identity rule refusing the pair (a Codeforces target, a gym set,
+   * a `domain`, a non-official instance, a non-canonical spelling); `existing_editorial_reusable`
+   * is usable material already being stored for the target; `cf_source_unavailable` is a
+   * composition without a usable Codeforces adapter.
+   */
+  readonly skippedReason: MirrorEditorialSkipReason | null;
+  /** Derived Codeforces external key (`<contest><index>`), or `null` when the rule did not apply. */
+  readonly key: string | null;
+}
+
 export interface RefreshMaterialRequest {
   readonly problemRef: ProblemRef;
   /** Fetch the full problem detail/statement in addition to the editorial material. */
@@ -421,6 +447,31 @@ export interface RefreshMaterialRequest {
    * accepted and it becomes the attribution of a non-found record.
    */
   readonly officialTutorialUrl?: string | null;
+  /**
+   * Explicit Codeforces-mirror reuse (Sprint 33B).
+   *
+   * It is opt-in, so no existing caller changes behaviour: an automatic history sync, a manual
+   * import and an ordinary refresh never consult another site. When enabled, the target's own
+   * reference must satisfy the domain's exact `luogu_cf_identifier` rule; the Codeforces problem is
+   * derived from that identity, never from a caller parameter, and only the *editorial* is borrowed
+   * (the statement still comes from the target's own adapter).
+   */
+  readonly mirrorEditorial?: MirrorEditorialPort | null;
+  /**
+   * Reuse an already usable stored editorial instead of consulting the equivalent problem. Defaults
+   * to `true`: a valid user-provided answer or an already imported tutorial wins over a new
+   * Codeforces request.
+   */
+  readonly reuseExistingEditorial?: boolean;
+  /**
+   * Account whose authenticated session may be used for the editorial read (Sprint 33C).
+   *
+   * A platform that publishes solution material only to a signed-in reader needs to know whose
+   * session to use, and the account must belong to the adapter's own source instance — the adapter
+   * re-checks that. `null`/absent leaves the read anonymous, which is what every existing caller
+   * does and which can never report an absence.
+   */
+  readonly account?: Account | null;
   readonly token: CancellationToken;
   readonly limits: PlatformLimits;
 }
@@ -444,6 +495,9 @@ export interface EditorialRefreshOutcome {
   /**
    * Set when no request was made because the problem has no stored metadata: a snapshot
    * cannot be built without a real problem, and the service never invents one.
+   *
+   * The equivalent-problem reuse has its own reason and its own member
+   * ({@link RefreshMaterialReport.mirror}); it never overloads this one.
    */
   readonly skippedReason: 'problem_metadata_missing' | null;
 }
@@ -454,6 +508,8 @@ export interface RefreshMaterialReport {
   readonly problem: NormalizedProblem | null;
   readonly statement: StatementRefreshOutcome;
   readonly editorial: EditorialRefreshOutcome;
+  /** Whether the equivalent Codeforces problem was consulted, and if not, why. */
+  readonly mirror: MirrorEditorialOutcome;
   /** Editorial merge outcome; null when no editorial request was made. */
   readonly material: MaterialReport | null;
   /** Committed snapshot; null when there was nothing to persist. */

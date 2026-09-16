@@ -31,8 +31,11 @@ import {
   createSourceInstance,
   createTaxonomyIndex,
   problemKey,
+  type Account,
+  type ProblemRef,
   type SourceInstance,
 } from '../../src/domain/index.js';
+import { CF_MIRROR_EDITORIAL_RULE_TAG } from '../../src/application/cf-mirror-editorial.js';
 import { API_PREFIX, type ApiEnvelope, type ApiErrorBody } from '../../src/plugin/api-transport.js';
 import {
   registerBusinessApi,
@@ -637,6 +640,38 @@ void test('material.supplement records an explicit absence only with its note', 
   });
 });
 
+void test('an explicit absence stores the user note exactly once, not twice', async () => {
+  // The absent declaration carries one user input as both the declaration note and the result detail,
+  // and the merge joins declaration and detail with " | ". Storing that verbatim duplicated the sentence
+  // ("X | X"); the stored evidence — read back from the real database, not from the response projection —
+  // must hold the user's sentence once.
+  const scope = fx.makeScope('codeforces', 'codeforces.com', 'alice', '1234A');
+  const note = '已核实没有题解：官方题解列表为空';
+  await withBench({ sources: [{ instance: scope.instance }] }, async (bench) => {
+    await seedScope(bench.store, scope);
+
+    const absent = await ok(bench, 'material.supplement', {
+      problemKey: scope.problem.key,
+      expectedSnapshotId: null,
+      editorial: { status: 'absent', url: 'https://codeforces.com/blog/entry/1', title: 'Blog', note },
+    });
+    assert.equal(absent.material.outcome, 'applied');
+    assert.equal(absent.material.availability, 'absent');
+
+    const head = await bench.store.getCurrentSnapshotHead(scope.problem.ref);
+    assert.ok(head);
+    const snapshot = await bench.store.getSnapshot(head.snapshotId);
+    assert.ok(snapshot);
+    assert.equal(snapshot.sources.length, 1);
+    const source = snapshot.sources[0];
+    assert.ok(source);
+    assert.equal(source.availability, 'absent');
+    assert.equal(source.note, note, 'the declaration note is stored exactly once');
+    assert.equal(source.note?.includes(' | '), false, 'one sentence is not joined with itself');
+    assert.equal(snapshot.solutions.length, 0);
+  });
+});
+
 // ---------------------------------------------------------------------------------------
 // material.supplement — user-provided answers (Sprint 12)
 // ---------------------------------------------------------------------------------------
@@ -977,6 +1012,9 @@ void test('material.refresh answers a recursively redacted DTO and separates fai
     assert.equal(value.editorial.solutionCount, 1);
     assert.equal(value.material.freshFound, true);
     assert.equal(value.snapshot.version, 1);
+    // A Codeforces problem is not a Luogu mirror, so the equivalent-problem member is a skip and the
+    // answer carries no reuse claim at all.
+    assert.deepEqual(value.mirror, { status: 'skipped', skippedReason: 'mirror_not_applicable', key: null });
 
     const text = JSON.stringify(value);
     assert.equal(text.includes(SECRET), false, 'no fetched statement or solution body may travel');
@@ -1005,6 +1043,173 @@ void test('material.refresh answers a recursively redacted DTO and separates fai
     const missing = await refused(bench, 'material.refresh', { problemKey: unknownKey, fetchStatement: false }, 404);
     assert.equal(failureOf(missing).code, 'not_found');
   });
+});
+
+void test('material.refresh reuses the exact equivalent Codeforces editorial for a Luogu mirror, server-side', async () => {
+  // The Luogu record of Codeforces problem 1900A: the only pairing the identity rule recognizes.
+  const luogu = fx.makeScope('luogu', 'www.luogu.com.cn', 'alice', 'CF1900A');
+  const editorialUrl = 'https://codeforces.com/blog/entry/12345';
+  const cfSource = createEditorialSource({
+    id: 'cf-blog-12345',
+    kind: 'editorial',
+    url: editorialUrl,
+    title: 'Codeforces Round editorial',
+    availability: 'found',
+    retrievedAt: AT,
+    text: `the official tutorial uses a sparse table ${SECRET}`,
+    note: 'section 1900A of blog 12345',
+  });
+  const cfSolution = createEditorialSolution({
+    solutionId: 'cf-blog-12345-1900A',
+    sourceId: cfSource.id,
+    ordinal: 0,
+    title: '1900A',
+    text: `the official tutorial uses a sparse table ${SECRET}`,
+  });
+  const cfRequests: { readonly problemRef: ProblemRef }[] = [];
+  const cfAdapter = fakeAdapter(CF, {
+    fetchEditorial: async (request) => {
+      cfRequests.push({ problemRef: request.problemRef });
+      return { status: 'found', sources: [cfSource], solutions: [cfSolution], retrievedAt: AT };
+    },
+  });
+  const luoguAdapter = fakeAdapter(LG, {
+    // The statement still comes from Luogu; Luogu must never be asked for the editorial here.
+    fetchProblem: async (request) =>
+      createNormalizedProblem({
+        ref: request.problemRef,
+        title: '洛谷镜像题',
+        url: 'https://www.luogu.com.cn/problem/CF1900A',
+        statement: `洛谷题面 ${SECRET}`,
+        fetchedAt: AT,
+        ratings: [],
+        rawTags: [RAW_TAG_SENTINEL],
+      }),
+    fetchEditorial: async () => {
+      throw new Error('the Luogu adapter must not be asked for an editorial of a mirror');
+    },
+  });
+  await withBench(
+    {
+      sources: [{ instance: CF }, { instance: LG }],
+      adapter: (instance) => (instance.platform === 'codeforces' ? cfAdapter : luoguAdapter),
+    },
+    async (bench) => {
+      await seedScope(bench.store, luogu);
+
+      const value = await ok(bench, 'material.refresh', { problemKey: luogu.problem.key, fetchStatement: true });
+      // The reuse happened and names the derived Codeforces problem; the caller supplied no number.
+      assert.deepEqual(value.mirror, { status: 'fetched', skippedReason: null, key: '1900A' });
+      assert.equal(value.statement.status, 'fetched');
+      assert.equal(value.editorial.status, 'found');
+      assert.equal(value.editorial.sourceCount, 1);
+      // The Codeforces adapter was asked for exactly the equivalent problem on the official instance.
+      assert.deepEqual(cfRequests, [
+        { problemRef: { sourceInstanceId: CF.id, domain: null, externalKey: '1900A' } },
+      ]);
+
+      // The stored source keeps the official blog URL and records the mapping provenance.
+      const stored = await bench.store.getCurrentSnapshotHead(luogu.problem.ref);
+      const snapshot = await bench.store.getSnapshot(stored?.snapshotId ?? '');
+      const source = snapshot?.sources.find((entry) => entry.id === 'cf-blog-12345');
+      assert.ok(source, 'the Codeforces editorial source must be stored against the Luogu problem');
+      assert.equal(source.url, editorialUrl);
+      assert.ok(source.note?.includes(CF_MIRROR_EDITORIAL_RULE_TAG), 'the mapping source must be recorded');
+      assert.ok(source.note?.includes('1900A'), 'the note must name the equivalent problem');
+
+      // The DTO is still redacted: no statement, no solution body, no blog URL, no provenance note.
+      const text = JSON.stringify(value);
+      for (const leak of [SECRET, RAW_TAG_SENTINEL, 'sparse table', editorialUrl, 'cf-blog-12345', CF_MIRROR_EDITORIAL_RULE_TAG]) {
+        assert.equal(text.includes(leak), false, `the answer must not carry ${leak}`);
+      }
+    },
+  );
+});
+
+void test('material.refresh reads authenticated material through the account the caller selected', async () => {
+  // A Luogu problem whose solution material only a signed-in reader can see. The request names the
+  // caller's selected account; the plugin resolves it, proves it belongs to the problem's own source
+  // instance, and hands it to the adapter. Nothing about the account is taken from free text.
+  const luogu = fx.makeScope('luogu', 'www.luogu.com.cn', '123456', 'P1001');
+  // A stored Codeforces account of a different source instance, so the refusal is about the source
+  // mismatch rather than about a missing row.
+  const cfAccount: Account = {
+    id: accountIdOf(CF.id, 'alice'),
+    sourceInstanceId: CF.id,
+    handle: 'alice',
+    displayName: 'Alice',
+    profileUrl: null,
+  };
+  const seen: { readonly accountId: string | null; readonly problemKey: string }[] = [];
+  const luoguAdapter = fakeAdapter(luogu.instance, {
+    capabilities: { editorial: true },
+    fetchEditorial: async (request) => {
+      seen.push({ accountId: request.account?.id ?? null, problemKey: request.problemRef.externalKey });
+      const source = createEditorialSource({
+        id: 'luogu-solutions-P1001',
+        kind: 'solution',
+        url: 'https://www.luogu.com.cn/problem/solution/P1001',
+        title: 'Luogu solutions for P1001',
+        availability: 'found',
+        retrievedAt: AT,
+        text: 'lid-1\tPLACEHOLDER_TITLE',
+      });
+      const solution = createEditorialSolution({
+        solutionId: 'luogu-solution-lid-1',
+        sourceId: source.id,
+        ordinal: 0,
+        title: 'PLACEHOLDER_TITLE',
+        text: `the signed-in solution body ${SECRET}`,
+      });
+      return { status: 'found', sources: [source], solutions: [solution], retrievedAt: AT };
+    },
+  });
+  await withBench(
+    { sources: [{ instance: luogu.instance }], adapter: () => luoguAdapter },
+    async (bench) => {
+      await seedScope(bench.store, luogu);
+      await bench.store.upsertAccounts([cfAccount]);
+
+      const value = await ok(bench, 'material.refresh', {
+        problemKey: luogu.problem.key,
+        fetchStatement: false,
+        accountId: luogu.account.id,
+      });
+      assert.equal(value.editorial.status, 'found');
+      assert.equal(value.editorial.sourceCount, 1);
+      assert.equal(value.editorial.solutionCount, 1);
+      assert.equal(value.material.freshFound, true);
+      // The adapter received exactly the selected account, and the stored body is redacted from the DTO.
+      assert.deepEqual(seen, [{ accountId: luogu.account.id, problemKey: 'P1001' }]);
+      assert.equal(JSON.stringify(value).includes(SECRET), false);
+
+      // The material really landed in the snapshot the analysis will read.
+      const head = await bench.store.getCurrentSnapshotHead(luogu.problem.ref);
+      const snapshot = await bench.store.getSnapshot(head?.snapshotId ?? '');
+      assert.equal(snapshot?.solutions[0]?.solutionId, 'luogu-solution-lid-1');
+      assert.match(snapshot?.solutions[0]?.text ?? '', /signed-in solution body/u);
+
+      // An account of another source instance can never authenticate this problem's read.
+      const foreign = await refused(
+        bench,
+        'material.refresh',
+        { problemKey: luogu.problem.key, fetchStatement: false, accountId: cfAccount.id },
+        404,
+      );
+      assert.equal(failureOf(foreign).code, 'not_found');
+
+      // An unknown account id is a not-found, never a silent anonymous read.
+      const unknown = await refused(
+        bench,
+        'material.refresh',
+        { problemKey: luogu.problem.key, fetchStatement: false, accountId: 'luogu:www.luogu.com.cn|999999' },
+        404,
+      );
+      assert.equal(failureOf(unknown).code, 'not_found');
+      // Neither refusal reached the adapter.
+      assert.equal(seen.length, 1);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------------------

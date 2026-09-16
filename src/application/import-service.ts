@@ -73,8 +73,15 @@ import {
   type SourceInstance,
   type Submission,
 } from '../domain/index.js';
-import { describePlatformError, editorialFailureFromPlatformError } from './platform-errors.js';
-import type { EditorialFetchResult, Page, PlatformAdapter, ProblemMetadataSource, TrainingStore } from './ports.js';
+import { PlatformError, describePlatformError, editorialFailureFromPlatformError } from './platform-errors.js';
+import type {
+  EditorialFetchResult,
+  Page,
+  PlatformAdapter,
+  PlatformLimits,
+  ProblemMetadataSource,
+  TrainingStore,
+} from './ports.js';
 import type { SyncCheckpoint, SyncCheckpointRef } from './storage-types.js';
 import {
   IMPORT_PAGE_LIMITS,
@@ -88,6 +95,7 @@ import {
   type ManualMaterialInput,
   type MaterialOutcome,
   type MaterialReport,
+  type MirrorEditorialOutcome,
   type ProblemPageCounts,
   type RefreshMaterialReport,
   type RefreshMaterialRequest,
@@ -104,6 +112,13 @@ import {
   type SyncPageRequest,
   type SyncPageSource,
 } from './import-types.js';
+import {
+  selectMirrorEditorial,
+  withMirrorProvenance,
+  type MirrorEditorialPort,
+  type MirrorEditorialRequest,
+  type MirrorEditorialSelection,
+} from './cf-mirror-editorial.js';
 
 export interface ImportServiceOptions {
   readonly store: TrainingStore;
@@ -652,6 +667,14 @@ export class ImportService {
    * reported without discarding good cached material. Nothing is fetched inside the commit
    * transaction, and material fetched against a snapshot head that changed in the meantime is
    * rejected instead of overwriting newer content.
+   *
+   * The **statement always comes from the target's own adapter**. When the request enables
+   * {@link RefreshMaterialRequest.mirrorEditorial} and the target's stored reference satisfies the
+   * domain's exact `luogu_cf_identifier` rule while no usable editorial is stored yet, the
+   * *editorial* is fetched from the equivalent Codeforces problem through the injected port instead.
+   * The equivalence, the derived Codeforces reference and the provenance note all come from
+   * {@link selectMirrorEditorial}/{@link withMirrorProvenance}; a Codeforces failure is merged as a
+   * non-`found` check and is never rewritten as an absence.
    */
   async refreshMaterial(adapter: PlatformAdapter, request: RefreshMaterialRequest): Promise<RefreshMaterialReport> {
     const token = request.token;
@@ -680,6 +703,7 @@ export class ImportService {
     throwIfCancelled(token);
     const storedBefore = await this.store.getProblem(key);
     throwIfCancelled(token);
+    const previousSnapshot = await this.readCurrentSnapshot(problemRef, token);
 
     let statement: StatementRefreshOutcome = { status: 'not_requested', fetchedProblem: null, error: null };
     if (request.fetchStatement) {
@@ -707,30 +731,41 @@ export class ImportService {
         problem: null,
         statement,
         editorial: { attempted: false, result: null, error: null, skippedReason: 'problem_metadata_missing' },
+        mirror: { status: 'skipped', skippedReason: 'mirror_not_applicable', key: null },
         material: null,
         snapshot: null,
       };
     }
 
-    let editorialResult: EditorialFetchResult;
-    let editorial: EditorialRefreshOutcome;
-    try {
-      editorialResult = await adapter.fetchEditorial({
-        problemRef,
-        token,
-        limits: request.limits,
-        officialTutorialUrl,
-      });
-      throwIfCancelled(token);
-      editorial = { attempted: true, result: editorialResult, error: null, skippedReason: null };
-    } catch (error) {
-      const failure = describePlatformError(error, 'editorial');
-      if (failure.code === 'cancelled' || failure.code === 'invalid_input') {
-        throw failure;
-      }
-      editorialResult = editorialFailureFromPlatformError(failure);
-      editorial = { attempted: true, result: editorialResult, error: failure, skippedReason: null };
-    }
+    // The mirror path is one-directional and never overrides the statement's own source: a caller
+    // that named the target's official tutorial keeps it, so only an *unattributed* editorial fetch
+    // can be redirected to the equivalent problem.
+    const selection =
+      officialTutorialUrl !== null
+        ? ({ kind: 'skip', reason: 'mirror_not_applicable' } as const)
+        : selectMirrorEditorial({
+            target: problemRef,
+            previous: previousSnapshot,
+            hasMirrorPort: request.mirrorEditorial !== undefined && request.mirrorEditorial !== null,
+            reuseExisting: request.reuseExistingEditorial !== false,
+          });
+
+    // Exactly one editorial request happens: the equivalent Codeforces problem when the identity
+    // rule and the stored material allow it, otherwise the target's own adapter as before. The
+    // caller's account travels with it so a platform that needs a session can use one; the adapter
+    // re-checks that the account belongs to its own source instance.
+    const fetched =
+      selection.kind === 'use'
+        ? await this.fetchMirrorMaterial(request.mirrorEditorial ?? null, selection.request, request.limits, token)
+        : await this.fetchOwnEditorial(adapter, problemRef, request.limits, officialTutorialUrl, token, request.account ?? null);
+    const editorialResult = fetched.result;
+    const editorial: EditorialRefreshOutcome = {
+      attempted: true,
+      result: editorialResult,
+      error: fetched.error,
+      skippedReason: null,
+    };
+    const mirror = mirrorOutcomeOf(selection);
 
     const retrievedAt = assertIsoTimestamp('retrievedAt', this.now());
     const committed = await this.store.transaction(async () => {
@@ -784,9 +819,108 @@ export class ImportService {
       problem: committed.problem,
       statement,
       editorial,
+      mirror,
       material: committed.material,
       snapshot: committed.snapshot,
     };
+  }
+
+  /**
+   * Fetch the editorial from the target's own adapter.
+   *
+   * A thrown platform error is converted instead of propagating, so a refused or broken request is
+   * reported as material state; a cancelled or malformed request is rethrown because it is the
+   * caller's own failure, not a platform observation. The optional account is what lets a platform
+   * that only answers a signed-in reader use a session at all.
+   */
+  private async fetchOwnEditorial(
+    adapter: PlatformAdapter,
+    problemRef: ProblemRef,
+    limits: PlatformLimits,
+    officialTutorialUrl: string | null,
+    token: CancellationToken,
+    account: Account | null,
+  ): Promise<{ readonly result: EditorialFetchResult; readonly error: PlatformError | null }> {
+    try {
+      const result = await adapter.fetchEditorial({
+        problemRef,
+        token,
+        limits,
+        officialTutorialUrl,
+        ...(account === null ? {} : { account }),
+      });
+      throwIfCancelled(token);
+      return { result, error: null };
+    } catch (error) {
+      const failure = describePlatformError(error, 'editorial');
+      if (failure.code === 'cancelled' || failure.code === 'invalid_input') {
+        throw failure;
+      }
+      return { result: editorialFailureFromPlatformError(failure), error: failure };
+    }
+  }
+
+  /**
+   * Fetch one equivalent Codeforces problem's editorial through the injected orchestration port.
+   *
+   * The port is asked for the reference the identity rule derived, and the answer is stamped with
+   * its mapping provenance before it is merged. A `found` answer whose sources are all unusable (an
+   * empty source list, a source carrying no write-up) is demoted to an explicit `unavailable`
+   * failure rather than being stored as fresh material the analysis could not use — that keeps the
+   * "reused material is real material" promise true.
+   */
+  private async fetchMirrorMaterial(
+    port: MirrorEditorialPort | null,
+    request: MirrorEditorialRequest,
+    limits: PlatformLimits,
+    token: CancellationToken,
+  ): Promise<{ readonly result: EditorialFetchResult; readonly error: PlatformError | null }> {
+    if (port === null) {
+      // Selection already refused a missing port; reaching this is a programming error, and
+      // inventing a fetch would hide it.
+      throw new DomainError('unfilled_settings', 'the mirror editorial port is not available', {
+        reason: 'mirror_port_missing',
+      });
+    }
+    let raw: EditorialFetchResult;
+    try {
+      raw = await port.fetchMirrorEditorial({
+        cfRef: request.cfRef,
+        target: request.luoguRef,
+        identity: request.identity,
+        token,
+        limits,
+      });
+    } catch (error) {
+      // A caller cancellation is the caller's own failure, not a platform observation, so it is
+      // rethrown as the cancellation it is instead of being filed as material state.
+      if (token.cancelled) {
+        throw new DomainError('cancelled', 'the material refresh was cancelled while the equivalent problem was fetched', {
+          problemKey: problemKey(request.luoguRef),
+        });
+      }
+      const failure = describePlatformError(error, 'editorial');
+      if (failure.code === 'cancelled' || failure.code === 'invalid_input') {
+        throw failure;
+      }
+      return { result: editorialFailureFromPlatformError(failure), error: failure };
+    }
+    // The same checkpoint outside the catch: a cancellation that landed while the answer arrived
+    // must refuse the write rather than being recorded as an operational failure.
+    throwIfCancelled(token);
+    const stamped = withMirrorProvenance(raw, request.identity);
+    if (stamped.status === 'found' && !mirrorMaterialIsUsable(stamped)) {
+      const failure = new PlatformError({
+        code: 'changed_response',
+        operation: 'editorial',
+        retryable: false,
+        detail: 'the equivalent Codeforces editorial carried no usable solution body',
+      });
+      return { result: editorialFailureFromPlatformError(failure), error: failure };
+    }
+    // The identity that justified the fetch travels with a non-`found` answer too, so the stored
+    // check record says which equivalent problem produced it and that absence was not concluded.
+    return { result: withMirrorCheckContext(stamped, request), error: null };
   }
 
   /**
@@ -1757,19 +1891,34 @@ function mergeEditorialMaterial(args: EditorialMergeArgs): EditorialMergeResult 
   };
 }
 
-/** Human-readable note of a non-`found` check: declaration note, sanitized detail, retry hint. */
+/**
+ * Human-readable note of a non-`found` check: declaration note, sanitized detail, retry hint.
+ *
+ * The two text fragments come from different layers and may legitimately be the *same* sentence: an
+ * explicit `absent` declaration carries one user input as both the declaration note and the result
+ * detail (the API cannot know they are equal), and joining them verbatim would store one sentence twice.
+ * Fragments that are identical after trimming are therefore kept once; distinct fragments keep their
+ * order (declaration, then detail), and the declared rate-limit hint is always appended because it is a
+ * separate fact, not a repeat of either text.
+ */
 function materialNote(
   result: Exclude<EditorialFetchResult, { status: 'found' }>,
   attributionNote: string | null,
 ): string | null {
   const parts: string[] = [];
-  const declared = attributionNote === null ? '' : attributionNote.trim();
-  if (declared.length > 0) {
-    parts.push(declared);
+  const seen = new Set<string>();
+  const push = (value: string): void => {
+    const trimmed = value.trim();
+    if (trimmed.length === 0 || seen.has(trimmed)) {
+      return;
+    }
+    seen.add(trimmed);
+    parts.push(trimmed);
+  };
+  if (attributionNote !== null) {
+    push(attributionNote);
   }
-  if (result.detail.trim().length > 0) {
-    parts.push(result.detail.trim());
-  }
+  push(result.detail);
   if (result.status === 'rate_limited' && result.retryAfterMs !== null) {
     parts.push(`retry after ${result.retryAfterMs} ms`);
   }
@@ -1786,6 +1935,54 @@ function materialReport(
   solutions: number,
 ): MaterialReport {
   return { problemKey: problemKeyValue, outcome, availability, freshFound, staleCachedAvailability, sources, solutions };
+}
+
+/**
+ * Whether a `found` equivalent-problem answer is material the analysis pipeline could actually use.
+ *
+ * It applies the same rule the pipeline applies to a stored snapshot (a `found` source with a
+ * referenced, non-blank body), so "reuse succeeded" can never mean "a source row was written that
+ * still leaves the problem unanalysable".
+ */
+function mirrorMaterialIsUsable(
+  result: Extract<EditorialFetchResult, { readonly status: 'found' }>,
+): boolean {
+  return result.sources.some(
+    (source) =>
+      source.availability === 'found' &&
+      result.solutions.some((solution) => solution.sourceId === source.id && solution.text.trim().length > 0),
+  );
+}
+
+/**
+ * Record the equivalence on a non-`found` equivalent-problem answer.
+ *
+ * The answer keeps its own availability — this function only ever *adds* context to the detail, so an
+ * `unavailable`, `rate_limited`, `changed_response`, `auth_required` or `forbidden` observation stays
+ * exactly that and can never become an absence. The added text names the equivalent problem the
+ * answer belongs to, so the stored material check is self-describing.
+ */
+function withMirrorCheckContext(
+  result: EditorialFetchResult,
+  request: MirrorEditorialRequest,
+): EditorialFetchResult {
+  if (result.status === 'found') {
+    return result;
+  }
+  const context =
+    `equivalent Codeforces problem ${request.identity.cfExternalKey} ` +
+    `(official Luogu mirror ${request.identity.luoguExternalKey})`;
+  return { ...result, detail: `${result.detail} | ${context}` };
+}
+
+/** The mirror member of the report: what was decided, and (for a fetch) which problem it named. */
+function mirrorOutcomeOf(selection: MirrorEditorialSelection): MirrorEditorialOutcome {
+  if (selection.kind === 'skip') {
+    return { status: 'skipped', skippedReason: selection.reason, key: null };
+  }
+  // A `fetched` mirror always names the derived Codeforces key, whatever the answer was: the point
+  // of the member is which equivalent problem was consulted, not what it said.
+  return { status: 'fetched', skippedReason: null, key: selection.request.identity.cfExternalKey };
 }
 
 function sortSources(sources: readonly EditorialSource[]): EditorialSource[] {

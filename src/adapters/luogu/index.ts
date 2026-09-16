@@ -73,6 +73,25 @@ export {
 } from './problem-session-reader.js';
 
 export {
+  LENTILLE_CONTEXT_ELEMENT_ID,
+  MAX_EDITORIAL_LID_CHARS,
+  MAX_EDITORIAL_PAGE_SIZE,
+  MAX_EDITORIAL_WRITE_UPS,
+  MAX_SOLUTION_INDEX_CHARS,
+  SOLUTION_LIST_URL_PREFIX,
+  buildEditorialMaterial,
+  lentilleContextPayload,
+  parseLuoguEditorialPage,
+  parseLuoguEditorialPayload,
+  type LuoguEditorialFailure,
+  type LuoguEditorialFailureKind,
+  type LuoguEditorialPage,
+  type LuoguEditorialPageResult,
+  type LuoguEditorialParseResult,
+  type ObservedSolution,
+} from './editorial-parser.js';
+
+export {
   LUOGU_PID_PATTERN,
   LUOGU_TAG_RAW_PREFIX,
   MAX_LUOGU_DISPLAY_NAME_CHARS,
@@ -107,6 +126,7 @@ export {
   type LuoguConnectionAdapterOptions,
   type LuoguConnectionStore,
   type LuoguReaderTransportOptions,
+  type LuoguStoredSubmissionsSource,
   type StoredLuoguSessionProviderOptions,
   type StoredSubmissionsSourceOptions,
 } from './connection.js';

@@ -112,6 +112,16 @@ export type ModelOperationErrorCode =
   | 'model_busy'
   | 'model_invalid'
   | 'history_overflow'
+  /**
+   * The selected material or a stored batch's material is not runnable (Sprint 33A).
+   *
+   * A start is refused with this code *before* any model availability probe, owned operation,
+   * attempt reservation or counter movement, so an old batch that references a blocked snapshot
+   * cannot dispatch a paid call — and refreshing the problem's material later cannot revive it,
+   * because the batch keeps referring to the immutable snapshot it captured. The caller has to
+   * refresh or supplement the material and prepare a **new** batch, which is what the UI says.
+   */
+  | 'materials_blocked'
   | 'cancelled'
   /**
    * The operation is intentionally not installed in this host composition. AI planning is optional
@@ -261,17 +271,31 @@ export interface ModelBatchRerunView {
 }
 
 /**
- * One selected problem that cannot be analysed yet because it has no material snapshot.
+ * One selected problem or unfinished job whose **current material is not runnable**.
  *
- * It is reported explicitly instead of silently dropping it or rejecting the whole selection:
- * no job is created and no model call is made for it, and the UI can offer the refresh action.
- * A metadata-only snapshot is deliberately **not** fabricated, because an empty snapshot would
- * claim that material was captured when nothing was.
+ * It is reported explicitly instead of silently dropping it, rejecting the whole selection or
+ * fabricating an empty snapshot: no job is created and no model call is made for it, so a blocked
+ * problem consumes no quota, writes no attempt and produces no audit record. A metadata-only
+ * snapshot is deliberately **not** fabricated, because an empty snapshot would claim that material
+ * was captured when nothing was.
+ *
+ * The reason is a stable code, never the classifier's English diagnostic: an unknown source set
+ * (`editorial_unknown`) is *not* an absence, a found source without body is not material a model may
+ * reason over, and an operational failure is never evidence that no editorial exists. The action is
+ * the one entry point that can fix it, and it either requests platform material
+ * (`refresh_materials`, no model call) or writes a locally provided body (`supplement_*`, no model
+ * call). Neither action may claim a platform editorial that was not retrieved.
  */
 export interface ModelBatchBlockedProblemView {
   readonly problemKey: string;
-  readonly reason: 'material_missing';
-  readonly action: 'refresh_materials';
+  readonly reason:
+    | 'material_missing'
+    | 'snapshot_unreadable'
+    | 'editorial_unknown'
+    | 'editorial_empty'
+    | 'source_unavailable'
+    | 'missing_statement';
+  readonly action: 'refresh_materials' | 'supplement_editorial' | 'supplement_statement';
 }
 
 /**
@@ -279,7 +303,9 @@ export interface ModelBatchBlockedProblemView {
  *
  * `ready` means a usable editorial exists, `absent` means every source explicitly reported absence
  * (the expensive reasoning role may run), and `error` groups everything that must not be treated as
- * absence — an operational source failure, a missing statement or an unknown source set.
+ * absence — an operational source failure, a missing statement, an unknown source set, a missing
+ * snapshot head and an unreadable snapshot body. `ready + absent + error` is the whole selection,
+ * and every non-`ready`/non-`absent` problem also appears in `blocked`.
  */
 export interface ModelBatchAvailabilitySummary {
   readonly ready: number;
@@ -293,15 +319,18 @@ export interface ModelBatchAvailabilitySummary {
  * This is the batch's own quota, not an estimate of what it will spend. Every dispatch — retries
  * included — reserves and counts against the batch limits, so `maxAnalysisCalls` (analysis plus
  * verification) and `maxReasoningCalls` are hard maxima; a batch without jobs is never run and is
- * bounded by zero.
+ * bounded by zero. `blocked` is the number of selected problems that were *not* turned into jobs
+ * because their material is not runnable; it is reported next to the bound so "20 selected" can
+ * never be read as "20 new tasks", and it contributes nothing to either maximum.
  */
 export interface ModelBatchCallUpperBound {
   readonly analysisCalls: number;
   readonly reasoningCalls: number;
+  readonly blocked: number;
 }
 
 export interface ModelBatchPrepareResult {
-  /** `null` when every requested job was already done, so no batch was created. */
+  /** `null` when no runnable job was produced, so no batch was created and nothing can be paid for. */
   readonly batchId: string | null;
   /** Revision of the settings record the batch captured; `null` for built-in defaults. */
   readonly settingsRevision: number | null;
@@ -315,7 +344,12 @@ export interface ModelBatchPrepareResult {
   readonly alreadyDone: readonly ModelBatchJobSummary[];
   /** Finished jobs this prepare replaced with a fresh run identity; old history is untouched. */
   readonly reruns: readonly ModelBatchRerunView[];
-  /** Selected problems with no material snapshot; never silently dropped, never paid for. */
+  /**
+   * Selected problems whose material is not runnable; never silently dropped, never paid for.
+   *
+   * A fresh material state produces a *new* snapshot, so a problem listed here has to be prepared
+   * again after refreshing or supplementing it: an old batch can never be repaired in place.
+   */
   readonly blocked: readonly ModelBatchBlockedProblemView[];
 }
 
@@ -401,6 +435,16 @@ export interface ModelBatchView {
   readonly counters: AnalysisBatchCounters;
   readonly uncertainAttempts: number;
   readonly lastErrorCode: string | null;
+  /**
+   * Read-only material preflight of this batch's **own** immutable snapshots.
+   *
+   * It is computed while the detail is projected and writes nothing: a batch stored by an earlier
+   * version may already reference a snapshot that cannot be analysed, and reporting that here is
+   * how the UI can disable "start"/"resume" before a paid call is attempted. Refreshing a problem's
+   * material produces a new snapshot and therefore never clears this list — the batch keeps the
+   * material it captured, so the only fix is a new free preparation of the refreshed problem.
+   */
+  readonly materialBlocks: readonly ModelBatchBlockedProblemView[];
   readonly jobs: readonly ModelBatchJobView[];
 }
 

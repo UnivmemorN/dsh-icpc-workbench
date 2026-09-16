@@ -36,6 +36,8 @@ export type ApiErrorCode =
   | 'invalid_input'
   | 'not_found'
   | 'conflict'
+  /** The stored batch references material that cannot be analysed; prepare a new batch instead. */
+  | 'materials_blocked'
   | 'payload_too_large'
   | 'unsupported_media_type'
   | 'timeout'
@@ -48,6 +50,7 @@ export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
   invalid_input: 400,
   not_found: 404,
   conflict: 409,
+  materials_blocked: 409,
   payload_too_large: 413,
   unsupported_media_type: 415,
   timeout: 408,
@@ -63,6 +66,7 @@ const DEFAULT_ERROR_MESSAGES: Readonly<Record<ApiErrorCode, string>> = {
   invalid_input: 'the request is invalid',
   not_found: 'the requested resource does not exist',
   conflict: 'the request conflicts with the current state',
+  materials_blocked: 'the stored batch references material that cannot be analysed; prepare a new batch',
   payload_too_large: `the request body exceeds the ${MAX_API_BODY_BYTES}-byte limit`,
   unsupported_media_type: 'the request body must be sent as application/json',
   timeout: 'the request did not complete in time',

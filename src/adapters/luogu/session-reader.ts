@@ -62,14 +62,17 @@
  */
 import {
   DEFAULT_PLATFORM_LIMITS,
+  type EditorialFetchResult,
   type ListSubmissionsRequest,
   type Page,
   type PlatformLimits,
 } from '../../application/ports.js';
 import type { LuoguSessionReader } from '../../application/luogu-session.js';
+import type { LuoguEditorialRequest } from '../../application/luogu-session.js';
 import {
   PLATFORM_ERROR_CODES,
   PlatformError,
+  editorialFailureFromPlatformError,
   isPlatformError,
   type PlatformErrorCode,
   type PlatformOperation,
@@ -82,6 +85,7 @@ import {
   type Account,
   type CancellationToken,
   type LuoguCookieProblem,
+  type ProblemRef,
   type SourceInstance,
   type Submission,
 } from '../../domain/index.js';
@@ -97,9 +101,17 @@ import {
   type SetTimerFn,
   type WaitFn,
 } from '../platform/http.js';
-import { LUOGU_BASE_URL, requireLuoguInstance } from './adapter.js';
+import { LUOGU_BASE_URL, isLuoguLoginPath, requireLuoguInstance } from './adapter.js';
 import { LUOGU_UID_PATTERN, requireLuoguUid } from './account.js';
 import { isHtmlResponse, isJsonRecord } from './parsers.js';
+import {
+  buildEditorialMaterial,
+  lentilleContextPayload,
+  parseLuoguEditorialPage,
+  type LuoguEditorialFailureKind,
+  type LuoguEditorialPage,
+  type ObservedSolution,
+} from './editorial-parser.js';
 import {
   decodeLuoguRecordCursor,
   encodeLuoguRecordCursor,
@@ -113,12 +125,25 @@ import { luoguStatusVerdict, parseRecordPage, type LuoguRecord, type LuoguRecord
 export const LUOGU_MIN_REQUEST_INTERVAL_MS = 2_000;
 /** Upper bound of one `listSubmissions` call; larger windows require cursor continuation. */
 export const LUOGU_MAX_SUBMISSION_LIMIT = 500;
+/**
+ * Fixed page ceiling of one editorial read.
+ *
+ * Every page is one authenticated request, so this bounds one read to a fixed number of requests. The
+ * observed P1001 answer needs six pages (`count` 56 at `perPage` 10) and no other observed answer needs
+ * more; a declared total that requires more pages is refused **whole** — the first page is read, then
+ * the read fails as `changed_response` — instead of returning a partial list of write-ups.
+ */
+export const LUOGU_MAX_EDITORIAL_PAGES = 20;
+/** Upper bound of the write-ups one editorial read will materialize; beyond it the read fails whole. */
+export const LUOGU_MAX_EDITORIAL_SOLUTIONS = 1_000;
+/** Upper bound of the retrieved body characters one editorial read will materialize. */
+export const LUOGU_MAX_EDITORIAL_CONTENT_CHARS = 4_000_000;
 
 const RECORD_LIST_PATH = '/record/list';
+/** The authenticated solution surface this reader addresses by problem id (Sprint 33C). */
+const SOLUTION_PATH_PREFIX = '/problem/solution/';
 const LENTILLE_HEADER = 'x-lentille-request';
 const LENTILLE_VALUE = 'content-only';
-/** Paths that mean "the session is gone" rather than "the shape changed". */
-const LOGIN_PATHS: ReadonlySet<string> = new Set(['/auth/login', '/login']);
 const MAX_LIMITS_VALUE = 600_000;
 const MAX_CONCURRENCY = 64;
 /** Canonical server page number of the internally built `/record/list?user=…&page=N` request. */
@@ -238,6 +263,66 @@ function normalizeRetryAfterMs(value: unknown): number | null {
  * The text is the shared `unavailable` wording and only a normalized finite non-negative
  * `retryAfterMs` may survive; the retryable flag follows the boundary, never the untrusted cause.
  */
+/**
+ * Stable operational code of one unreadable editorial payload.
+ *
+ * The mapping is total and closed, so a payload this build cannot read always becomes a code the
+ * caller already understands — and never `absent`. A `404` is `unavailable` (the observed capture
+ * says so explicitly), the authentication wall and a refusal keep their own codes, and every
+ * structural defect is `changed_response`.
+ */
+const EDITORIAL_FAILURE_CODES: Readonly<Record<LuoguEditorialFailureKind, PlatformErrorCode>> = {
+  not_an_object: 'changed_response',
+  envelope_unreadable: 'changed_response',
+  envelope_status: 'changed_response',
+  no_solutions_block: 'changed_response',
+  solutions_unreadable: 'changed_response',
+  count_unreadable: 'changed_response',
+  per_page_unreadable: 'changed_response',
+  count_result_mismatch: 'changed_response',
+  no_problem_block: 'changed_response',
+  problem_pid_mismatch: 'changed_response',
+  item_unreadable: 'changed_response',
+  lid_unreadable: 'changed_response',
+  content_truncated: 'changed_response',
+  empty_content: 'changed_response',
+  not_found: 'unavailable',
+  authentication_required: 'auth_required',
+  rate_limited: 'rate_limited',
+  server_error: 'unavailable',
+  refused: 'forbidden',
+};
+
+function editorialFailureCode(kind: LuoguEditorialFailureKind): PlatformErrorCode {
+  return EDITORIAL_FAILURE_CODES[kind];
+}
+
+/**
+ * The canonical problem id of one reference, validated against this instance.
+ *
+ * The id is what addresses the platform's solution surface, so it must be exactly the canonical
+ * external key of a main-problemset Luogu problem: a source instance that is not ours and a
+ * sub-domain are refused before any request, and the key must be the pid shape the platform uses.
+ * This mirrors the adapter's own check, because the reader is reachable through its port as well.
+ */
+function requireLuoguProblemId(ref: ProblemRef, instance: SourceInstance, operation: PlatformOperation): string {
+  if (!ref || typeof ref !== 'object') {
+    throw invalidInput(operation, 'a problem reference is required');
+  }
+  if (ref.sourceInstanceId !== instance.id) {
+    throw invalidInput(operation, 'the problem reference belongs to another source instance');
+  }
+  const domain = (ref.domain ?? '').trim().toLowerCase();
+  if (domain !== '' && domain !== instance.domain) {
+    throw invalidInput(operation, `Luogu problems have no sub-domain, got ${domain}`);
+  }
+  const raw = typeof ref.externalKey === 'string' ? ref.externalKey.trim() : '';
+  if (!/^[A-Za-z0-9_-]{1,80}$/u.test(raw)) {
+    throw invalidInput(operation, 'the problem id must be 1-80 alphanumeric, underscore or hyphen characters');
+  }
+  return raw;
+}
+
 function unknownFailure(
   operation: PlatformOperation,
   boundary: UnknownFailureBoundary,
@@ -451,7 +536,7 @@ function assertExpectedRecordTarget(url: string, expectedUid: string, expectedPa
       detail: 'the authenticated request target is not a valid URL',
     });
   }
-  if (LOGIN_PATHS.has(parsed.pathname)) {
+  if (isLuoguLoginPath(url)) {
     throw new PlatformError({
       code: 'auth_required',
       operation,
@@ -503,6 +588,97 @@ function assertExpectedRecordTarget(url: string, expectedUid: string, expectedPa
 }
 
 /**
+ * The one target the authenticated transport may currently address.
+ *
+ * The credential is the most sensitive value in this process, so it is attached only to a target the
+ * owning call has bound *by identity*: an exact record page of the account, or an exact solution page
+ * of one problem. `null` means no call owns the transport, and then no request is made at all — a
+ * caller that reaches the transport without a bound target cannot obtain a cookie.
+ */
+type SessionTarget =
+  | { readonly kind: 'record'; readonly page: number }
+  | { readonly kind: 'editorial'; readonly pid: string; readonly page: number };
+
+/**
+ * Refuse any target that is not the bound solution page of this problem.
+ *
+ * The same properties as {@link assertExpectedRecordTarget} hold: official origin only, no URL
+ * credentials and no non-default port, the exact official path, no fragment and nothing but the one
+ * canonical `page` parameter this call bound. The observed surface spells the first page with **no**
+ * query at all and every later page as `?page=N`, so the accepted query is exactly that:
+ *
+ * - page 1: an empty query string;
+ * - page `N > 1`: exactly one `page` parameter equal to the canonical decimal spelling of `N` — a
+ *   repeated `page`, a zero-padded spelling such as `page=02`, an additional parameter of any name, a
+ *   `+` or `%` spelling and a value that is not this call's own page are all refused before dispatch.
+ *
+ * The guard runs on **every** dispatch, the manual redirect hops included, so a redirect target that is
+ * not this call's own page can never receive the cookie either. A login path means the session is gone
+ * and is refused as such; every other deviation is an `unavailable` refusal that echoes nothing about
+ * the request (in particular not the query, which carries the page number).
+ */
+function assertExpectedEditorialTarget(url: string, expectedPid: string, expectedPage: number): void {
+  const operation: PlatformOperation = 'editorial';
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new PlatformError({
+      code: 'unavailable',
+      operation,
+      retryable: false,
+      detail: 'the authenticated request target is not a valid URL',
+    });
+  }
+  if (isLuoguLoginPath(url)) {
+    throw new PlatformError({
+      code: 'auth_required',
+      operation,
+      retryable: false,
+      detail: SAFE_FAILURE_DETAILS.auth_required,
+    });
+  }
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.origin !== LUOGU_BASE_URL ||
+    parsed.username.length > 0 ||
+    parsed.password.length > 0 ||
+    parsed.port.length > 0
+  ) {
+    throw new PlatformError({
+      code: 'unavailable',
+      operation,
+      retryable: false,
+      detail: 'refusing to attach a Luogu session to a target outside the official origin',
+    });
+  }
+  if (parsed.pathname !== `${SOLUTION_PATH_PREFIX}${encodeURIComponent(expectedPid)}`) {
+    throw new PlatformError({
+      code: 'unavailable',
+      operation,
+      retryable: false,
+      detail: 'refusing to attach a Luogu session outside the expected solution endpoint of this problem',
+    });
+  }
+  const pages = parsed.searchParams.getAll('page');
+  const extra = [...parsed.searchParams.keys()].filter((name) => name !== 'page');
+  const expectedQuery = expectedPage === 1 ? '' : `?page=${String(expectedPage)}`;
+  if (
+    parsed.hash.length > 0 ||
+    extra.length > 0 ||
+    parsed.search !== expectedQuery ||
+    (expectedPage > 1 && (pages.length !== 1 || pages[0] !== String(expectedPage)))
+  ) {
+    throw new PlatformError({
+      code: 'unavailable',
+      operation,
+      retryable: false,
+      detail: 'refusing an authenticated solution request that is not the expected page of this problem',
+    });
+  }
+}
+
+/**
  * Forward a response, replacing any failure of its body stream with a fixed sanitized error.
  *
  * The shared transport maps a non-typed body-read failure to `network failure: <message>`; that
@@ -538,13 +714,65 @@ function withSanitizedBody(response: FetchResponseLike, operation: PlatformOpera
   };
 }
 
+/**
+ * The one status whose body a read may interpret: every other status is the whole answer.
+ *
+ * See {@link emptyRefusalResponse}: the status decides, and a refusal body is never pulled, parsed or
+ * measured.
+ */
+const INTERPRETABLE_STATUS = 200;
+
+/**
+ * Best-effort teardown of a body a refusal's caller will never read.
+ *
+ * The response this replaces is a refusal, so its body is discarded without being pulled: no byte of it
+ * can then reach the byte cap (an oversized refusal body would otherwise change `401` into a payload
+ * failure), and a body stream that throws while being read can no longer replace the refusal's own
+ * typed code. Deferred and never awaited, exactly like the transport's own teardown, so a stream that
+ * refuses to cancel cannot hang the request.
+ */
+function discardRefusalBody(response: FetchResponseLike): void {
+  const body = response.body;
+  if (body === null) {
+    return;
+  }
+  void Promise.resolve()
+    .then(() => body.getReader().cancel())
+    .catch(() => undefined);
+}
+
+/**
+ * Replace a non-200 response with one whose body carries no content and no declared length.
+ *
+ * `content-length` is dropped on purpose: the transport checks it *before* it looks at the body, so
+ * forwarding the refusal's declared size would let an oversized refusal body raise a payload failure
+ * even though nothing is read. `location` and `retry-after` are kept, because the transport's redirect
+ * policy and retry metadata are part of the answer.
+ */
+function emptyRefusalResponse(response: FetchResponseLike): FetchResponseLike {
+  discardRefusalBody(response);
+  return {
+    status: response.status,
+    headers: {
+      get: (name: string): string | null => {
+        const lower = name.trim().toLowerCase();
+        if (lower === 'content-length') {
+          return null;
+        }
+        return response.headers.get(name);
+      },
+    },
+    body: null,
+  };
+}
+
 export interface AuthenticatedLuoguFetchOptions {
   /** Returns the currently bound session cookie, or `null` when no session is bound. */
   readonly cookie: () => string | null;
   /** Canonical UID of the account this transport serves; a request may address only this account. */
   readonly expectedUid: string;
-  /** Page the owning reader call is currently reading; `null` when no call owns the transport. */
-  readonly expectedPage: () => number | null;
+  /** Target the owning reader call is currently reading; `null` when no call owns the transport. */
+  readonly expectedTarget: () => SessionTarget | null;
   /** Underlying fetch; every call it receives already carries a validated cookie header. */
   readonly fetchImpl: FetchLike;
 }
@@ -553,14 +781,19 @@ export interface AuthenticatedLuoguFetchOptions {
  * Wrap a fetch implementation so it attaches the bound session cookie.
  *
  * This is the single place a Luogu credential becomes an outgoing header. Properties the tests pin
- * down: the cookie is attached only to the internally expected record page of one account (any
- * other origin, path, account, page, extra parameter or fragment is refused before dispatch, and a
+ * down: the cookie is attached only to the internally bound target of one account (any other origin,
+ * path, account, page, problem id, extra parameter or fragment is refused before dispatch, and a
  * login redirect becomes `auth_required` without a request being sent to it); a caller-supplied
  * `cookie` header is refused instead of merged; every failure from the underlying fetch — whose
  * message or typed detail may contain anything, including the cookie — is reconstructed with only
  * the validated code and retry metadata; `HttpTransport` still owns pacing, cancellation, timeout,
  * the byte cap and the same-origin-only manual redirect policy, so a cross-origin redirect target
  * is never fetched at all.
+ *
+ * **A non-200 answer is returned with an empty body, before the transport can read one.** The status is
+ * the whole answer for a refusal, so the body is discarded unread here — the earliest point in the
+ * stack — which is what makes `401` remain `auth_required` even when that body is oversized, is not
+ * JSON, or throws when read.
  */
 export function createAuthenticatedLuoguFetch(options: AuthenticatedLuoguFetchOptions): FetchLike {
   const operation: PlatformOperation = 'submissions';
@@ -573,11 +806,15 @@ export function createAuthenticatedLuoguFetch(options: AuthenticatedLuoguFetchOp
     if (typeof cookie !== 'string' || cookie.length === 0) {
       throw invalidInput(operation, 'no Luogu session is bound to this transport');
     }
-    const page = options.expectedPage();
-    if (typeof page !== 'number' || !Number.isInteger(page) || page < 1) {
-      throw invalidInput(operation, 'no record page is currently bound to this transport');
+    const target = options.expectedTarget();
+    if (target === null) {
+      throw invalidInput(operation, 'no target is currently bound to this transport');
     }
-    assertExpectedRecordTarget(url, expectedUid, page);
+    if (target.kind === 'record') {
+      assertExpectedRecordTarget(url, expectedUid, target.page);
+    } else {
+      assertExpectedEditorialTarget(url, target.pid, target.page);
+    }
     const headers: Record<string, string> = { ...init.headers };
     for (const name of Object.keys(headers)) {
       if (name.trim().toLowerCase() === 'cookie') {
@@ -593,22 +830,29 @@ export function createAuthenticatedLuoguFetch(options: AuthenticatedLuoguFetchOp
       // sample quotes the cookie — so only its validated code and retry metadata may survive.
       sanitizeAuthenticatedFailure(cause, operation, 'transport');
     }
+    if (response.status !== INTERPRETABLE_STATUS) {
+      return emptyRefusalResponse(response);
+    }
     return withSanitizedBody(response, operation);
   };
 }
 
-function pathOf(url: string): string | null {
-  try {
-    return new URL(url).pathname;
-  } catch {
-    return null;
-  }
-}
+/**
+ * The typed outcome of reading one authenticated solution page.
+ *
+ * A page is data and a failure is *returned* rather than thrown, so the walk can keep the two apart and
+ * every failure keeps its own platform code (an authentication wall, a refusal, a rate limit, a
+ * challenge, a changed payload) instead of being folded into "nothing to store". A raw page can never
+ * be an absence: only the walk knows that it read page 1 and that page 1 declared zero write-ups.
+ */
+type EditorialPageRead =
+  | { readonly ok: true; readonly page: LuoguEditorialPage }
+  | { readonly ok: false; readonly error: PlatformError };
 
 interface SessionHolder {
   cookie: string | null;
-  /** Page number the owning scan is currently reading; set only while its request is in flight. */
-  page: number | null;
+  /** Target the owning call is currently reading; set only while its request is in flight. */
+  target: SessionTarget | null;
 }
 
 interface AccountTransport {
@@ -703,10 +947,486 @@ export class LuoguSessionReaderAdapter implements LuoguSessionReader {
         // The cookie lives exactly as long as the call that owns it, on every success, error and
         // cancellation path; the cached transport (and its pacing state) survives.
         bound.holder.cookie = null;
-        bound.holder.page = null;
+        bound.holder.target = null;
       }
     } finally {
       this.endAccountScan(account.id);
+    }
+  }
+
+  /**
+   * Read one problem's solution material through this account's session (Sprint 33C, paged in the
+   * revision).
+   *
+   * The shape this reads was observed from a sanitized capture of the authenticated
+   * `/problem/solution/<pid>` surface and is parsed per page by {@link parseLuoguEditorialPage}, whose
+   * rules decide that only an explicit `count: 0` with an empty result list is an absence. The
+   * capture also recorded `?page=2` answering the same shape with a non-empty result while `count` is
+   * the **total** number of write-ups (56 for P1001 at `perPage` 10), so one whole read is the walk
+   * {@link readAllEditorialPages} performs:
+   *
+   * - the credential comes from the injected provider and is normalized to the canonical cookie pair,
+   *   exactly as the submission path does, so an unverified or foreign session is refused before any
+   *   request;
+   * - the transport is the account's own bound transport, so pacing (>= 2 s) is shared with the
+   *   account's other calls, and the target holder is bound per request to exactly one page of exactly
+   *   this problem — the first page with no query at all, every later page as the canonical
+   *   `?page=N`;
+   * - a body that arrives as HTML (a login redirect, a challenge page, a changed layout) is classified
+   *   as an authentication wall or an unreadable answer — never as "no editorial";
+   * - a payload the parser cannot read becomes a fixed sanitized `changed_response`: the parser's
+   *   structural path is dropped, so a server-provided value can never travel in a diagnostic, and a
+   *   `sample` is never taken from an authenticated body at all.
+   */
+  async fetchEditorial(request: LuoguEditorialRequest): Promise<EditorialFetchResult> {
+    const operation: PlatformOperation = 'editorial';
+    const token = request.token;
+    throwIfCancelled(token);
+    requireLuoguInstance(this.sourceInstance, operation);
+    const http = resolvePlatformLimits(request.limits, operation);
+    if (request.officialTutorialUrl !== undefined && request.officialTutorialUrl !== null) {
+      // Luogu's own material is addressed by problem id, so a supplied URL cannot be honoured. It is
+      // refused instead of being silently ignored, which would let a caller believe it was used.
+      throw invalidInput(operation, 'a supplied editorial URL cannot be honoured: Luogu material is addressed by problem id');
+    }
+    const account: Account = request.account;
+    if (!account || typeof account !== 'object') {
+      throw invalidInput(operation, 'a Luogu account is required for an authenticated editorial read');
+    }
+    const uid = requireLuoguUid(this.sourceInstance, account);
+    const pid = requireLuoguProblemId(request.problemRef, this.sourceInstance, operation);
+    throwIfCancelled(token);
+
+    try {
+      this.beginAccountScan(account.id, operation);
+      try {
+        const cookie = requireLuoguSessionCookie(await this.readEditorialSession(account, token), uid);
+        throwIfCancelled(token);
+        const bound = this.transportFor(account.id, uid);
+        bound.holder.cookie = cookie;
+        try {
+          return await this.readAllEditorialPages(pid, token, http, bound);
+        } finally {
+          // The cookie lives exactly as long as the call that owns it, on every outcome.
+          bound.holder.cookie = null;
+          bound.holder.target = null;
+        }
+      } finally {
+        this.endAccountScan(account.id);
+      }
+    } catch (cause) {
+      // The reader answers its port the way the adapter answers the pipeline: an operational failure
+      // is *returned* with its own discriminant, so the material gate can tell an authentication wall
+      // or a rate limit apart from an absence. A cancellation and a malformed request are the caller's
+      // own failures and keep propagating.
+      if (isPlatformError(cause)) {
+        return editorialFailureFromPlatformError(cause);
+      }
+      throw cause;
+    }
+  }
+
+  /**
+   * Resolve the session of exactly this account for an editorial read.
+   *
+   * The credential provider is an untrusted boundary — its rejection can carry the cookie in a detail
+   * or a sample — so the failure is rebuilt as a fixed sanitized one, and cancellation keeps its own
+   * discriminant.
+   *
+   * A session that belongs to *another* account is the one case that is not a malformed input: it
+   * means this call cannot be authenticated at all, so it is reported as the authentication wall it
+   * is. The provider is never asked to authenticate as somebody else.
+   */
+  private async readEditorialSession(account: Account, token: CancellationToken): Promise<LuoguSession> {
+    throwIfCancelled(token);
+    try {
+      const session = await this.sessions.sessionFor(account, token);
+      throwIfCancelled(token);
+      if (typeof session?.uid !== 'string' || session.uid.trim() !== account.handle) {
+        throw new PlatformError({
+          code: 'auth_required',
+          operation: 'editorial',
+          retryable: false,
+          detail: SAFE_FAILURE_DETAILS.auth_required,
+        });
+      }
+      return session;
+    } catch (cause) {
+      throwIfCancelled(token);
+      sanitizeAuthenticatedFailure(cause, 'editorial', 'session');
+    }
+  }
+
+  /**
+   * Walk the server pages of one problem's solution list and compose the whole stored material.
+   *
+   * The rules this method owns, in order:
+   *
+   * 1. page 1 is read **without a query**, exactly as the capture recorded it;
+   * 2. only page 1 may report an absence, and only when the parser recognised an explicit
+   *    `count: 0` with an empty list;
+   * 3. the declared total fixes how many pages exist (`ceil(count / perPage)`, at most
+   *    {@link LUOGU_MAX_EDITORIAL_PAGES}); a total that needs more pages fails the read **whole**
+   *    after the first page, so no partial list of write-ups is ever returned;
+   * 4. every later page is requested as the canonical `?page=N`; a page whose declared `count` or
+   *    `perPage` differs from the first page is drift and fails the read;
+   * 5. every page must be exactly `min(perPage, max(0, count - (page - 1) * perPage))` write-ups long
+   *    — a short, empty or over-long page would silently skip or duplicate material — and a repeated
+   *    `lid` inside one page or across pages is drift as well;
+   * 6. a page that answers 401/403/404, HTML, a challenge or a rate limit keeps its own typed
+   *    discriminant and is never turned into an absence;
+   * 7. the number of write-ups and the total retrieved body size are bounded
+   *    ({@link LUOGU_MAX_EDITORIAL_SOLUTIONS}, {@link LUOGU_MAX_EDITORIAL_CONTENT_CHARS}); crossing a
+   *    bound fails the read whole instead of storing what was read so far;
+   * 8. the token is checked before and after every await, and `retrievedAt` is read **once** so every
+   *    source and the result itself carry the same instant.
+   *
+   * Nothing is returned until every page was read, checked and could be materialized: a failure means
+   * no write-up of this read exists anywhere.
+   */
+  private async readAllEditorialPages(
+    pid: string,
+    token: CancellationToken,
+    http: Partial<HttpLimits>,
+    bound: AccountTransport,
+  ): Promise<EditorialFetchResult> {
+    const first = await this.readEditorialPage(1, pid, token, http, bound);
+    throwIfCancelled(token);
+    if (!first.ok) {
+      throw first.error;
+    }
+    const { count, perPage } = first.page;
+    const pageCount = Math.ceil(count / perPage);
+    if (pageCount > LUOGU_MAX_EDITORIAL_PAGES) {
+      // The declared total needs more requests than one read may spend. The first page was read, so
+      // this is an observation about the answer, and the whole read fails instead of returning a
+      // partial list.
+      throw this.editorialDrift(
+        `the declared total ${count} at page size ${perPage} needs ${pageCount} pages, more than the ${LUOGU_MAX_EDITORIAL_PAGES} this read may fetch`,
+      );
+    }
+    const expectedFirst = Math.min(perPage, Math.max(0, count));
+    if (first.page.items.length !== expectedFirst) {
+      throw this.editorialDrift(
+        `server page 1 answered ${first.page.items.length} write-ups but the declared total ${count} requires ${expectedFirst}`,
+      );
+    }
+    if (count === 0) {
+      // The one absence this stage recognises: page 1 explicitly declared zero write-ups and answered
+      // an empty list of them. Any other empty or short answer is a failure, not an absence.
+      return { status: 'absent', detail: 'Luogu reported no solution for this problem (count 0 with an empty result list)' };
+    }
+    const items: ObservedSolution[] = [];
+    const seen = new Set<string>();
+    // Local accumulators, so two reads can never share a budget: at most one read per account is in
+    // flight, but nothing here depends on that.
+    const budget = { items: 0, contentChars: 0 };
+    this.collectEditorialItems(first.page.items, items, seen, budget);
+    for (let pageNumber = 2; pageNumber <= pageCount; pageNumber += 1) {
+      throwIfCancelled(token);
+      const next = await this.readEditorialPage(pageNumber, pid, token, http, bound);
+      throwIfCancelled(token);
+      if (!next.ok) {
+        throw next.error;
+      }
+      if (next.page.count !== count || next.page.perPage !== perPage) {
+        throw this.editorialDrift(
+          `the declared solution pagination changed from ${count}/${perPage} to ${next.page.count}/${next.page.perPage} at page ${pageNumber}`,
+        );
+      }
+      const expected = Math.min(perPage, Math.max(0, count - (pageNumber - 1) * perPage));
+      if (next.page.items.length !== expected) {
+        throw this.editorialDrift(
+          `server page ${pageNumber} answered ${next.page.items.length} write-ups but the declared total ${count} requires ${expected}`,
+        );
+      }
+      // Duplicates are checked page by page, so the read stops at the first page that overlaps instead
+      // of spending every remaining request on a broken answer.
+      this.collectEditorialItems(next.page.items, items, seen, budget);
+    }
+    throwIfCancelled(token);
+    if (items.length !== count) {
+      throw this.editorialDrift(`the read returned ${items.length} write-ups but the declared total is ${count}`);
+    }
+    // Read exactly once, so every source of this read and the result itself carry the same instant.
+    const retrievedAt = this.nowIso();
+    throwIfCancelled(token);
+    return this.materializeEditorial(items, pid, retrievedAt);
+  }
+
+  /**
+   * Append one page's write-ups, enforcing the two bounded budgets and the cross-page identity rule.
+   *
+   * A repeated `lid` — inside one page or across pages — means the pages overlap or the ids are not
+   * per-write-up identities; storing both copies would give one write-up two records. The key compared
+   * here is the parser's **canonical** lid (trimmed and NFC-normalised), which is exactly the string
+   * every stored id is built from, so two Unicode spellings of one id also collide here. The number of
+   * write-ups and the total retrieved body size are bounded as well, so a pathological answer is
+   * refused while it is read rather than after it was materialized.
+   */
+  private collectEditorialItems(
+    pageItems: readonly ObservedSolution[],
+    items: ObservedSolution[],
+    seen: Set<string>,
+    budget: { items: number; contentChars: number },
+  ): void {
+    for (const item of pageItems) {
+      if (seen.has(item.lid)) {
+        throw this.editorialDrift('the read repeated one write-up id');
+      }
+      seen.add(item.lid);
+      items.push(item);
+      budget.items += 1;
+      if (budget.items > LUOGU_MAX_EDITORIAL_SOLUTIONS) {
+        throw this.editorialDrift(
+          `the read returned more than the ${LUOGU_MAX_EDITORIAL_SOLUTIONS} write-ups one read may store`,
+        );
+      }
+      budget.contentChars += item.content.length;
+      if (budget.contentChars > LUOGU_MAX_EDITORIAL_CONTENT_CHARS) {
+        throw this.editorialDrift(
+          `the read retrieved more than the ${LUOGU_MAX_EDITORIAL_CONTENT_CHARS} characters one read may store`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Turn the validated write-ups of one whole read into the typed editorial result.
+   *
+   * The parser's per-write-up builder owns the stored identity; a refusal here (a value that cannot
+   * become a stored id) becomes a fixed sanitized `changed_response` carrying no value, and a
+   * programming error is rethrown unchanged rather than being disguised as a platform answer.
+   */
+  private materializeEditorial(
+    items: readonly ObservedSolution[],
+    pid: string,
+    retrievedAt: string,
+  ): EditorialFetchResult {
+    const built = buildEditorialMaterial(items, pid, retrievedAt);
+    if (built.ok && built.status === 'found') {
+      return { status: 'found', sources: built.sources, solutions: built.solutions, retrievedAt };
+    }
+    if (!built.ok) {
+      throw this.editorialFailure(built.kind);
+    }
+    // `buildEditorialMaterial` only reports `found`: an empty read never reaches it, because the walk
+    // above already answered the one absence it recognises.
+    throw this.editorialDrift('the read produced no material and no absence');
+  }
+
+  /** Fixed sanitized `changed_response` for one structural drift of an authenticated read. */
+  private editorialDrift(detail: string): PlatformError {
+    return new PlatformError({
+      code: 'changed_response',
+      operation: 'editorial',
+      retryable: false,
+      detail,
+    });
+  }
+
+  /** Fixed sanitized failure of one unreadable payload; the parser's path is deliberately dropped. */
+  private editorialFailure(kind: LuoguEditorialFailureKind): PlatformError {
+    const code = editorialFailureCode(kind);
+    return new PlatformError({
+      code,
+      operation: 'editorial',
+      // A declared rate limit and a declared server-side failure are transient, exactly like the same
+      // conditions as real HTTP statuses; every structural defect is terminal.
+      retryable: code === 'rate_limited' || kind === 'server_error',
+      // Neither carries a declared delay in a payload, so the delay stays unknown rather than invented.
+      ...(code === 'rate_limited' ? { retryAfterMs: null } : {}),
+      detail: SAFE_FAILURE_DETAILS[code],
+    });
+  }
+
+  /** Dispatch one authenticated editorial page request; failures are sanitized like every other hop. */
+  private async requestEditorial(
+    pid: string,
+    pageNumber: number,
+    token: CancellationToken,
+    http: Partial<HttpLimits>,
+    bound: AccountTransport,
+  ): Promise<HttpResponse> {
+    throwIfCancelled(token);
+    // The solution page of exactly this problem is bound, so the credential can reach only it. The
+    // bound page is what the target guard compares the dispatched URL (and every redirect hop) with.
+    bound.holder.target = { kind: 'editorial', pid, page: pageNumber };
+    try {
+      return await bound.transport.request(this.editorialPath(pid, pageNumber), {
+        token,
+        operation: 'editorial',
+        headers: { [LENTILLE_HEADER]: LENTILLE_VALUE },
+        // The observed error envelopes arrive as these statuses, and they are accepted so the reader
+        // can answer with *its* fixed, body-blind classification of them (see
+        // `editorialStatusFailure`) instead of a generic transport error. The body of a non-200 answer
+        // is never parsed, so a shaped success block inside a refusal cannot become material or an
+        // absence. Anything else (a server error, a rate limit, a challenge) stays a transport failure
+        // with its own typed code, so a 429 keeps `rate_limited`.
+        acceptStatuses: [400, 401, 403, 404],
+        limits: http,
+      });
+    } catch (cause) {
+      sanitizeAuthenticatedFailure(cause, 'editorial', 'transport');
+    } finally {
+      // The credential is bound to one request at a time; nothing is left bound between pages.
+      bound.holder.target = null;
+    }
+  }
+
+  /**
+   * The one accepted address of one solution page.
+   *
+   * The unparameterised path is the observed first page; `?page=N` is the observed continuation. No
+   * other spelling is ever built here, which is what makes the target guard's exact comparison
+   * meaningful.
+   */
+  private editorialPath(pid: string, pageNumber: number): string {
+    const base = `${SOLUTION_PATH_PREFIX}${encodeURIComponent(pid)}`;
+    return pageNumber === 1 ? base : `${base}?page=${String(pageNumber)}`;
+  }
+
+  /** One authenticated solution page, parsed and typed; a failure is returned, never thrown. */
+  private async readEditorialPage(
+    pageNumber: number,
+    pid: string,
+    token: CancellationToken,
+    http: Partial<HttpLimits>,
+    bound: AccountTransport,
+  ): Promise<EditorialPageRead> {
+    const response = await this.requestEditorial(pid, pageNumber, token, http, bound);
+    throwIfCancelled(token);
+    try {
+      return { ok: true, page: this.classifyEditorialPage(response, pid) };
+    } catch (cause) {
+      throwIfCancelled(token);
+      if (isPlatformError(cause)) {
+        return { ok: false, error: cause };
+      }
+      throw cause;
+    }
+  }
+
+  /**
+   * Classify one authenticated editorial response and parse exactly one page of it.
+   *
+   * **The HTTP status decides first, and only `200` may reach the payload parser.** The accepted
+   * statuses exist so the answer is a *typed* code rather than a generic transport error, and the body
+   * of a non-200 answer is never read at all: a refusal is never allowed to look like content, so an
+   * error page that happens to carry a shaped, empty `solutions` block (or even a shaped non-empty one)
+   * can never become `absent` or `found`.
+   *
+   * | HTTP status | Result |
+   * | --- | --- |
+   * | `200` | the payload is parsed; the body decides between material, drift and a body-level error envelope |
+   * | `401` | `auth_required`, fixed text, whether the body is JSON or an inline login page |
+   * | `403` | `forbidden`, fixed text |
+   * | `404` | `unavailable` (never `absent`), fixed text |
+   * | `400` | `unavailable` with a fixed text: the platform refused the request itself |
+   * | anything else | the transport's own typed failure (a `429` stays `rate_limited`) |
+   *
+   * Two `200` body forms are accepted, because both carry the same payload shape: the JSON envelope of
+   * the request itself, and the hydration element of the page the platform answers with instead. At
+   * status `200` an HTML body is never parsed as material: a login page reached by a redirect is
+   * refused by the target guard before the cookie is attached, an inline login page at the solution URL
+   * carries no reliable structural signal and is therefore `changed_response`, and any other page
+   * without a hydration element is an unreadable answer. A payload this build cannot read becomes its
+   * own typed failure — never a page with no write-ups, which the walk would have to interpret.
+   */
+  private classifyEditorialPage(response: HttpResponse, pid: string): LuoguEditorialPage {
+    const statusFailure = this.editorialStatusFailure(response.status);
+    if (statusFailure !== null) {
+      throw statusFailure;
+    }
+    const payload = this.editorialPayload(response);
+    const parsed = parseLuoguEditorialPage(payload, pid);
+    if (!parsed.ok) {
+      throw this.editorialFailure(parsed.kind);
+    }
+    // `parseLuoguEditorialPage` reads pages only; the per-page `absent` status belongs to the
+    // whole-payload wrapper, which the walk deliberately does not use.
+    if (parsed.status !== 'page') {
+      throw this.editorialDrift('the solution payload was classified as a whole-payload answer');
+    }
+    return parsed.page;
+  }
+
+  /**
+   * The fixed, body-blind classification of one non-200 authenticated editorial status.
+   *
+   * Returns `null` for `200` (the only status whose body may be parsed) and a fixed sanitized failure
+   * for every other status this read accepts. The mapping is total, so a status this build does not
+   * expect is still a non-`absent` failure rather than an unreadable body.
+   */
+  private editorialStatusFailure(status: number): PlatformError | null {
+    if (status === 200) {
+      return null;
+    }
+    const fixed = (code: PlatformErrorCode, detail: string): PlatformError =>
+      new PlatformError({ code, operation: 'editorial', retryable: false, detail });
+    if (status === 401) {
+      return fixed('auth_required', 'Luogu refused the authenticated solution request: HTTP 401');
+    }
+    if (status === 403) {
+      return fixed('forbidden', 'Luogu refused the authenticated solution request: HTTP 403');
+    }
+    if (status === 404) {
+      return fixed('unavailable', 'Luogu answered HTTP 404 for the solution request');
+    }
+    if (status === 400) {
+      // The platform rejected the request itself; this is not evidence about the material and can
+      // never be an absence.
+      return fixed('unavailable', 'Luogu rejected the solution request: HTTP 400');
+    }
+    return fixed('unavailable', `Luogu answered HTTP ${String(status)} for the solution request`);
+  }
+
+  /**
+   * Extract the payload of one **HTTP 200** authenticated response without ever echoing its body.
+   *
+   * Only reached after {@link editorialStatusFailure} accepted the status, so no refusal body is ever
+   * interpreted. A login path is still refused here as defence in depth — the target guard normally
+   * refuses a redirect to it *before* the cookie is attached — and any other HTML page is an unreadable
+   * answer with a fixed, body-free detail.
+   */
+  private editorialPayload(response: HttpResponse): unknown {
+    const contentType = response.headers['content-type'] ?? null;
+    if (isHtmlResponse(contentType, response.body)) {
+      if (isLuoguLoginPath(response.url)) {
+        throw new PlatformError({
+          code: 'auth_required',
+          operation: 'editorial',
+          retryable: false,
+          detail: 'the Luogu session is no longer valid: the solution page was answered by the login page',
+        });
+      }
+      const hydrated = lentilleContextPayload(response.body);
+      if (hydrated === null) {
+        // A challenge page, a changed layout or a page without the hydration element. This says
+        // nothing about whether an editorial exists.
+        throw new PlatformError({
+          code: 'changed_response',
+          operation: 'editorial',
+          retryable: false,
+          detail: 'Luogu answered a page without a readable solution payload instead of solution JSON',
+        });
+      }
+      return hydrated;
+    }
+    return this.parseEditorialBody(response.body);
+  }
+
+  /** Parse the JSON body without ever echoing it: the parser's message can quote the input. */
+  private parseEditorialBody(body: string): unknown {
+    try {
+      return JSON.parse(body) as unknown;
+    } catch {
+      throw new PlatformError({
+        code: 'changed_response',
+        operation: 'editorial',
+        retryable: false,
+        detail: 'Luogu answered a solution response that is not valid JSON',
+      });
     }
   }
 
@@ -896,7 +1616,7 @@ export class LuoguSessionReaderAdapter implements LuoguSessionReader {
     if (existing !== undefined) {
       return existing;
     }
-    const holder: SessionHolder = { cookie: null, page: null };
+    const holder: SessionHolder = { cookie: null, target: null };
     const transport = new HttpTransport({
       origin: LUOGU_BASE_URL,
       minRequestIntervalMs: LUOGU_MIN_REQUEST_INTERVAL_MS,
@@ -908,7 +1628,7 @@ export class LuoguSessionReaderAdapter implements LuoguSessionReader {
       fetchImpl: createAuthenticatedLuoguFetch({
         cookie: () => holder.cookie,
         expectedUid: uid,
-        expectedPage: () => holder.page,
+        expectedTarget: () => holder.target,
         fetchImpl: this.fetchImpl,
       }),
       clock: this.transportOptions.clock,
@@ -937,7 +1657,7 @@ export class LuoguSessionReaderAdapter implements LuoguSessionReader {
     throwIfCancelled(token);
     // The target guard reads this holder, so every dispatch — a redirect hop included — is bound
     // to exactly the page this call requested.
-    bound.holder.page = pageNumber;
+    bound.holder.target = { kind: 'record', page: pageNumber };
     try {
       return await bound.transport.request(
         `${RECORD_LIST_PATH}?user=${encodeURIComponent(uid)}&page=${pageNumber}`,
@@ -951,7 +1671,7 @@ export class LuoguSessionReaderAdapter implements LuoguSessionReader {
     } catch (cause) {
       sanitizeAuthenticatedFailure(cause, 'submissions', 'transport');
     } finally {
-      bound.holder.page = null;
+      bound.holder.target = null;
     }
   }
 
@@ -966,8 +1686,7 @@ export class LuoguSessionReaderAdapter implements LuoguSessionReader {
     const response = await this.requestRecordPage(pageNumber, uid, token, http, bound);
     throwIfCancelled(token);
     if (isHtmlResponse(response.headers['content-type'] ?? null, response.body)) {
-      const path = pathOf(response.url);
-      if (path !== null && LOGIN_PATHS.has(path)) {
+      if (isLuoguLoginPath(response.url)) {
         throw new PlatformError({
           code: 'auth_required',
           operation: 'submissions',

@@ -40,6 +40,7 @@ import { registerModelApi } from './model-api.js';
 import { registerBootstrapApi } from './bootstrap-api.js';
 import { registerLuoguApi } from './luogu-api.js';
 import { createLuoguHost, type LuoguHostSeam } from './luogu-host.js';
+import { createGatedLuoguAdapter } from './luogu-gated-adapter.js';
 import { disposeAll, rollback } from './lifecycle.js';
 import { registerGuidanceApi } from './guidance-api.js';
 import { applyGuidanceService } from './guidance-service.js';
@@ -96,7 +97,14 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
       if(settings===null)await store.saveWorkbenchSettings(defaultWorkbenchSettings(),null);
       else if(!isFlashOnlySettings(settings.value))await store.saveWorkbenchSettings(withFlashOnlyModels(settings.value),settings.revision);
     });
-    const adapters:PlatformAdapter[]=[new CodeforcesAdapter({sourceInstance:sources[0]!}),new LuoguAdapter({sourceInstance:sources[1]!})];
+    // The anonymous Luogu adapter every public problem read goes through. It carries the composition's
+    // transport seam *here*, at the one place it is built, so the host's own default metadata source
+    // (the automatic-sync metadata repair) and the business adapter's anonymous reads are both covered
+    // by an injected synthetic transport — a seam that reached only one of them would leave a path on
+    // the real network.
+    const anonymousTransport=environment.luogu?.anonymousTransport??{};
+    const anonymousLuogu=new LuoguAdapter({sourceInstance:sources[1]!,...anonymousTransport});
+    const adapters:PlatformAdapter[]=[new CodeforcesAdapter({sourceInstance:sources[0]!}),anonymousLuogu];
     const byId=new Map(adapters.map(a=>[a.sourceInstance.id,a]));
     const imports=new ImportService({store,now}),workbench=new WorkbenchService({store,taxonomy:createTaxonomyIndex(CURRENT_TAXONOMY),now,uniqueId:randomUUID,guidance});
     const client=new DshAuditedModelClient({llm:host.llm,sessions:auditSessions},{now,flashOnly:true}),catalog=new ModelCatalog(host.llm);
@@ -129,11 +137,28 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
       onInternalError:reportFailure,...(environment.luogu===undefined?{}:{seam:environment.luogu})});
     disposers.push(async()=>{await luoguHost.dispose();});
     await luoguHost.start(createCancellationSource().token);
+    // The business Luogu adapter is rebuilt over the host's own authenticated reader: the anonymous
+    // metadata adapter stays the *only* source of public problem reads, while submissions and solution
+    // material run through the reader the sync service already drives, so one account has one
+    // credential path, one pacing state and one cookie lifecycle. `capabilities()` then reports the
+    // submissions/editorial support this composition really has, instead of advertising a session it
+    // cannot reach. Both adapters keep the composition's transport seam, so an injected synthetic
+    // transport covers every Luogu request of this activation.
+    //
+    // The business adapter is then wrapped in the host's *own* source gate: every business operation
+    // that can reach Luogu — the anonymous statement/profile/catalog reads included — becomes one whole
+    // gated operation of this source, so a business read can never start on top of a gated sync,
+    // connection probe or another account's read. The host's own paths are already gated at their call
+    // site, so this wrapper is applied here and nowhere else.
+    const businessLuogu=createGatedLuoguAdapter({
+      adapter:new LuoguAdapter({sourceInstance:sources[1]!,sessionReader:luoguHost.sessionReader,...anonymousTransport}),
+      gate:luoguHost.gate});
+    const businessAdapters=new Map(byId);businessAdapters.set(sources[1]!.id,businessLuogu);
     disposers.push(await registerLuoguApi({registry:host.connection.fetch,store,service:luoguHost.service,
       sourceInstance:sources[1]!,connectionAvailable:luoguHost.connectionAvailable,
       connectionPlatform:luoguHost.connectionPlatform,now,...observer}));
     disposers.push(await registerBusinessApi({registry:host.connection.fetch,store,imports,workbench,sources:sources.map(instance=>({instance})),settings:()=>store.getWorkbenchSettings(),now,uniqueId:randomUUID,
-      adapterFor:async id=>{const adapter=byId.get(id);if(!adapter)throw Error('ICPC_SOURCE_ADAPTER_UNSUPPORTED');return adapter;},...observer,onDisposeError:reportFailure}));
+      adapterFor:async id=>{const adapter=businessAdapters.get(id);if(!adapter)throw Error('ICPC_SOURCE_ADAPTER_UNSUPPORTED');return adapter;},...observer,onDisposeError:reportFailure}));
     disposers.push(registerGuidanceApi(host.connection.fetch,guidance));
     disposers.push(await registerAssessmentApi(host.connection.fetch,assessment));
     // Virtual-contest performance ledger (Sprint 18c): free local CRUD over the durable per-account
@@ -141,7 +166,7 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
     disposers.push(await registerPerformanceApi({registry:host.connection.fetch,...observer,
       service:new VirtualPerformanceService({store,now,uniqueId:()=>uniqueId('virtual-performance')})}));
     disposers.push(await registerModelApi({registry:host.connection.fetch,controller,...observer}));
-    disposers.push(await registerBootstrapApi({registry:host.connection.fetch,store,controller,catalog,dataDir,hostVersion:compatibility.packageVersion,adapters,...observer}));
+    disposers.push(await registerBootstrapApi({registry:host.connection.fetch,store,controller,catalog,dataDir,hostVersion:compatibility.packageVersion,adapters:[...businessAdapters.values()],...observer}));
     return {dataDir,controller,guidance,dispose:disposeAll(disposers)};
   } catch(error){return rollback(error,disposers);}
 }

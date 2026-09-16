@@ -1123,7 +1123,7 @@ test('the authenticated fetch dispatches only the exact expected record target o
   const guarded = createAuthenticatedLuoguFetch({
     cookie: () => COOKIE,
     expectedUid: UID,
-    expectedPage: () => 2,
+    expectedTarget: () => ({ kind: 'record', page: 2 }),
     fetchImpl: inner,
   });
   const init: FetchInitLike = {
@@ -1161,7 +1161,7 @@ test('the authenticated fetch dispatches only the exact expected record target o
   const unbound = createAuthenticatedLuoguFetch({
     cookie: () => null,
     expectedUid: UID,
-    expectedPage: () => 2,
+    expectedTarget: () => ({ kind: 'record', page: 2 }),
     fetchImpl: inner,
   });
   await rejectsWithCode(unbound(exact, init), 'invalid_input');
@@ -1677,6 +1677,9 @@ test('the composed adapter delegates to the reader and re-checks cancellation af
       source.cancel('cancelled while the reader settled');
       return { items: [], nextCursor: null, fetchedAt: AT };
     },
+    fetchEditorial: async () => {
+      throw new Error('unexpected fetchEditorial');
+    },
   };
   const adapter = createLuoguAdapter({ sourceInstance: SOURCE, sessionReader: cancelling });
   await rejectsWithCode(
@@ -1688,6 +1691,9 @@ test('the composed adapter delegates to the reader and re-checks cancellation af
     listSubmissions: async (request) => {
       calls.push(request.cursor ?? 'first');
       return { items: [], nextCursor: 'next', fetchedAt: AT };
+    },
+    fetchEditorial: async () => {
+      throw new Error('unexpected fetchEditorial');
     },
   };
   const okAdapter = createLuoguAdapter({ sourceInstance: SOURCE, sessionReader: delegating });

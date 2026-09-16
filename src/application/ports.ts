@@ -148,6 +148,16 @@ export interface FetchEditorialRequest {
    * *before* issuing any request; it never turns an arbitrary URL into a fetch target.
    */
   readonly officialTutorialUrl?: string | null;
+  /**
+   * Optional account whose authenticated session may be used for this read.
+   *
+   * Platforms that publish solution material only to a signed-in reader (Luogu today) need to know
+   * *whose* session to use, and the account must belong to the adapter's own source instance. It is
+   * optional so every existing caller keeps working: an adapter with no authenticated reader, or a
+   * call that names no account, falls back to its anonymous probe — which can never report an
+   * absence, because an anonymous read is not evidence about whether material exists.
+   */
+  readonly account?: Account | null;
 }
 
 /**

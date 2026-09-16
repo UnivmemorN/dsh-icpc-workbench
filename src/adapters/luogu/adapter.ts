@@ -58,6 +58,7 @@ import {
   type PlatformLimits,
 } from '../../application/ports.js';
 import {
+  PLATFORM_ERROR_CODES,
   PlatformError,
   editorialFailureFromPlatformError,
   isPlatformError,
@@ -114,6 +115,132 @@ export interface LuoguProblemDetailResult {
   readonly detail: LuoguProblemDetail;
 }
 
+/**
+ * Where an authenticated editorial/submission reader comes from.
+ *
+ * A reader instance serves every account (`LuoguSessionReader`). A **factory** serves one reader per
+ * account, which is what the host runtime publishes: the returned reader is the same instance the
+ * submission sync drives for that account, so one account has one transport, one pacing state and one
+ * cookie lifecycle. Both forms are accepted so a composition never has to invent a second credential
+ * path just to reach the reader it already owns.
+ */
+export type LuoguSessionReaderSource = LuoguSessionReader | ((account: Account) => LuoguSessionReader);
+
+/**
+ * Fixed, body-free text per editorial failure code for the **anonymous** probe.
+ *
+ * The source of the failure is a server-provided string in the worst case (an injected fetch's message,
+ * a redirect `Location`, an envelope's `errorType`), so the text is written here and never derived from
+ * the answer. A rate limit keeps its own code; a refusal, a not-found and a server error each keep
+ * theirs; everything unrecognized is a changed response.
+ */
+const ANONYMOUS_EDITORIAL_FAILURE_DETAILS: Readonly<Record<PlatformErrorCode, string>> = {
+  cancelled: 'the anonymous solutions request was cancelled',
+  auth_required: 'the anonymous solutions endpoint requires a session',
+  forbidden: 'the anonymous solutions endpoint refused the request',
+  rate_limited: 'the anonymous solutions endpoint rate limited the request',
+  unavailable: 'the anonymous solutions endpoint did not answer',
+  changed_response: 'the anonymous solutions endpoint answered an unexpected response',
+  invalid_input: 'the anonymous solutions request was rejected',
+};
+
+/**
+ * Map one recognized error code of an anonymous envelope onto the editorial contract.
+ *
+ * The integer alone decides: the envelope's `errorType`/`errorMessage` are never read, and no result
+ * carries a sample. `429` keeps `rate_limited` (with no declared delay, because the payload declares
+ * none), `404`/`5xx` are `unavailable`, and every other unreadable code is a changed response.
+ */
+function anonymousEditorialCodeFailure(
+  errorCode: number,
+  label: string,
+): Exclude<EditorialFetchResult, { status: 'found' }> {
+  if (errorCode === 401) {
+    // `auth_required` and `forbidden` carry no sample member at all.
+    return { status: 'auth_required', detail: `${label} requires a session` };
+  }
+  if (errorCode === 403) {
+    return { status: 'forbidden', detail: `${label} refused the anonymous request` };
+  }
+  if (errorCode === 429) {
+    return { status: 'rate_limited', detail: `${label} rate limited the anonymous request`, retryAfterMs: null };
+  }
+  if (errorCode === 404 || errorCode >= 500) {
+    return {
+      status: 'unavailable',
+      detail: `${label} did not answer solution material`,
+      retryable: errorCode >= 500,
+    };
+  }
+  return { status: 'changed_response', detail: `${label} answered an unrecognized error code`, sample: null };
+}
+
+/** Runtime allowlist of the codes a failure may carry; anything else is a forged discriminant. */
+const KNOWN_PLATFORM_ERROR_CODES: ReadonlySet<string> = new Set<string>(PLATFORM_ERROR_CODES);
+
+/**
+ * Keep only a declared, non-negative **safe integer** delay; a forged negative, fractional, infinite,
+ * unsafe or non-numeric value is dropped rather than forwarded.
+ */
+function safeRetryAfterMs(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Rebuild one **anonymous** editorial failure from a typed platform error.
+ *
+ * The shared transport's failures are typed but not body-free: `detail` can quote an injected fetch's
+ * error message and a redirect failure attaches the offending `Location` as a `sample`. An anonymous
+ * answer is unverified material, so this rebuilds every code with a fixed sentence, keeps only the
+ * retry metadata (`retryable`, `retryAfterMs`) and never carries a sample. Cancellation and a
+ * malformed request are the caller's own failures and are rethrown by
+ * {@link editorialFailureFromPlatformError}, which this mirrors.
+ *
+ * The error is an **untrusted value at the runtime level**, not just at the type level: an injected
+ * fetch can construct a `PlatformError` whose `code` is not in {@link PLATFORM_ERROR_CODES}, whose
+ * `retryable` is not a boolean, or whose `retryAfterMs` is not a declared delay. A code outside the
+ * allowlist, or a non-boolean `retryable`, degrades the whole answer to the fixed non-retryable
+ * `unavailable`; a forged `retryAfterMs` is dropped (the code's own mapping is kept). In every case the
+ * result is a complete, fixed, value-free failure — a forged discriminant can neither make this
+ * function return `undefined`/a non-result nor put its own text into a DTO.
+ */
+function anonymousEditorialFailureFrom(
+  error: PlatformError,
+): Exclude<EditorialFetchResult, { status: 'found' }> {
+  const typed = error as { readonly code?: unknown; readonly retryable?: unknown; readonly retryAfterMs?: unknown };
+  if (typeof typed.code !== 'string' || !KNOWN_PLATFORM_ERROR_CODES.has(typed.code)) {
+    return {
+      status: 'unavailable',
+      detail: ANONYMOUS_EDITORIAL_FAILURE_DETAILS.unavailable,
+      retryable: false,
+    };
+  }
+  if (typeof typed.retryable !== 'boolean') {
+    return {
+      status: 'unavailable',
+      detail: ANONYMOUS_EDITORIAL_FAILURE_DETAILS.unavailable,
+      retryable: false,
+    };
+  }
+  const code = typed.code as PlatformErrorCode;
+  const detail = ANONYMOUS_EDITORIAL_FAILURE_DETAILS[code];
+  switch (code) {
+    case 'auth_required':
+      return { status: 'auth_required', detail };
+    case 'forbidden':
+      return { status: 'forbidden', detail };
+    case 'rate_limited':
+      return { status: 'rate_limited', detail, retryAfterMs: safeRetryAfterMs(typed.retryAfterMs) };
+    case 'unavailable':
+      return { status: 'unavailable', detail, retryable: typed.retryable };
+    case 'changed_response':
+      return { status: 'changed_response', detail, sample: null };
+    case 'cancelled':
+    case 'invalid_input':
+      throw error;
+  }
+}
+
 export interface LuoguAdapterOptions {
   readonly sourceInstance: SourceInstance;
   /** Shared transport; must already be bound to {@link LUOGU_BASE_URL}. */
@@ -131,16 +258,61 @@ export interface LuoguAdapterOptions {
   /** Load `/_lfe/tags` on demand so raw ids are accompanied by dictionary names. */
   readonly resolveTagNames?: boolean;
   /**
-   * Authenticated submission reader (Sprint 17a). When supplied, `listSubmissions` delegates to
-   * it and the capabilities advertise submission history; without one the adapter keeps probing
-   * the anonymous endpoint and reports the observed authentication wall instead of inventing a
-   * history. Session material lives behind the reader; nothing credential-bearing appears here.
+   * Authenticated submission and editorial reader (Sprint 17a; editorial in 33C), either as one
+   * instance or as a per-account factory.
+   *
+   * When supplied, `listSubmissions` delegates to it and `fetchEditorial` delegates to it whenever the
+   * request names an account; the capabilities advertise submission history *and* solution material,
+   * which is exactly why **both** operations are required and validated here — an adapter must never
+   * advertise what it cannot serve. Without a reader the adapter keeps probing the anonymous endpoints
+   * and reports the observed authentication wall instead of inventing a history or an absence. Session
+   * material lives behind the reader; nothing credential-bearing appears here.
    */
-  readonly sessionReader?: LuoguSessionReader | null;
+  readonly sessionReader?: LuoguSessionReaderSource | null;
 }
 
 function invalidInput(operation: PlatformOperation, detail: string): PlatformError {
   return new PlatformError({ code: 'invalid_input', operation, retryable: false, detail });
+}
+
+/** Paths that mean "the session is gone" rather than "the shape changed". */
+const LUOGU_LOGIN_PATHS: ReadonlySet<string> = new Set(['/auth/login', '/login']);
+
+/**
+ * Whether one URL addresses a Luogu login page.
+ *
+ * Exported so every Luogu read — the authenticated reader's transport guard and body handling, and the
+ * adapter's anonymous probe — shares one definition of "this answer is the login wall". A URL that
+ * cannot be parsed is not a login path; it is refused elsewhere as an invalid target. A `null`/absent
+ * URL (an injected fetch that reports none) is not a login path either.
+ */
+export function isLuoguLoginPath(url: string | null | undefined): boolean {
+  if (typeof url !== 'string' || url.length === 0) {
+    return false;
+  }
+  try {
+    return LUOGU_LOGIN_PATHS.has(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Require the two operations a reader must expose, in the order this adapter advertises them.
+ *
+ * The check is structural and named, so a reader that can only answer one of the two surfaces is
+ * refused with the operation it cannot serve rather than being advertised as if it could.
+ */
+function requireReaderShape(reader: unknown): asserts reader is LuoguSessionReader {
+  if (reader === null || typeof reader !== 'object') {
+    throw invalidInput('submissions', 'sessionReader must be a Luogu session reader or a factory of one');
+  }
+  if (typeof (reader as LuoguSessionReader).listSubmissions !== 'function') {
+    throw invalidInput('submissions', 'sessionReader must expose listSubmissions(request)');
+  }
+  if (typeof (reader as LuoguSessionReader).fetchEditorial !== 'function') {
+    throw invalidInput('editorial', 'sessionReader must expose fetchEditorial(request)');
+  }
 }
 
 /**
@@ -271,7 +443,7 @@ export class LuoguAdapter implements PlatformAdapter {
   private readonly transport: HttpTransport;
   private readonly clock: ClockFn;
   private readonly resolveTagNames: boolean;
-  private readonly sessionReader: LuoguSessionReader | null;
+  private readonly sessionReader: LuoguSessionReaderSource | null;
   private dictionary: ReadonlyMap<number, string> | null;
 
   constructor(options: LuoguAdapterOptions) {
@@ -297,8 +469,15 @@ export class LuoguAdapter implements PlatformAdapter {
     this.resolveTagNames = options.resolveTagNames === true;
     this.dictionary = options.tagDictionary ? normalizeDictionary(options.tagDictionary) : null;
     const reader = options.sessionReader ?? null;
-    if (reader !== null && typeof reader.listSubmissions !== 'function') {
-      throw invalidInput('submissions', 'sessionReader must expose listSubmissions(request)');
+    // A reader is advertised as both submission history and editorial material, so it must answer
+    // both. A partially implemented reader is refused here instead of being advertised and then
+    // failing at call time: `capabilities()` below derives both flags from this one injection, and an
+    // adapter that cannot serve what it advertises is a broken composition. A factory is proven the
+    // same way, on a synthetic account of this instance whose reader shape does not depend on any
+    // stored credential or session.
+    if (reader !== null) {
+      const probe = typeof reader === 'function' ? reader(this.probeAccount()) : reader;
+      requireReaderShape(probe);
     }
     this.sessionReader = reader;
   }
@@ -310,7 +489,7 @@ export class LuoguAdapter implements PlatformAdapter {
       implemented: true,
       problems: true,
       submissions: authenticated,
-      editorial: false,
+      editorial: authenticated,
       pagedProblems: true,
       pagedSubmissions: authenticated,
       requiresAuth: true,
@@ -321,7 +500,9 @@ export class LuoguAdapter implements PlatformAdapter {
         authenticated
           ? 'authenticated submission history runs through the injected Luogu session reader; its record envelope is structurally validated and has not been verified against a live authenticated response'
           : 'submissions and account history need a Luogu session; the authenticated record shape is not implemented',
-        'editorials need a Luogu session; the anonymous solutions endpoint answers HTTP 401 UserUnloginException',
+        authenticated
+          ? 'authenticated solution material is read through the same session reader from the /problem/solution/<pid> surface; its payload shape comes from a sanitized capture, so only an explicit zero-count with an empty result list is reported as absent'
+          : 'solution material needs a Luogu session; the anonymous solutions endpoint answers HTTP 401 UserUnloginException and is never treated as an absence',
         'raw difficulty and raw tag ids (luogu-tag:<id>) are preserved; names need an explicit tag dictionary',
       ],
     };
@@ -460,8 +641,9 @@ export class LuoguAdapter implements PlatformAdapter {
     const operation = 'submissions' as const;
     request.token.throwIfCancelled();
     if (this.sessionReader !== null) {
-      this.requireAccountHandle(request.account, operation);
-      const page = await this.sessionReader.listSubmissions(request);
+      const handle = this.requireAccountHandle(request.account, operation);
+      const reader = this.readerFor(request.account, handle, operation);
+      const page = await reader.listSubmissions(request);
       request.token.throwIfCancelled();
       return page;
     }
@@ -517,9 +699,17 @@ export class LuoguAdapter implements PlatformAdapter {
   }
 
   /**
-   * Anonymous editorial probe. The authenticated editorial shape is not implemented, so the only
-   * honest answers are the observed authentication wall (or another typed operational failure) and
-   * `changed_response` for an unfamiliar successful payload. Never `absent`.
+   * Read one problem's solution material.
+   *
+   * With an injected {@link LuoguSessionReader} and an account on the request, the call is delegated to
+   * the authenticated reader, which owns the session, the canonical cookie pair and the payload rules
+   * of Sprint 33C. The adapter re-checks the account scope before the delegate and the token after it,
+   * so a cancellation observed while the reader was resolving is never handed back as material.
+   *
+   * Without a reader — or without an account — the anonymous endpoint is probed instead. Its observed
+   * answers are the authentication wall (`HTTP 401` / `data.errorCode=401` → `auth_required`), 403,
+   * 429, and `changed_response` for an unfamiliar successful payload. The anonymous path can never
+   * report `absent`, because an anonymous read is not evidence about whether an editorial exists.
    */
   async fetchEditorial(request: FetchEditorialRequest): Promise<EditorialFetchResult> {
     const operation = 'editorial' as const;
@@ -529,22 +719,126 @@ export class LuoguAdapter implements PlatformAdapter {
     if (request.officialTutorialUrl !== undefined && request.officialTutorialUrl !== null) {
       this.assertOfficialTutorialUrl(request.officialTutorialUrl, operation);
     }
+    const reader = this.sessionReader;
+    const account = request.account ?? null;
+    if (reader !== null && account !== null) {
+      // The account must belong to this instance before the delegate sees it, so one instance can
+      // never be asked to read another's material.
+      const handle = this.requireAccountHandle(account, operation);
+      try {
+        const result = await this.readerFor(account, handle, operation).fetchEditorial({
+          account,
+          problemRef: request.problemRef,
+          token: request.token,
+          limits: request.limits,
+          ...(request.officialTutorialUrl === undefined ? {} : { officialTutorialUrl: request.officialTutorialUrl }),
+        });
+        request.token.throwIfCancelled();
+        return result;
+      } catch (cause) {
+        if (isPlatformError(cause)) {
+          return editorialFailureFromPlatformError(cause);
+        }
+        throw cause;
+      }
+    }
     request.token.throwIfCancelled();
     try {
       const response = await this.get(`${SOLUTION_PATH_PREFIX}${encodeURIComponent(pid)}`, request.token, http, operation);
       request.token.throwIfCancelled();
-      luoguData(this.jsonRoot(response, operation, `solutions for ${pid}`), operation);
+      // The anonymous probe uses its own body-blind reader: unlike the shared `jsonRoot`, it never
+      // computes a `bodySnippet`, never quotes a parser message and never copies `errorType`/`errorCode`
+      // text, so no retrieved text can travel into a DTO, a stored note or a diagnostic.
+      const failure = this.anonymousEditorialFailure(response, reader === null);
+      if (failure !== null) {
+        return failure;
+      }
       return {
         status: 'changed_response',
-        detail: 'Luogu answered an anonymous solutions payload whose authenticated shape is not implemented',
-        sample: bodySnippet(response.body),
+        detail:
+          reader === null
+            ? 'Luogu answered an anonymous solutions payload and no authenticated reader is configured'
+            : 'Luogu answered an anonymous solutions payload and no account was given for the authenticated read',
+        // Deliberately no sample. An anonymous answer is *unverified* material, and the pipeline
+        // persists an editorial failure's sample into a note (and a DTO carries it to the UI), so if
+        // this surface ever starts answering bodies, quoting one here would leak retrieved editorial
+        // text into durable records. The typed status and the fixed sentence are the whole answer.
+        sample: null,
       };
     } catch (cause) {
+      // Every platform failure of this path is rebuilt from its typed code: the shared transport's
+      // `detail` can quote an injected fetch's error text, and its redirect handling attaches the
+      // offending `Location` as a `sample`. Neither may reach a DTO, a note or a log line, so only the
+      // code and the retry metadata survive here as well.
       if (isPlatformError(cause)) {
-        return editorialFailureFromPlatformError(cause);
+        return anonymousEditorialFailureFrom(cause);
       }
       throw cause;
     }
+  }
+
+  /**
+   * Classify one anonymous solutions answer without ever reading a value out of its body.
+   *
+   * Returns `null` when the answer is a *recognised* anonymous payload that carries no error envelope —
+   * the caller then reports `changed_response` with its own fixed sentence — and a fully sanitized
+   * {@link EditorialFetchResult} failure otherwise:
+   *
+   * - a **final URL on a login path** is the authentication wall, whatever the page says: a redirect the
+   *   anonymous transport followed to `/auth/login` (or `/login`) is the session wall, not a changed
+   *   layout. An inline login page served at the *original* URL stays `changed_response`, because no
+   *   reliable structural signal for it was observed;
+   * - an HTML answer is `changed_response` with fixed text (the anonymous surface may be a challenge
+   *   page; either way a page is not material);
+   * - a body that is not valid JSON, or is not a JSON object, is `changed_response` with fixed text —
+   *   the parser's own message is dropped because `JSON.parse` quotes the offending input;
+   * - a body-level error envelope is mapped by its integer `errorCode` alone (401 → `auth_required`,
+   *   403 → `forbidden`, 429 → `rate_limited`, 404/5xx → `unavailable`, anything else →
+   *   `changed_response`) with fixed text, so a server-provided `errorType`/`errorMessage` cannot travel;
+   * - every one of those results has `sample: null` and a fixed `detail`, so neither the body nor any
+   *   server-provided string can reach a DTO, a note or a log line.
+   */
+  private anonymousEditorialFailure(response: HttpResponse, anonymousOnly: boolean): EditorialFetchResult | null {
+    const label = anonymousOnly
+      ? 'the anonymous solutions endpoint'
+      : 'the anonymous solutions endpoint (no account was given for the authenticated read)';
+    if (isLuoguLoginPath(response.url)) {
+      return { status: 'auth_required', detail: `${label} answered the login wall` };
+    }
+    if (isHtmlResponse(response.headers['content-type'] ?? null, response.body)) {
+      return {
+        status: 'changed_response',
+        detail: `${label} answered an HTML page instead of JSON`,
+        sample: null,
+      };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(response.body) as unknown;
+    } catch {
+      // `JSON.parse` messages quote the offending input, so the message is deliberately not attached.
+      return { status: 'changed_response', detail: `${label} answered a body that is not valid JSON`, sample: null };
+    }
+    if (!isJsonRecord(parsed)) {
+      return { status: 'changed_response', detail: `${label} answered a body that is not a JSON object`, sample: null };
+    }
+    const data = parsed.data;
+    if (!isJsonRecord(data)) {
+      return { status: 'changed_response', detail: `${label} answered a payload without a data object`, sample: null };
+    }
+    const errorCode = data.errorCode;
+    if (errorCode === undefined || errorCode === null) {
+      return null;
+    }
+    if (typeof errorCode !== 'number' || !Number.isSafeInteger(errorCode)) {
+      return { status: 'changed_response', detail: `${label} answered an unreadable error code`, sample: null };
+    }
+    if (errorCode === 200) {
+      return null;
+    }
+    // Fixed sentences per code: the envelope's own error type and message are never read, let alone
+    // quoted, because they are server-provided text.
+    return anonymousEditorialCodeFailure(errorCode, label);
   }
 
   /**
@@ -751,6 +1045,57 @@ export class LuoguAdapter implements PlatformAdapter {
     }
     this.requireAccountHandle(account, operation);
     return account.id;
+  }
+
+  /**
+   * The authenticated reader of exactly this account.
+   *
+   * A factory injection is asked for the account's own reader — the instance the host runtime already
+   * drives for that account's submissions — and the answer is proven to expose both operations again,
+   * because a factory is an untrusted seam: it could answer a reader for one account and something
+   * else for another. A malformed answer is an `invalid_input` refusal before any credential is
+   * touched, never a call into an object that cannot serve the request.
+   */
+  private readerFor(account: Account, handle: string, operation: PlatformOperation): LuoguSessionReader {
+    const source = this.sessionReader;
+    if (source === null) {
+      throw invalidInput(operation, 'no authenticated Luogu reader is configured');
+    }
+    if (typeof source !== 'function') {
+      return source;
+    }
+    let reader: unknown;
+    try {
+      reader = (source as (account: Account) => unknown)(account);
+    } catch (cause) {
+      if (isPlatformError(cause)) {
+        throw cause;
+      }
+      throw invalidInput(operation, `the session reader of account ${handle} could not be resolved`);
+    }
+    requireReaderShape(reader);
+    return reader;
+  }
+
+  /**
+   * One synthetic account of this instance, used only to prove a reader *factory* answers a reader.
+   *
+   * Its reader shape does not depend on any stored credential: the host's factory caches by account id
+   * and builds the same reader for any account of this instance, so this proves the seam's shape
+   * without reading a session, a vault entry or a connection row. The identity is never used for a
+   * request, and the handle is deliberately **not** a canonical UID (`0`), so a factory that insists
+   * on a real account is refused loudly at construction instead of silently accepting an injection it
+   * would then fail to serve.
+   */
+  private probeAccount(): Account {
+    const handle = '0';
+    return {
+      id: accountIdOf(this.sourceInstance.id, handle),
+      sourceInstanceId: this.sourceInstance.id,
+      handle,
+      displayName: null,
+      profileUrl: null,
+    };
   }
 
   /** Require a coherent account: same instance, usable handle, id derived from both. */

@@ -4,9 +4,15 @@ import type { ConnectionFetchRoute, HostConnectionFetch } from '@deepseek-ai/dsh
 import { SqliteTrainingStore } from '../../src/adapters/sqlite/index.js';
 import { CoachingService } from '../../src/application/coaching-service.js';
 import { AnalysisPipeline } from '../../src/application/analysis-pipeline.js';
+import { createAnalysisBatch } from '../../src/application/batch-types.js';
 import type { ModelGateway } from '../../src/application/ports.js';
 import { defaultWorkbenchSettings } from '../../src/application/workbench-settings.js';
-import { createTaxonomy, createModelUsage } from '../../src/domain/index.js';
+import {
+  analysisJobIdOf,
+  createModelUsage,
+  createProblemSnapshot,
+  createTaxonomy,
+} from '../../src/domain/index.js';
 import { ModelOperations } from '../../src/plugin/model-operations.js';
 import { registerModelApi } from '../../src/plugin/model-api.js';
 import { disposeAll } from '../../src/plugin/lifecycle.js';
@@ -97,4 +103,81 @@ test('model route registration rolls back async contributions on partial failure
 test('cleanup attempts all resources once and retains failure',async()=>{
   const seen:number[]=[];const close=disposeAll([async()=>{seen.push(1);},async()=>{seen.push(2);throw Error('failure');},async()=>{seen.push(3);}]);
   const a=close(), b=close();assert.strictEqual(a,b);await assert.rejects(a,AggregateError);assert.deepEqual(seen,[3,2,1]);
+});
+
+// ---------------------------------------------------------------------------------------
+// Material preflight at the HTTP boundary (Sprint 33A)
+// ---------------------------------------------------------------------------------------
+
+/** One snapshot whose editorial state is unknown: no source record at all, so nothing is runnable. */
+function unreadableMaterialSnapshot(problem: Parameters<typeof createProblemSnapshot>[0]['problem']) {
+  return createProblemSnapshot({ problem, sources: [], solutions: [], capturedAt: fx.AT });
+}
+
+test('HTTP batch.prepare reports blocked material without a batch, and batch.detail keeps it read-only',async()=>{
+  const b=await setup();try {
+    const bare=fx.makeProblem(fx.makeRef(fx.makeInstance('codeforces','codeforces.com'),'4242X'));
+    await b.store.upsertProblems([bare]);
+    await b.store.saveSnapshot(unreadableMaterialSnapshot(bare));
+
+    const prepared=await b.registry.call('batch.prepare',{problemKeys:[bare.key]});
+    assert.equal(prepared.status,200);
+    assert.equal(prepared.body.value.batchId,null);
+    assert.deepEqual(prepared.body.value.jobs,[]);
+    // The refusal is explicit, free and spoiler-free: a reason, an action and zero calls.
+    assert.deepEqual(prepared.body.value.blocked,[{problemKey:bare.key,reason:'editorial_unknown',action:'refresh_materials'}]);
+    assert.deepEqual(prepared.body.value.availability,{ready:0,absent:0,error:1});
+    assert.deepEqual(prepared.body.value.upperBoundCalls,{analysisCalls:0,reasoningCalls:0,blocked:1});
+    assert.equal(b.calls().analyzed,0);
+    // No statement, source title, editorial body or classifier detail travels through the answer.
+    const serialized=JSON.stringify(prepared);
+    for (const leak of [bare.title,bare.statement!,'carry no referenced solution text','absence cannot be concluded']) {
+      assert.equal(serialized.includes(leak),false,`the answer must not carry ${leak}`);
+    }
+    // `batch.detail` of a fresh runnable batch carries the new read-only preflight field.
+    const runnable=await b.registry.call('batch.prepare',{problemKeys:[b.world.problem.key]});
+    assert.deepEqual(runnable.body.value.blocked,[]);
+    const detail=await b.registry.call('batch.detail',{batchId:runnable.body.value.batchId});
+    assert.deepEqual(detail.body.value.batch.materialBlocks,[]);
+  } finally {await b.close();}
+});
+
+test('a stored batch whose material cannot be analysed is refused over HTTP without an operation or a call',async()=>{
+  const b=await setup();try {
+    const batchId='legacy-http-blocked';
+    const snapshotId=b.world.problem.key+'@'+'0'.repeat(64)+':v1';
+    await b.store.saveBatch(createAnalysisBatch({
+      batchId,
+      jobs:[{jobId:analysisJobIdOf(snapshotId),snapshotId}],
+      createdAt:fx.AT,
+      maxJobs:1,
+    }),null);
+
+    // A direct API caller cannot bypass the gate: the refusal is `materials_blocked` with a fixed
+    // safe message, it is a 409 conflict, and no owned operation was created.
+    const run=await b.registry.call('batch.run',{batchId,expectedSettingsRevision:1});
+    assert.equal(run.status,409);
+    assert.equal(run.body.error.code,'materials_blocked');
+    assert.equal(typeof run.body.error.message,'string');
+    assert.equal(b.calls().analyzed,0);
+
+    const detail=await b.registry.call('batch.detail',{batchId});
+    assert.equal(detail.body.value.operation,null);
+    assert.equal(detail.body.value.batch.status,'pending');
+    assert.equal(detail.body.value.batch.jobs[0].snapshotId,snapshotId);
+    assert.deepEqual(detail.body.value.batch.counters,{analysisCalls:0,reasoningCalls:0,retries:0});
+    assert.equal(detail.body.value.batch.materialBlocks.length,1);
+    assert.equal(detail.body.value.batch.materialBlocks[0].reason,'snapshot_unreadable');
+    assert.equal(detail.body.value.batch.materialBlocks[0].action,'refresh_materials');
+    // A resume of the same batch is refused identically, so neither control path can start it.
+    const resume=await b.registry.call('batch.resume',{batchId,expectedSettingsRevision:1});
+    assert.equal(resume.status,409);
+    assert.equal(resume.body.error.code,'materials_blocked');
+    assert.equal(b.calls().analyzed,0);
+    // Nothing of the batch moved.
+    const after=await b.store.getBatch(batchId);
+    assert.equal(after?.status,'pending');
+    assert.equal(after?.revision,1);
+    assert.deepEqual(await b.store.listModelCallAttempts({batchId}),[]);
+  } finally {await b.close();}
 });

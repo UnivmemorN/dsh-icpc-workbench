@@ -7,6 +7,8 @@ import {activateHost,resolveHarnessHome,type ActivationEnvironment,type PublicHo
 import {ModelCatalog} from '../../src/plugin/model-catalog.js';
 import {SqliteTrainingStore} from '../../src/adapters/sqlite/index.js';
 import {createLuoguAccount,luoguSourceInstance} from '../../src/adapters/luogu/index.js';
+import type {FetchLike} from '../../src/adapters/platform/http.js';
+import {problemKey} from '../../src/domain/index.js';
 import {GuidanceMethodRegistry} from '../../src/adapters/guidance/index.js';
 import * as balanced from '../../packages/dsh-icpc-method-balanced/index.js';
 import {defaultWorkbenchSettings} from '../../src/application/workbench-settings.js';
@@ -250,12 +252,264 @@ test('an unsupported credential platform keeps bootstrap and the free business r
   assert.equal(f.calls(),0);
  }finally{await runtime.dispose();f.remove();}
 });
+/**
+ * A synthetic Luogu surface for the production composition: the anonymous problem statement, the
+ * authenticated solution surface (really paginated) and the authenticated record list.
+ *
+ * Every response is an in-process object; nothing here can reach the network, and no real credential,
+ * cookie or session is involved. `pages` records the `page` parameter of every solution request — the
+ * first page must have none — so a test can prove the production reader really paged, and `at` records
+ * the synthetic clock instant of every request, so a test can prove the source-wide floor holds across
+ * the two *different* transports the composition uses (the business adapter's anonymous transport and
+ * the account reader's transport).
+ */
+function luoguMaterialSurface(options:{readonly pid:string;readonly total:number;readonly perPage:number}){
+ const pages:(number|null)[]=[];
+ const paths:string[]=[];
+ const calls:{readonly path:string;readonly page:number|null;readonly at:number}[]=[];
+ let nowMs:()=>number=()=>0;
+ const fetchImpl:FetchLike=async(url)=>{
+  const parsed=new URL(url);
+  paths.push(parsed.pathname);
+  const raw=parsed.searchParams.get('page');
+  calls.push({path:parsed.pathname,page:raw===null?null:Number(raw),at:nowMs()});
+  if(parsed.pathname===`/problem/${options.pid}`){
+   return sfx.jsonResponse({status:200,data:{problem:{pid:options.pid,type:'P',name:'Synthetic problem',
+    difficulty:1,tags:[],content:{name:'Synthetic problem',description:'Given n, print n.',formatI:'One integer n.',
+    formatO:'One integer.',hint:null},samples:[['1','1']],limits:{time:[1000],memory:[262144]}}}});}
+  if(parsed.pathname===`/problem/solution/${options.pid}`){
+   const page=raw===null?1:Number(raw);
+   pages.push(raw===null?null:page);
+   const start=(page-1)*options.perPage;
+   const length=Math.min(options.perPage,Math.max(0,options.total-start));
+   const result=Array.from({length},(_,index)=>({lid:`lid-${start+index}`,title:`SYNTHETIC_SOLUTION_${start+index}`,
+    category:1,time:1_700_000_000,author:{uid:1,name:'synthetic-author'},upvote:1,replyCount:0,favorCount:0,status:2,
+    solutionFor:{pid:options.pid,type:'P'},content:`SYNTHETIC_BODY_${start+index}`,contentFull:true}));
+   return sfx.jsonResponse({status:200,data:{solutions:{perPage:options.perPage,count:options.total,result},
+    problem:{pid:options.pid,type:'P',name:'Synthetic problem'},acceptSolution:false},user:{uid:1,name:'viewer'}});}
+  throw new Error('the production composition must not request '+parsed.pathname);
+ };
+ return {fetchImpl,pages,paths,calls,setClock:(read:()=>number)=>{nowMs=read;}};
+}
+
+test('the production composition reads paged solution material through the host session reader',async()=>{
+ const clock=sfx.createClock(),waits=sfx.createWait(),vault=sfx.createMemoryVault(),timers=timerSeam();
+ const instance=luoguSourceInstance(),pid='P1001';
+ const surface=luoguMaterialSurface({pid,total:56,perPage:10});
+ // The gate and the transports share this one clock, and every paced wait advances it, so a recorded
+ // request instant measures the real spacing between whole operations.
+ const advancingWait=async(ms:number,token:Parameters<typeof waits.wait>[1]):Promise<void>=>{await waits.wait(ms,token);clock.advance(ms);};
+ surface.setClock(clock.nowMs);
+ const f=fixture({vault,now:clock.now,nowMs:clock.nowMs,wait:advancingWait,tickIntervalMs:1000,setInterval:timers.interval,
+  transport:{fetchImpl:surface.fetchImpl,clock:clock.nowMs,wait:advancingWait,setTimer:sfx.neverFireTimer},
+  anonymousTransport:{fetchImpl:surface.fetchImpl,clock:clock.nowMs,wait:advancingWait,setTimer:sfx.neverFireTimer}});
+ mkdirSync(f.dataDir,{recursive:true});
+ // Seed the durable shape a real connection leaves behind: the account, its connected session row and
+ // the stored problem the refresh targets. The cookie itself lives only in the synthetic vault.
+ const account=createLuoguAccount(instance,'800001'),reference='luogu.session.material-1';
+ vault.secrets.set(reference,sfx.cookieFor('800001'));
+ const problem=fx.makeProblem(fx.makeRef(instance,pid));
+ const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>clock.now()});
+ await seed.upsertSourceInstances([instance]);await seed.upsertAccounts([account]);await seed.upsertProblems([problem]);
+ await seed.saveLuoguConnection({accountId:account.id,sourceInstanceId:instance.id,reference,status:'connected',
+  connectedAt:clock.now(),checkedAt:clock.now(),failureCode:null,staleReference:null},null);
+ await seed.close();
+ // The guard goes up **before** activation: every transport this activation builds (including a default
+ // one that would capture `globalThis.fetch` at construction) must be the injected synthetic one, so a
+ // missing seam fails the case instead of quietly reaching the platform. The runtime stays nullable
+ // because activation itself is what the guard has to cover.
+ const realFetch=globalThis.fetch;
+ globalThis.fetch=(()=>{throw new Error('ICPC_TEST_NETWORK_FORBIDDEN');}) as typeof globalThis.fetch;
+ let runtime:Awaited<ReturnType<typeof activateHost>>|null=null;
+ try {
+  runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+  // The capability the whole revision exists for: the *business* Luogu adapter really reports the
+  // submissions and editorial support this composition has, instead of a session it cannot reach.
+  const boot=await f.call('bootstrap');
+  assert.equal(boot.status,200);
+  const luogu=boot.body.value.adapters.find((entry:any)=>entry.sourceInstanceId===instance.id);
+  assert.ok(luogu,'the Luogu adapter must be advertised');
+  assert.equal(luogu.capabilities.submissions,true,'the business adapter advertises submissions');
+  assert.equal(luogu.capabilities.editorial,true,'the business adapter advertises editorial material');
+
+  const refreshed=await f.call('material.refresh',{problemKey:problem.key,fetchStatement:true,accountId:account.id});
+  assert.equal(refreshed.status,200,JSON.stringify(refreshed.body));
+  const value=refreshed.body.value;
+  assert.equal(value.editorial.attempted,true);
+  assert.equal(value.editorial.status,'found');
+  assert.equal(value.editorial.sourceCount,56,'every write-up of every page is stored');
+  assert.equal(value.editorial.solutionCount,56);
+  assert.equal(value.statement.status,'fetched',JSON.stringify(value.statement.failure));
+  // The statement came from the anonymous metadata adapter and the material from the authenticated
+  // reader: one statement request, six solution pages (the first without a query), whole answer stored.
+  assert.deepEqual(surface.pages,[null,2,3,4,5,6]);
+  assert.equal(surface.paths.filter(path=>path===`/problem/${pid}`).length,1,JSON.stringify(surface.paths));
+  // Every business operation ran on the host's source gate, across two *different* transports: the
+  // anonymous statement read and the authenticated solution read are one whole gated operation each, so
+  // the first solution request starts at the source floor after the statement operation ended — the
+  // anonymous transport's own pacing could never produce that gap. The six pages inside the solution
+  // operation are paced by its transport (the gate is not re-entered per page).
+  const statement=surface.calls.find(call=>call.path===`/problem/${pid}`);
+  const solutions=surface.calls.filter(call=>call.path===`/problem/solution/${pid}`);
+  assert.ok(statement&&solutions.length===6);
+  const firstSolution=solutions[0]!;
+  assert.equal(firstSolution.at-statement.at>=2000,true,
+   `the source gate must separate the statement and solution operations: ${JSON.stringify(surface.calls)}`);
+  const pageGaps=solutions.slice(1).map((call,index)=>call.at-(solutions[index]?.at??0));
+  assert.equal(pageGaps.every(gap=>gap>=2000),true,JSON.stringify(surface.calls));
+  assert.equal(value.snapshot.sourceCount,56);
+  assert.equal(value.snapshot.solutionCount,56);
+  // The response is a status projection: no retrieved body may appear in it.
+  assert.equal(JSON.stringify(value).includes('SYNTHETIC_BODY'),false);
+  assert.equal(JSON.stringify(value).includes('synthetic-author'),false);
+  // And the stored snapshot really holds the bodies, one per write-up.
+  const inspect=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>clock.now()});
+  try {
+   const head=await inspect.getCurrentSnapshotHead(problem.ref);
+   assert.ok(head);
+   const snapshot=await inspect.getSnapshot(head.snapshotId);
+   assert.ok(snapshot);
+   assert.equal(snapshot.solutions.length,56);
+   assert.equal(snapshot.solutions.some(solution=>solution.text==='SYNTHETIC_BODY_55'),true,'the last page is stored');
+   assert.equal(snapshot.solutions.filter(solution=>solution.text.startsWith('SYNTHETIC_BODY_')).length,56);
+   assert.equal(snapshot.sources.length,56);
+   assert.equal(snapshot.sources.some(source=>source.title==='SYNTHETIC_SOLUTION_55'),true);
+   assert.equal(snapshot.sources.filter(source=>source.author==='synthetic-author').length,56);
+   assert.equal(snapshot.sources.every(source=>source.publishedAt===null&&source.language===null),true);
+   // Every source is the problem's own solution list, addressed by pid, and every write-up has its own
+   // source: one source per write-up is what the revision stores instead of one page-wide source.
+   assert.equal(snapshot.sources.every(source=>source.url===`https://www.luogu.com.cn/problem/solution/${pid}`),true);
+   assert.equal(new Set(snapshot.sources.map(source=>source.id)).size,56);
+   assert.equal(snapshot.solutions.every(solution=>snapshot.sources.some(source=>source.id===solution.sourceId)),true);
+  }finally{await inspect.close();}
+  assert.equal(f.calls(),0,'no model call is made anywhere in this slice');
+ }finally{
+  // Dispose first, then restore — and restore unconditionally: a disposal that throws must not leave
+  // the process with a refusing global fetch or a temporary directory behind.
+  try{
+   if(runtime!==null)await runtime.dispose();
+  }finally{
+   globalThis.fetch=realFetch;
+   f.remove();
+  }
+ }
+});
+test('the source gate serializes business reads across accounts',async()=>{
+ // Two accounts of one source, each with its own stored session and its own reader transport. Both
+ // business reads must run as whole gated operations of the *same* source: no request of the second
+ // read may start within the floor of the first read's last request, whatever transport it uses.
+ const clock=sfx.createClock(),waits=sfx.createWait(),vault=sfx.createMemoryVault(),timers=timerSeam();
+ const instance=luoguSourceInstance(),pid='P1001';
+ const surface=luoguMaterialSurface({pid,total:3,perPage:10});
+ const advancingWait=async(ms:number,token:Parameters<typeof waits.wait>[1]):Promise<void>=>{await waits.wait(ms,token);clock.advance(ms);};
+ surface.setClock(clock.nowMs);
+ const f=fixture({vault,now:clock.now,nowMs:clock.nowMs,wait:advancingWait,tickIntervalMs:1000,setInterval:timers.interval,
+  transport:{fetchImpl:surface.fetchImpl,clock:clock.nowMs,wait:advancingWait,setTimer:sfx.neverFireTimer},
+  anonymousTransport:{fetchImpl:surface.fetchImpl,clock:clock.nowMs,wait:advancingWait,setTimer:sfx.neverFireTimer}});
+ mkdirSync(f.dataDir,{recursive:true});
+ const first=createLuoguAccount(instance,'800001'),second=createLuoguAccount(instance,'800002');
+ vault.secrets.set('luogu.session.a',sfx.cookieFor('800001'));
+ vault.secrets.set('luogu.session.b',sfx.cookieFor('800002'));
+ const problem=fx.makeProblem(fx.makeRef(instance,pid));
+ const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>clock.now()});
+ await seed.upsertSourceInstances([instance]);await seed.upsertAccounts([first,second]);await seed.upsertProblems([problem]);
+ await seed.saveLuoguConnection({accountId:first.id,sourceInstanceId:instance.id,reference:'luogu.session.a',status:'connected',
+  connectedAt:clock.now(),checkedAt:clock.now(),failureCode:null,staleReference:null},null);
+ await seed.saveLuoguConnection({accountId:second.id,sourceInstanceId:instance.id,reference:'luogu.session.b',status:'connected',
+  connectedAt:clock.now(),checkedAt:clock.now(),failureCode:null,staleReference:null},null);
+ await seed.close();
+ const realFetch=globalThis.fetch;
+ globalThis.fetch=(()=>{throw new Error('ICPC_TEST_NETWORK_FORBIDDEN');}) as typeof globalThis.fetch;
+ let runtime:Awaited<ReturnType<typeof activateHost>>|null=null;
+ try {
+  runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+  for(const account of [first,second]){
+   const refreshed=await f.call('material.refresh',{problemKey:problem.key,fetchStatement:true,accountId:account.id});
+   assert.equal(refreshed.status,200,JSON.stringify(refreshed.body));
+   assert.equal(refreshed.body.value.editorial.status,'found',account.handle);
+   assert.equal(refreshed.body.value.editorial.solutionCount,3,account.handle);
+  }
+  // The recorded sequence is: statement(A), solutions(A), statement(B), solutions(B). Every gap is at
+  // least the source floor — an ungated read would dispatch its first request at the same instant as the
+  // previous operation's last one, because the two operations use different transports.
+  const calls=surface.calls;
+  assert.deepEqual(calls.map(call=>call.path),[`/problem/${pid}`,`/problem/solution/${pid}`,`/problem/${pid}`,`/problem/solution/${pid}`]);
+  for(let index=1;index<calls.length;index+=1){
+   const gap=(calls[index]?.at??0)-(calls[index-1]?.at??0);
+   assert.equal(gap>=2000,true,`gap ${String(index)} was ${String(gap)} ms: ${JSON.stringify(calls)}`);
+  }
+  assert.equal(f.calls(),0);
+ }finally{
+  // Dispose first, then restore unconditionally: a throwing disposal must not leave the refusing guard
+  // or the temporary directory behind.
+  try{
+   if(runtime!==null)await runtime.dispose();
+  }finally{
+   globalThis.fetch=realFetch;
+   f.remove();
+  }
+ }
+});
+test('an enabled startup sync repairs metadata through the default anonymous transport seam',async()=>{
+ // The host's *default* anonymous metadata source — the adapter a `runOnStartup` pass repairs missing
+ // problem metadata with — must also run on the injected transport. The seam is not passed as
+ // `metadataSource` here, so this case fails if that adapter is built without it (the refusing global
+ // fetch below would reject the repair instead of the synthetic surface answering it).
+ const clock=sfx.createClock(),waits=sfx.createWait(),vault=sfx.createMemoryVault(),timers=timerSeam();
+ const instance=luoguSourceInstance(),pid='P1001';
+ const surface=luoguMaterialSurface({pid,total:1,perPage:10});
+ const feed=sfx.createRecordFeed(new Map([['800001',sfx.toPages(sfx.buildRecords(3,[pid]),50)]]));
+ const routedFetch:FetchLike=async(url,init)=>{
+  const path=new URL(url).pathname;
+  return path==='/record/list'?feed.fetchImpl(url,init):surface.fetchImpl(url,init);
+ };
+ const f=fixture({vault,now:clock.now,nowMs:clock.nowMs,wait:waits.wait,tickIntervalMs:1000,setInterval:timers.interval,
+  transport:{fetchImpl:routedFetch,clock:clock.nowMs,wait:waits.wait,setTimer:sfx.neverFireTimer},
+  anonymousTransport:{fetchImpl:routedFetch,clock:clock.nowMs,wait:waits.wait,setTimer:sfx.neverFireTimer}});
+ mkdirSync(f.dataDir,{recursive:true});
+ const account=createLuoguAccount(instance,'800001');
+ vault.secrets.set('luogu.session.startup',sfx.cookieFor('800001'));
+ const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>clock.now()});
+ await seed.upsertSourceInstances([instance]);await seed.upsertAccounts([account]);
+ await seed.saveLuoguSyncSettings({accountId:account.id,automaticEnabled:true,runOnStartup:true,intervalMinutes:30,updatedAt:clock.now()},null);
+ await seed.saveLuoguConnection({accountId:account.id,sourceInstanceId:instance.id,reference:'luogu.session.startup',status:'connected',
+  connectedAt:clock.now(),checkedAt:clock.now(),failureCode:null,staleReference:null},null);
+ await seed.close();
+ const realFetch=globalThis.fetch;
+ globalThis.fetch=(()=>{throw new Error('ICPC_TEST_NETWORK_FORBIDDEN');}) as typeof globalThis.fetch;
+ let runtime:Awaited<ReturnType<typeof activateHost>>|null=null;
+ try {
+  runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
+  // The startup sweep runs before activation returns; wait for the pass to reach its incremental phase.
+  await waitFor(async()=>{const view=await f.call('luogu.status',{accountId:account.id});return view.body.value.phase==='incremental';},'the startup metadata repair to complete');
+  // The default anonymous metadata source answered from the injected surface…
+  assert.equal(surface.calls.some(call=>call.path===`/problem/${pid}`),true,
+   `the default metadata source must use the injected transport: ${JSON.stringify(surface.calls)}`);
+  // …the submission history came from the injected record feed…
+  assert.equal(feed.calls.length>0,true,'the authenticated reader used the injected record feed');
+  // …and the repaired metadata really landed in the store.
+  const inspect=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>clock.now()});
+  try {
+   const stored=await inspect.getProblem(problemKey({sourceInstanceId:instance.id,domain:null,externalKey:pid}));
+   assert.ok(stored,'the startup pass must store the repaired problem');
+   assert.equal(stored.title,'Synthetic problem');
+  }finally{await inspect.close();}
+  assert.equal(f.calls(),0);
+ }finally{
+  try{
+   if(runtime!==null)await runtime.dispose();
+  }finally{
+   globalThis.fetch=realFetch;
+   f.remove();
+  }
+ }
+});
 test('activation shares the installed guidance catalogue with production plan preparation',async()=>{
- const f=fixture();
  // The very seam `apply()` uses for the `icpcGuidance` service: a method registered here is what a
  // companion package installs, and plan preparation must capture it instead of reporting that no
  // catalogue is composed.
  const registry=new GuidanceMethodRegistry();registry.register(balanced.balancedMethod);
+ const f=fixture();
  const scope=fx.makeScope('codeforces','codeforces.com','alice','1A');
  mkdirSync(f.dataDir,{recursive:true});
  const seed=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>fx.AT});

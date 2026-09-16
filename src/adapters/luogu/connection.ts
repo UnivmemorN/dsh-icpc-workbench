@@ -235,14 +235,20 @@ export function createStoredLuoguSessionProvider(
 }
 
 /**
- * Build the submissions source the sync service drives.
+ * Build the submissions source the sync service drives, and expose the very readers it uses.
  *
- * One reader per account is cached, so the reader's own per-account transport pacing survives
- * across pages; the stored-session provider under it re-reads the current session on every call.
+ * One reader per account is cached, so the reader's own per-account transport pacing survives across
+ * pages; the stored-session provider under it re-reads the current session on every call.
+ *
+ * The returned function carries its own `readerFor`, which answers the *same* cached instance the
+ * submission sync uses. That is what lets a composition give its editorial reader the account's
+ * existing session, pacing state and cookie lifecycle instead of building a second credential path:
+ * one reader per account serves both surfaces, and a session that is reconnected or forgotten is
+ * observed by both immediately, because the provider under it re-reads the row and the vault per call.
  */
 export function createStoredSubmissionsSource(
   options: StoredSubmissionsSourceOptions,
-): (account: Account) => SyncPageSource {
+): LuoguStoredSubmissionsSource {
   invariant(
     options !== null && typeof options === 'object' && options.sourceInstance !== null,
     'unfilled_settings',
@@ -263,7 +269,7 @@ export function createStoredSubmissionsSource(
         maxRedirects: options.transport?.maxRedirects,
       }));
   const readers = new Map<string, LuoguBoundSessionReader>();
-  return (account: Account): SyncPageSource => {
+  const readerFor = (account: Account): LuoguBoundSessionReader => {
     const existing = readers.get(account.id);
     if (existing !== undefined) {
       return existing;
@@ -272,6 +278,20 @@ export function createStoredSubmissionsSource(
     readers.set(account.id, reader);
     return reader;
   };
+  return Object.assign(readerFor, { readerFor });
+}
+
+/**
+ * The per-account submissions source plus the readers behind it.
+ *
+ * `readerFor` is the seam a composition uses to reach the *same* authenticated reader the submission
+ * sync drives, so an editorial read shares that account's transport, pacing floor and cookie lifecycle
+ * rather than opening a second credential path.
+ */
+export interface LuoguStoredSubmissionsSource {
+  (account: Account): SyncPageSource;
+  /** The cached authenticated reader of exactly this account, creating it on first use. */
+  readerFor(account: Account): LuoguBoundSessionReader;
 }
 
 /** What one observed reader failure means for the stored connection. */

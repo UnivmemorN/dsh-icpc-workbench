@@ -511,7 +511,7 @@ function validateManualEditorial(value: unknown): ApiManualEditorialInput {
 
 export function validateMaterialRefresh(value: unknown): ApiMaterialRefreshRequest {
   const object = plainObject('material.refresh', value);
-  requireKeys('material.refresh', object, ['problemKey', 'fetchStatement'], ['officialTutorialUrl']);
+  requireKeys('material.refresh', object, ['problemKey', 'fetchStatement'], ['officialTutorialUrl', 'accountId']);
   return {
     problemKey: problemKeyInput('problemKey', object['problemKey']),
     fetchStatement: booleanValue('fetchStatement', object['fetchStatement']),
@@ -524,6 +524,8 @@ export function validateMaterialRefresh(value: unknown): ApiMaterialRefreshReque
             MAX_API_TEXT_CHARS,
           ),
         }),
+    // The account is an opaque stored id; the handler resolves it and re-checks its source instance.
+    ...(object['accountId'] === undefined ? {} : { accountId: nullableString('accountId', object['accountId'], 256) }),
   };
 }
 

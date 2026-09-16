@@ -488,11 +488,21 @@ export interface ApiImportApplyResult {
   readonly changedSnapshots: number;
 }
 
-/** Request of `material.refresh`: explicit statement flag plus an optional official tutorial URL. */
+/** Request of `material.refresh`: explicit statement flag, optional account and optional tutorial URL. */
 export interface ApiMaterialRefreshRequest {
   readonly problemKey: string;
   readonly fetchStatement: boolean;
   readonly officialTutorialUrl?: string | null;
+  /**
+   * Account whose authenticated session may be used for the read (Sprint 33C).
+   *
+   * A platform that publishes solution material only to a signed-in reader needs to know whose
+   * session to use. It is the *caller's selected account*, never free text: the plugin resolves it
+   * from the store and refuses one that does not belong to the problem's own source instance, so a
+   * request can neither name a foreign account nor make one up. Absent/`null` reads anonymously,
+   * which can never report an absence.
+   */
+  readonly accountId?: string | null;
 }
 
 /** Head metadata after a refresh; editorial bodies and raw tags stay out of this projection. */
@@ -525,11 +535,27 @@ export interface ApiEditorialStatusView {
   readonly skippedReason: string | null;
 }
 
+/**
+ * Whether the equivalent Codeforces problem was consulted for this target, and if not, why.
+ *
+ * It is metadata only: the derived Codeforces identifier is public platform identity (the same key
+ * the merged bank groups by), and no source URL, blog id, title or body travels through it. A
+ * `skipped` answer never implies that Codeforces has no editorial — it means this run deliberately
+ * did not ask.
+ */
+export interface ApiMirrorEditorialView {
+  readonly status: 'skipped' | 'fetched';
+  readonly skippedReason: string | null;
+  /** Derived Codeforces external key (`<contest><index>`), or `null` when the rule did not apply. */
+  readonly key: string | null;
+}
+
 export interface ApiMaterialRefreshResult {
   readonly problemKey: string;
   readonly snapshot: ApiMaterialSnapshotView | null;
   readonly statement: ApiStatementStatusView;
   readonly editorial: ApiEditorialStatusView;
+  readonly mirror: ApiMirrorEditorialView;
   readonly material: ApiMaterialDeclarationView | null;
 }
 

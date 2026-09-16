@@ -7,6 +7,14 @@
  * adapter, the account-bound authenticated metadata fallback and the durable `LuoguSyncService` —
  * plus the single interval timer that drives the per-account due instants.
  *
+ * ## One credential path
+ *
+ * `submissionsFor` owns one authenticated reader per account, and the runtime republishes it as
+ * {@link LuoguHostRuntime.sessionReader}. The submission sync and the editorial read therefore share
+ * that account's transport, its >= 2 s pacing state, its cookie lifecycle and its session provider;
+ * composition injects the same function into the business adapter, so no second credential path can
+ * exist. The cookie still travels only from the vault into one authenticated reader call.
+ *
  * ## Order of operations
  *
  * `start()` first runs {@link recoverDurableSync}, which materializes the contract defaults of every
@@ -53,9 +61,9 @@ import {
   createStoredSubmissionsSource,
 } from '../adapters/luogu/index.js';
 import { WindowsCredentialVault } from '../adapters/windows/index.js';
-import type { WaitFn } from '../adapters/platform/http.js';
+import type { ClockFn, FetchLike, SetTimerFn, WaitFn } from '../adapters/platform/http.js';
 import { LuoguSyncService } from '../application/luogu-sync-service.js';
-import { createLuoguSourceGate } from '../application/luogu-source-gate.js';
+import { createLuoguSourceGate, type LuoguSourceGate } from '../application/luogu-source-gate.js';
 import {
   defaultLuoguSyncSettings,
   emptyLuoguSyncState,
@@ -64,6 +72,7 @@ import {
 } from '../application/luogu-sync-types.js';
 import type { LocalCredentialVault } from '../application/local-credential-vault.js';
 import type { ImportService } from '../application/import-service.js';
+import type { LuoguSessionReader } from '../application/luogu-session.js';
 import type { PlatformAdapter, PlatformLimits, ProblemMetadataSource, TrainingStore } from '../application/ports.js';
 import {
   DomainError,
@@ -103,8 +112,24 @@ export interface LuoguHostSeam {
   readonly tickIntervalMs?: number;
   /** Transport wiring of the authenticated reader (synthetic fetch in tests). */
   readonly transport?: Parameters<typeof createStoredSubmissionsSource>[0]['transport'];
+  /**
+   * Transport wiring of the **anonymous** metadata reader.
+   *
+   * Composition uses this to hand the business adapter the same synthetic fetch the rest of the slice
+   * runs on: an offline activation must not leave one adapter on the real network. Production supplies
+   * nothing here and the adapter builds its own official-origin transport.
+   */
+  readonly anonymousTransport?: LuoguAnonymousTransport;
   /** Anonymous metadata source; defaults to the composition's official Luogu adapter. */
   readonly metadataSource?: PlatformAdapter;
+}
+
+/** Transport wiring of an anonymous Luogu adapter (the fields `LuoguAdapterOptions` accepts). */
+export interface LuoguAnonymousTransport {
+  readonly fetchImpl?: FetchLike;
+  readonly clock?: ClockFn;
+  readonly wait?: WaitFn;
+  readonly setTimer?: SetTimerFn;
 }
 
 export interface LuoguHostOptions {
@@ -130,6 +155,26 @@ export interface LuoguHostRuntime {
   readonly connectionAvailable: boolean;
   /** Resolved platform of the credential backend, disclosed even when unavailable. */
   readonly connectionPlatform: string;
+  /**
+   * The account-bound authenticated reader of this host: the **same** `LuoguSessionReader` instance
+   * the submission sync drives, one per account.
+   *
+   * Composition injects this into the business `LuoguAdapter`, so an editorial read runs on the
+   * account's existing transport — one credential path, one >= 2 s source pacing state and one cookie
+   * lifecycle per account — instead of a second session mechanism. It exposes only the two normalized
+   * reader operations; no cookie, vault reference or connection record is reachable through it.
+   */
+  readonly sessionReader: (account: Account) => LuoguSessionReader;
+  /**
+   * The one source-wide gate this host owns.
+   *
+   * The sync service and the connection manager already run their own operations through it, so
+   * composition must wrap every *additional* Luogu HTTP path (the business adapter's anonymous and
+   * authenticated reads) in this same instance: one gate per source instance is what makes the >= 2 s
+   * quiet time hold across transports and accounts. Wrapping a path the host already gates would nest
+   * two floors, so the wrapper belongs around the business adapter only.
+   */
+  readonly gate: LuoguSourceGate;
   /** Recover durable state, run the startup sweep and start the periodic tick. */
   start(token: CancellationToken): Promise<void>;
   /** Stop the timer and drain the service; idempotent. */
@@ -366,6 +411,8 @@ export function createLuoguHost(options: LuoguHostOptions): LuoguHostRuntime {
     service,
     connectionAvailable: capabilities.implemented,
     connectionPlatform: capabilities.platform,
+    sessionReader: (account: Account): LuoguSessionReader => submissionsFor.readerFor(account),
+    gate,
     async start(token: CancellationToken): Promise<void> {
       if (started || disposed) {
         return;
