@@ -2,7 +2,7 @@
 
 面向个人 ICPC 训练的 DeepSeek Harness 插件：汇总 Codeforces、洛谷和手工做题记录，复核并补全知识点标签，查看薄弱项，生成兼顾思维与板子的训练计划及能力评估。
 
-当前为 **0.1.25 实验版**。已测试宿主 **dsh 0.1.5-rc.2**，Node **22.19+（22 系列）或 24+**。插件源码、训练数据与 Harness 工作区分别管理。
+当前为 **0.1.26 实验版**。已测试宿主 **dsh 0.1.5-rc.2**，Node **22.19+（22 系列）或 24+**。插件源码、训练数据与 Harness 工作区分别管理。
 
 ## 文档
 
@@ -15,7 +15,7 @@
 
 1. 按[安装指南](docs/user/installation.md)将本地安装包放入独立的 dsh profile，并设置训练数据目录。
 2. 在「账号与同步」添加 CF Handle 或洛谷数字 UID，导入或同步记录。见[账号与同步](docs/user/accounts-and-sync.md)。
-3. 在[题库](docs/user/problem-bank.md)查看题目并补充完成方式，再进行[标签审核](docs/user/tags-and-answers.md)或[训练与评估](docs/user/training-and-assessment.md)。
+3. 在[题库](docs/user/problem-bank.md)查看题目、补充完成方式，也可以勾选多道题批量刷新平台材料；随后进行[标签审核](docs/user/tags-and-answers.md)或[训练与评估](docs/user/training-and-assessment.md)。
 
 日常安装使用已有的本地 tgz；从源码构建安装包的步骤见开发文档。遇到问题可查看[故障排查](docs/user/troubleshooting.md)。
 

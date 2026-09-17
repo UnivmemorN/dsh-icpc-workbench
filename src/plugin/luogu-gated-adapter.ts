@@ -20,7 +20,10 @@
  * does not have stays absent, so a caller's own capability check keeps deciding.
  *
  * The gate's `run` receives the caller's token, so a queued operation whose request is cancelled
- * before it starts never dispatches anything.
+ * before it starts never dispatches anything. An editorial answer may carry a provider-declared
+ * Retry-After (`rate_limited`, or an `unavailable` outage that declared one); the wrapper hands the
+ * gate a typed extractor so that delay becomes the **source-wide** not-before instant, which every
+ * later operation of this source — of whichever transport — observes.
  */
 import type { LuoguSourceGate } from '../application/luogu-source-gate.js';
 import type {
@@ -63,6 +66,22 @@ function requireGate(gate: LuoguSourceGate): LuoguSourceGate {
 }
 
 /**
+ * The declared Retry-After of one editorial answer, or `null` when it declared none.
+ *
+ * Both failure variants that can declare a delay are read: `rate_limited` always carries the member
+ * (possibly `null`), `unavailable` carries it only when the provider declared one, and `found`,
+ * `absent`, `auth_required`, `forbidden` and `changed_response` never do. The value is handed to the
+ * gate unchanged; the gate itself validates it, so a `null`, a zero and a negative value are all
+ * "no declaration" and can never move the shared deadline backwards.
+ */
+function editorialRetryAfterOf(result: EditorialFetchResult): number | null {
+  if (result.status === 'rate_limited' || result.status === 'unavailable') {
+    return result.retryAfterMs ?? null;
+  }
+  return null;
+}
+
+/**
  * Wrap one adapter so each of its operations is one whole gated operation.
  *
  * `capabilities()` and `sourceInstance` pass through untouched: the wrapper must never make an adapter
@@ -92,7 +111,9 @@ export function createGatedLuoguAdapter(
       return gate.run(request.token, () => adapter.fetchProblem(request));
     },
     fetchEditorial(request: FetchEditorialRequest): Promise<EditorialFetchResult> {
-      return gate.run(request.token, () => adapter.fetchEditorial(request));
+      // The extractor runs while this call still owns the FIFO slot, so a queued operation of the
+      // same source — including one of another account's transport — already observes the delay.
+      return gate.run(request.token, () => adapter.fetchEditorial(request), editorialRetryAfterOf);
     },
     ...(typeof adapter.fetchAccountProfile === 'function'
       ? {

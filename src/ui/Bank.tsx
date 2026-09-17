@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Panel, Empty, Notice, ErrorNotice, useWorkbench, useRequest, tagName } from './common.js';
+import { BulkMaterialRefresh } from './BulkMaterialRefresh.js';
+import {
+  MATERIAL_HISTORY_ENTRY_LABEL,
+  MATERIAL_HISTORY_SCOPE_NOTE,
+  MATERIAL_HISTORY_TITLE,
+  materialScopeIdentity,
+} from './material-batch-view.js';
 import { CompletionEditor } from './CompletionEditor.js';
 import {
   MAX_COMPLETION_EDIT_KEYS,
@@ -208,6 +215,25 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
     fromSelection: boolean;
   } | null>(null);
   const [selectionNotice, setSelectionNotice] = useState<string | null>(null);
+  /**
+   * The captured bank selection one open bulk-material panel refreshes; `null` while closed.
+   *
+   * The keys are captured when the panel opens, so the scope it states cannot silently follow a later
+   * selection change; the panel itself is reusable and the review page passes its own aggregated scope.
+   * The panel is keyed by that captured scope identity, so re-opening it for a different capture resets
+   * its durable material batch instead of showing an old batch under the new scope's text.
+   */
+  const [materialScope, setMaterialScope] = useState<readonly string[] | null>(null);
+  /**
+   * The always-available history/recovery surface of the durable material batches.
+   *
+   * It needs no selection: after a reload `selectedKeys` is empty, yet a batch returned by
+   * `material.list` must stay reachable. Opening it captures no scope, so the panel's free prepare is
+   * refused there while the stored list, the batch detail and that batch's own explicit start/cancel/
+   * retry actions stay available. Opening, loading and selecting are reads, and the opener itself
+   * never prepares, starts or resumes anything.
+   */
+  const [materialHistoryOpen, setMaterialHistoryOpen] = useState(false);
   /** Bumped after a successful completion edit so the open problem detail re-reads its record. */
   const [detailVersion, setDetailVersion] = useState(0);
   const editorAnchor = useRef<HTMLDivElement | null>(null);
@@ -417,6 +443,22 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
             onClick={() => openEditor(selectedKeys, true)}
           >
             批量修改完成方式
+          </button>
+          <button
+            type="button"
+            disabled={!selectionGates.selection}
+            onClick={() => {
+              // The two `BulkMaterialRefresh` surfaces are mutually exclusive, so only one durable
+              // material batch can ever be on screen under one scope sentence.
+              setMaterialHistoryOpen(false);
+              setMaterialScope([...selectedKeys]);
+            }}
+          >
+            批量刷新平台材料（不调用 AI）
+          </button>
+          {/* Always enabled, even with nothing selected: history and recovery must survive a reload. */}
+          <button type="button" onClick={() => { setMaterialScope(null); setMaterialHistoryOpen(true); }}>
+            {MATERIAL_HISTORY_ENTRY_LABEL}
           </button>
           <button type="button" disabled={!selectionGates.selection} onClick={() => navigate('review')}>
             准备标签分析
@@ -854,6 +896,27 @@ export function PlatformBank({ reviewOnly = false }: { reviewOnly?: boolean }) {
         {read.error === null && pager('bottom')}
         {selectionBar('bottom')}
       </Panel>
+      {materialScope !== null && (
+        <BulkMaterialRefresh
+          key={materialScopeIdentity(null, materialScope)}
+          problemKeys={materialScope}
+          accountId={accountId}
+          scopeNote={
+            `本次范围：打开面板时选中的 ${materialScope.length} 题，保留当时的顺序；之后改变题库选择不会改变本面板范围。`
+          }
+          onClose={() => setMaterialScope(null)}
+        />
+      )}
+      {materialHistoryOpen && (
+        <BulkMaterialRefresh
+          key={materialScopeIdentity(null, [])}
+          problemKeys={[]}
+          accountId={accountId}
+          title={MATERIAL_HISTORY_TITLE}
+          scopeNote={MATERIAL_HISTORY_SCOPE_NOTE}
+          onClose={() => setMaterialHistoryOpen(false)}
+        />
+      )}
       {problemKey ? (
         <ProblemView
           key={problemKey + '|' + accountId + '|' + detailVersion}

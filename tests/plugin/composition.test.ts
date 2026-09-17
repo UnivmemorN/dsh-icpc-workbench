@@ -20,25 +20,28 @@ function fixture(luogu?:ActivationEnvironment['luogu']) {
  const temp=fx.tempDatabase(),hostDir=join(temp.dir,'host'),dataDir=join(temp.dir,'training');
  mkdirSync(hostDir);writeFileSync(join(hostDir,'package.json'),JSON.stringify({name:'@deepseek-ai/dsh',version:'0.1.5-rc.2'}));
  const launcherPath=join(hostDir,'bin.js');writeFileSync(launcherPath,'// fixture');
- const routes=new Map<string,ConnectionFetchRoute>();let calls=0,failAt=Infinity;
- const host={connection:{fetch:{register(route:ConnectionFetchRoute){if(routes.size===failAt)throw Error('injected registration failure');routes.set(route.path,route);return async()=>{await Promise.resolve();routes.delete(route.path);};}}},
+ const routes=new Map<string,ConnectionFetchRoute>();let calls=0,failAt=Infinity,failPath:((path:string)=>boolean)|null=null;
+ const host={connection:{fetch:{register(route:ConnectionFetchRoute){if(routes.size===failAt||failPath?.(route.path)===true)throw Error('injected registration failure');routes.set(route.path,route);return async()=>{await Promise.resolve();routes.delete(route.path);};}}},
   llm:{listProviders:()=>[{id:'deepseek-official',name:'DeepSeek'}],listModels:async(provider:string)=>[{id:'deepseek-flash',provider,name:'Flash'}],
    resolveModelInfo:async(provider:string,id:string)=>({provider,id,name:id,inputModalities:['text'],context:{contextWindow:1_000_000},defaultMaxTokens:1024,reasoning:{efforts:[{id:'max',name:'Max'}]}}),
    async *stream(){calls++;throw Error('unexpected paid call');}},
   sessionPersistence:{create(){calls++;throw Error('unexpected persistence creation');}},
   sessions:{prepare(){calls++;throw Error('unexpected audit session');},create(){calls++;throw Error('unexpected audit session');},flush:async()=>{calls++;return true;}}} as unknown as PublicHost;
  const environment={nodeVersion:'24.15.0',launcherPath,dshHome:join(temp.dir,'dsh-home'),...(luogu===undefined?{}:{luogu})};
- return {temp,host,dataDir,environment,routes,calls:()=>calls,setFailure:(n:number)=>{failAt=n;},
+ return {temp,host,dataDir,environment,routes,calls:()=>calls,setFailure:(n:number)=>{failAt=n;},setFailurePath:(predicate:(path:string)=>boolean)=>{failPath=predicate;},
   async call(operation:string,value?:unknown){const route=routes.get('/api/icpc/v1/'+operation)!;assert.ok(route,'registered route '+operation);const response=await route.fetch(new Request('http://localhost/api/icpc/v1/'+operation,value===undefined?{}:{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(value)}));return {status:response.status,body:await response.json() as any};},
   remove:()=>fx.removeDirectory(temp.dir)};
 }
 test('host composition keeps activation free, persists settings/accounts and creates a restorable backup',async()=>{
  const f=fixture();let runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.calls(),0);assert.equal(f.routes.size,68); // 46 business/model/bootstrap + 13 typed Luogu + 3 virtual-performance + 6 assessment operations.
+  assert.equal(f.calls(),0);assert.equal(f.routes.size,74); // 24 free business + 13 typed Luogu + 18 model/bootstrap + 6 bulk material refresh + 3 virtual-performance + 6 assessment + 1 guidance + 3 bootstrap operations.
   // The six durable ability-assessment routes are part of that count, so a registration regression
   // cannot hide behind a coincidentally unchanged total somewhere else.
   for(const operation of ['retro.list','retro.editPreview','retro.editApply','assessment.config','assessment.prepare','assessment.run','assessment.status','assessment.cancel','assessment.history'])assert.ok(f.routes.has('/api/icpc/v1/'+operation),'assessment route '+operation+' must be registered');
+  // The six Sprint 34A bulk material-refresh routes are named too: each one is a real typed operation,
+  // so a dropped registration cannot be absorbed by another stage's route count.
+  for(const operation of ['material.prepare','material.start','material.detail','material.list','material.cancel','material.retryFailed'])assert.ok(f.routes.has('/api/icpc/v1/'+operation),'bulk material route '+operation+' must be registered');
   for (const operation of ['luogu.metadataBacklog', 'luogu.retryMetadata', 'luogu.supplementMetadata', 'luogu.managedProblems', 'luogu.manageProblems']) assert.ok(f.routes.has('/api/icpc/v1/' + operation), 'recovery route ' + operation + ' must be registered');
   assert.ok(f.routes.has('/api/icpc/v1/luogu.profile'),'the anonymous public-profile route must be registered');
   const boot=await f.call('bootstrap');assert.equal(boot.status,200);assert.equal(boot.body.value.settings.revision,1);assert.equal(boot.body.value.sources.length,2);assert.equal(boot.body.value.hydro.implemented,false);assert.equal(boot.body.value.hostVersion,'0.1.5-rc.2');
@@ -169,7 +172,7 @@ test('the luogu host recovers durable state, keeps defaults offline and owns its
  await seed.upsertSourceInstances([instance]);await seed.upsertAccounts([account]);await seed.close();
  const runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
  try {
-  assert.equal(f.routes.size,68);
+  assert.equal(f.routes.size,74);
   assert.equal(feed.calls.length,0,'default automation must not contact the platform on startup');
   assert.equal(timers.entries.length,1,'exactly one owned periodic timer');
   assert.equal(timers.entries[0]?.intervalMs,1000);
@@ -225,12 +228,26 @@ test('an enabled runOnStartup account syncs through the injected transport and m
 test('a failed route registration rolls the luogu host back without leaving routes or timers',async()=>{
  const clock=sfx.createClock(),waits=sfx.createWait(),vault=sfx.createMemoryVault(),timers=timerSeam();
  const f=fixture({vault,now:clock.now,nowMs:clock.nowMs,wait:waits.wait,tickIntervalMs:1000,setInterval:timers.interval});
- f.setFailure(45); // The 46th registration is a Luogu operation, after the host already started.
+ f.setFailure(45); // A registration failure after the Luogu host already started and owned its timer.
  try {
   await assert.rejects(()=>activateHost(f.host,{dataDir:f.dataDir},f.environment),/injected registration failure/);
   assert.equal(f.routes.size,0);
   assert.equal(timers.entries.length,1);
   assert.equal(timers.entries[0]?.stopped,true,'rollback stops the owned timer');
+ }finally{f.remove();}
+});
+test('a failed bulk material-refresh registration removes its routes and closes the service',async()=>{
+ // The service is created, recovered and given a disposer *before* its API registration (route-first
+ // disposal), so a failure while registering the very first material route must roll back through that
+ // already-registered service disposer: no route is left behind and the database is still openable.
+ const f=fixture();
+ f.setFailurePath(path=>path.endsWith('/material.prepare'));
+ try {
+  await assert.rejects(()=>activateHost(f.host,{dataDir:f.dataDir},f.environment),/injected registration failure/);
+  assert.equal(f.routes.size,0);
+  assert.equal(f.routes.has('/api/icpc/v1/material.start'),false);
+  const store=new SqliteTrainingStore({path:join(f.dataDir,'training.sqlite'),now:()=>fx.AT});
+  try{assert.deepEqual(await store.listMaterialRefreshBatches(null),[]);}finally{await store.close();}
  }finally{f.remove();}
 });
 test('an unsupported credential platform keeps bootstrap and the free business routes alive',async()=>{
@@ -480,8 +497,14 @@ test('an enabled startup sync repairs metadata through the default anonymous tra
  let runtime:Awaited<ReturnType<typeof activateHost>>|null=null;
  try {
   runtime=await activateHost(f.host,{dataDir:f.dataDir},f.environment);
-  // The startup sweep runs before activation returns; wait for the pass to reach its incremental phase.
-  await waitFor(async()=>{const view=await f.call('luogu.status',{accountId:account.id});return view.body.value.phase==='incremental';},'the startup metadata repair to complete');
+  // The startup sweep runs before activation returns; wait for the pass to reach its incremental phase
+  // **and** to drain the metadata backlog it queued. Waiting for the backlog as well is what makes the
+  // assertions below read a committed repair: the phase alone flips when the history page commits,
+  // while the per-key metadata write that follows it is still in flight.
+  await waitFor(async()=>{const view=await f.call('luogu.status',{accountId:account.id});return view.body.value.phase==='incremental'&&view.body.value.metadataBacklog===0;},'the startup metadata repair to complete');
+  const repaired=await f.call('luogu.status',{accountId:account.id});
+  assert.equal(repaired.body.value.metadataResolved,1,'the queued key must be resolved, not failed');
+  assert.equal(repaired.body.value.metadataFailed,0,'the startup repair must not fail the queued key');
   // The default anonymous metadata source answered from the injected surface…
   assert.equal(surface.calls.some(call=>call.path===`/problem/${pid}`),true,
    `the default metadata source must use the injected transport: ${JSON.stringify(surface.calls)}`);

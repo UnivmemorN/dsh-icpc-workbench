@@ -23,18 +23,20 @@ import { DshPlanGenerator } from '../adapters/dsh/plan-generator.js';
 import { AnalysisPipeline } from '../application/analysis-pipeline.js';
 import { CoachingService } from '../application/coaching-service.js';
 import { ImportService } from '../application/import-service.js';
+import { MaterialRefreshBatchService } from '../application/material-refresh-batch-service.js';
 import { PlanningService } from '../application/planning-service.js';
 import { VirtualPerformanceService } from '../application/virtual-performance-service.js';
 import { WorkbenchService } from '../application/workbench-service.js';
 import { defaultWorkbenchSettings, isFlashOnlySettings, withFlashOnlyModels } from '../application/workbench-settings.js';
 import { DEFAULT_PLATFORM_LIMITS, type PlatformAdapter } from '../application/ports.js';
 import type { GuidanceCatalog } from '../application/guidance-catalog.js';
-import { CURRENT_TAXONOMY, createCancellationSource, createTaxonomyIndex } from '../domain/index.js';
+import { CURRENT_TAXONOMY, CODEFORCES_MAIN_INSTANCE_ID, createCancellationSource, createTaxonomyIndex } from '../domain/index.js';
 import { checkHostCompatibility, type HostCompatibilityProbe } from './compatibility.js';
 import { parsePluginConfig, resolveDataDir } from './config.js';
 import { ModelCatalog, type CatalogHost } from './model-catalog.js';
 import { ModelOperations } from './model-operations.js';
 import { registerBusinessApi } from './business-api.js';
+import { registerMaterialBatchApi } from './material-batch-api.js';
 import { registerPerformanceApi } from './performance-api.js';
 import { registerModelApi } from './model-api.js';
 import { registerBootstrapApi } from './bootstrap-api.js';
@@ -159,6 +161,28 @@ export async function activateHost(host:PublicHost,config:unknown={},environment
       connectionPlatform:luoguHost.connectionPlatform,now,...observer}));
     disposers.push(await registerBusinessApi({registry:host.connection.fetch,store,imports,workbench,sources:sources.map(instance=>({instance})),settings:()=>store.getWorkbenchSettings(),now,uniqueId:randomUUID,
       adapterFor:async id=>{const adapter=businessAdapters.get(id);if(!adapter)throw Error('ICPC_SOURCE_ADAPTER_UNSUPPORTED');return adapter;},...observer,onDisposeError:reportFailure}));
+    // Durable bulk material refresh (Sprint 34A): a separate aggregate that refreshes 1..100 selected
+    // stored problems through the *same* accepted single-problem refresh service and the same composed
+    // adapters (the source-gated Luogu adapter included), so every platform/source gate is preserved.
+    // Recovery runs before the routes exist: a batch a dead process left `running` becomes `paused`
+    // with its in-flight item retryable, and nothing contacts a platform automatically. The service
+    // is never given a model, a budget or an attempt: a bulk material refresh is platform IO only.
+    const cfMirrorAdapter=businessAdapters.get(CODEFORCES_MAIN_INSTANCE_ID);
+    const materialBatches=new MaterialRefreshBatchService({store,imports,now,uniqueId,
+      adapterFor:async id=>{const adapter=businessAdapters.get(id);if(!adapter)throw Error('ICPC_SOURCE_ADAPTER_UNSUPPORTED');return adapter;},
+      limits:async()=>((await store.getWorkbenchSettings())?.value.platformLimits??DEFAULT_PLATFORM_LIMITS),
+      ...(cfMirrorAdapter===undefined?{}:{mirrorEditorialFor:async()=>({fetchMirrorEditorial:async request=>cfMirrorAdapter.fetchEditorial({problemRef:request.cfRef,token:request.token,limits:request.limits})})}),
+      onInternalError:reportFailure});
+    await materialBatches.recoverInterrupted(createCancellationSource().token);
+    // Route-first disposal: disposers run in reverse registration order, so the service disposer is
+    // registered *before* its API disposer. The six routes are therefore removed first and only then
+    // is the service closed, so a request can never reach a service that disposal already closed.
+    // `close` itself is the whole disposal: it establishes the closing barrier, cancels owned work,
+    // waits its one shared finite deadline, durably interrupts every batch still in flight and
+    // detaches the late platform promise — so disposal is bounded and a non-cooperative adapter can
+    // never keep the store open behind an unbounded `whenSettled()`.
+    disposers.push(async()=>{await materialBatches.close();});
+    disposers.push(await registerMaterialBatchApi({registry:host.connection.fetch,service:materialBatches,...observer}));
     disposers.push(registerGuidanceApi(host.connection.fetch,guidance));
     disposers.push(await registerAssessmentApi(host.connection.fetch,assessment));
     // Virtual-contest performance ledger (Sprint 18c): free local CRUD over the durable per-account

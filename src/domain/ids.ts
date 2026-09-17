@@ -304,6 +304,26 @@ export function assertHttpUrl(label: string, value: string): string {
   return parsed.toString();
 }
 
+/**
+ * Throw unless `value` is an absolute http(s) URL with no embedded userinfo.
+ *
+ * A stored link is data a caller can read back, so credentials must never be representable in one:
+ * `https://alice:secret@host/...` is refused here rather than being accepted as an ordinary URL.
+ * {@link assertHttpUrl} stays the plain absolute-URL rule for links this plugin derives itself;
+ * every boundary that accepts a caller-supplied link uses this stricter check.
+ */
+export function assertCredentialFreeHttpUrl(label: string, value: string): string {
+  const absolute = assertHttpUrl(label, value);
+  const parsed = new URL(absolute);
+  invariant(
+    parsed.username === '' && parsed.password === '',
+    'invalid_url',
+    `${label} must not carry credentials`,
+    { label },
+  );
+  return absolute;
+}
+
 /** Compare two ids for equality without throwing on malformed input. */
 export function sameId(left: string | null | undefined, right: string | null | undefined): boolean {
   return typeof left === 'string' && typeof right === 'string' && left === right;

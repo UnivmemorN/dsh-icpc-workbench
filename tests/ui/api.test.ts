@@ -48,3 +48,29 @@ test('problem management browser transport keeps explicit selection and expected
   assert.equal(calls[1]?.input, '/api/icpc/v1/luogu.managedProblems');
   assert.deepEqual(JSON.parse(String(calls[1]?.init?.body)), { accountId: 'synthetic', state: 'trashed', page: 2, pageSize: 20 });
 });
+
+test('bulk material refresh browser transport keeps the exact six authenticated endpoints', async () => {
+  const calls: { input: RequestInfo | URL; init?: RequestInit }[] = [];
+  const client = new ApiClient(async (input, init) => { calls.push({ input, init }); return Response.json({ apiVersion: 1, ok: true, value: { batchId: 'material-batch-1' } }); });
+  const controller = new AbortController();
+  const prepared = { items: [{ problemKey: 'codeforces:codeforces.com|1A', accountId: null, officialTutorialUrl: 'https://codeforces.com/blog/entry/1', fetchStatement: false }] };
+  await client.request('material.prepare', prepared, controller.signal);
+  await client.request('material.start', { batchId: 'material-batch-1' });
+  await client.request('material.detail', { batchId: 'material-batch-1' });
+  await client.request('material.list', { status: 'paused', limit: 20 });
+  await client.request('material.cancel', { batchId: 'material-batch-1' });
+  await client.request('material.retryFailed', { batchId: 'material-batch-1' });
+  assert.deepEqual(
+    calls.map(call => call.input),
+    ['material.prepare', 'material.start', 'material.detail', 'material.list', 'material.cancel', 'material.retryFailed'].map(operation => '/api/icpc/v1/' + operation),
+  );
+  for (const call of calls) {
+    assert.equal(call.init?.method, 'POST');
+    assert.equal(call.init?.credentials, 'same-origin');
+    assert.equal(call.init?.headers && (call.init.headers as Record<string, string>)['content-type'], 'application/json');
+  }
+  assert.equal(calls[0]?.init?.signal, controller.signal);
+  assert.deepEqual(JSON.parse(String(calls[0]?.init?.body)), prepared);
+  assert.deepEqual(JSON.parse(String(calls[3]?.init?.body)), { status: 'paused', limit: 20 });
+  await assert.rejects(() => client.request('material.unknown' as never, {} as never), (error: unknown) => error instanceof ApiClientError && error.code === 'invalid_operation');
+});

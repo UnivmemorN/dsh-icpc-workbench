@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { SqliteTrainingStore } from '../../src/adapters/sqlite/index.js';
-import { migrateToSchemaV9, STORE_TABLES_V9, STORE_TABLES_V10 } from '../../src/adapters/sqlite/schema.js';
+import { migrateToSchemaV9, STORE_TABLES_V9, STORE_TABLES_V11 } from '../../src/adapters/sqlite/schema.js';
 import { WorkbenchService } from '../../src/application/workbench-service.js';
 import { CURRENT_TAXONOMY, createTaxonomyIndex, createCancellationSource } from '../../src/domain/index.js';
 import * as fx from './fixtures.js';
@@ -93,7 +93,7 @@ void test('trash removes only native mirror member and its AC evidence; batches 
   } finally { await store.close(); fx.removeDirectory(paths.dir); }
 });
 
-void test('genuine v9 gets a verified v9 backup and additive v10 migration without rewriting any old row', async () => {
+void test('genuine v9 gets a verified v9 backup and additive current-schema migration without rewriting any old row', async () => {
   const paths = fx.tempDatabase();
   const db = new DatabaseSync(paths.path);
   migrateToSchemaV9(db, 0);
@@ -105,10 +105,11 @@ void test('genuine v9 gets a verified v9 backup and additive v10 migration witho
   const store = new SqliteTrainingStore({ path: paths.path, now: () => fx.LATER }); await store.close();
   const migrated = new DatabaseSync(paths.path, { readOnly: true });
   try {
-    assert.equal(migrated.prepare('PRAGMA user_version').get()?.['user_version'], 10);
+    assert.equal(migrated.prepare('PRAGMA user_version').get()?.['user_version'], 11, 'the store migrates to the current schema');
     assert.deepEqual(fingerprint(migrated, STORE_TABLES_V9), before);
-    assert.deepEqual(migrated.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(row => row['name']), [...STORE_TABLES_V10].sort());
+    assert.deepEqual(migrated.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(row => row['name']), [...STORE_TABLES_V11].sort());
     assert.equal(migrated.prepare('SELECT count(*) AS n FROM problem_dispositions').get()?.['n'], 0);
+    assert.equal(migrated.prepare('SELECT count(*) AS n FROM material_refresh_batches').get()?.['n'], 0);
   } finally { migrated.close(); }
   const backups = readdirSync(paths.dir).filter(name => name.includes('.backup-v9-'));
   assert.equal(backups.length, 1);

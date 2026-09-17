@@ -291,4 +291,22 @@ ${katexCss}
 .icpc-completion-records>summary,.icpc-completion-preview-rows>summary{cursor:pointer;font-weight:600;font-size:13px;color:var(--icpc-ink);padding:4px 0;overflow-wrap:anywhere}
 .icpc-completion-records[open]>summary,.icpc-completion-preview-rows[open]>summary{margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--icpc-line)}
 .icpc-completion-records .icpc-table-wrap,.icpc-completion-preview-rows .icpc-table-wrap{margin-top:8px}
+/* Sprint 34B: the reusable bulk platform-material refresh panel. It is a normal card, so the bank
+   and the tag-review page can both host it without a second layout; only the boundary block, the
+   counter line, the item table and the batch picker get new rules. Nothing here selects a class the
+   bank filters, the completion editor, the problem detail or merged-bank mode already uses. */
+.icpc-material-batch{min-width:0}
+.icpc-material-batch .icpc-notice p,.icpc-material-batch-scope,.icpc-material-batch-counters{overflow-wrap:anywhere}
+.icpc-material-batch-scope{font-variant-numeric:tabular-nums}
+.icpc-material-batch-counters{margin:8px 0;font-variant-numeric:tabular-nums}
+.icpc-material-batch-actions button{max-width:100%}
+.icpc-material-batch-failure{display:flex;flex-direction:column;gap:4px;min-width:0}
+.icpc-material-batch-failure code{overflow-wrap:anywhere;font-size:12px}
+.icpc-material-batch-table{max-width:100%}
+.icpc-material-batch-table td{vertical-align:top;overflow-wrap:anywhere}
+.icpc-material-batch-table td:first-child{min-width:150px;font-variant-numeric:tabular-nums}
+.icpc-material-batch-list{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-top:12px}
+.icpc-material-batch-list label{flex:1 1 280px;min-width:0}
+@media(max-width:640px){.icpc-material-batch-table td:first-child{min-width:0}.icpc-material-batch-list label{flex-basis:100%}}
+@media(prefers-color-scheme:dark){.icpc-root .icpc-material-batch .icpc-material-batch-failure code{color:#e9a184}}
 `;

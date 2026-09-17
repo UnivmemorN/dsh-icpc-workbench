@@ -26,6 +26,7 @@ export {
   SOURCE_PLATFORMS,
   accountIdOf,
   assertCompoundId,
+  assertCredentialFreeHttpUrl,
   assertHttpUrl,
   assertIdPart,
   assertIsoTimestamp,

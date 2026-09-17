@@ -7,7 +7,7 @@
  * jobs, that a batch whose material is blocked can never be started or continued, and that the
  * platform's English error codes stay in the diagnostic area instead of becoming the primary text.
  *
- * Two boundaries are deliberately explicit here:
+ * Three boundaries are deliberately explicit here:
  *
  * - **A blocked problem is not a new task.** The preparation summary reports runnable jobs,
  *   already-checked problems, reruns and blocked material as four separate numbers, and the blocked
@@ -16,6 +16,11 @@
  *   snapshot while the stored batch keeps the immutable snapshot it captured, so the only remedy is
  *   to refresh or supplement and then prepare a new batch. The resume action is described as what
  *   it is — reclaiming leases and interruption — and never as a material fix.
+ * - **Blocked rows belong to exactly one batch.** {@link reviewMaterialScope} uses the free
+ *   preparation's answer only while its own `batchId` is the selected one — including the
+ *   `null === null` case of a fully blocked preparation that created no batch — and a stored detail's
+ *   rows only while that detail describes the selected batch, so a changed selection can never keep
+ *   the previous batch's rows displayed or actionable.
  */
 import type {
   ModelBatchBlockedProblemView,
@@ -252,15 +257,113 @@ export interface BlockedRow {
   readonly actionText: string;
 }
 
-/** Project the read-only material preflight of a batch detail onto renderable rows. */
-export function blockedRows(detail: ModelBatchDetailResult | null | undefined): readonly BlockedRow[] {
-  return materialBlocksOf(detail?.batch).map((entry) => ({
+/** Renderable rows of one blocked-problem list; the list always belongs to a single batch. */
+export function blockedProblemRows(
+  blocks: readonly ModelBatchBlockedProblemView[] | null | undefined,
+): readonly BlockedRow[] {
+  return (blocks ?? []).map((entry) => ({
     problemKey: entry.problemKey,
     reason: entry.reason,
     action: entry.action,
     text: materialBlockedText(entry.reason),
     actionText: materialActionText(entry.action),
   }));
+}
+
+/** Project the read-only material preflight of a batch detail onto renderable rows. */
+export function blockedRows(detail: ModelBatchDetailResult | null | undefined): readonly BlockedRow[] {
+  return blockedProblemRows(materialBlocksOf(detail?.batch));
+}
+
+/** Shown while the newly selected batch's detail is still being read. */
+export const REVIEW_SCOPE_LOADING_TEXT = '正在读取所选批次的材料状态；读取完成前不会显示上一个批次的行。';
+
+/** Shown when the preparation's blocked rows belong to a batch the page is no longer showing. */
+export const PREPARED_BLOCKED_ELSEWHERE_TEXT =
+  '本次免费准备的受阻题目属于另一个批次，因此不在此处列出；请切回该批次查看，或重新免费准备。';
+
+/** Everything that decides which blocked rows belong to the Review page's current selection. */
+export interface ReviewMaterialScopeInput {
+  /** The batch the page currently shows; `null` while none is selected. */
+  readonly selectedBatchId: string | null;
+  /** The last free-preparation answer of this session; it belongs to its own `batchId`. */
+  readonly prepared: ModelBatchPrepareResult | null | undefined;
+  /** The stored detail the page currently holds; it may still describe the previous selection. */
+  readonly detail: ModelBatchDetailResult | null | undefined;
+  /** True while the selected batch's detail read is in flight. */
+  readonly detailPending: boolean;
+}
+
+/** The blocked rows of one selection, with the provenance of every source that contributed. */
+export interface ReviewMaterialScope {
+  /** Unique rows in first-seen order; empty until a source that matches the selection exists. */
+  readonly rows: readonly BlockedRow[];
+  /** True while the selected batch's own detail is still being read. */
+  readonly loading: boolean;
+  /** True when the free preparation's answer describes the selected batch. */
+  readonly fromPrepared: boolean;
+  /** True when the stored detail describes the selected batch. */
+  readonly fromStored: boolean;
+}
+
+/**
+ * The blocked rows of the batch the Review page has selected — and of no other batch.
+ *
+ * The two possible sources have different ownership, so they are never mixed blindly: the free
+ * preparation's `blocked` rows are usable only while its own `batchId` equals the selected one, and a
+ * stored detail's `materialBlocks` are usable only while that detail's own `batch.batchId` is the
+ * selected one. Ownership is an equality test rather than a presence test, which is what makes a
+ * preparation that created no batch (`batchId === null`, every requested problem blocked) owned by
+ * the empty selection (`null === null`) — the exact state `batch.prepare` leaves the page in — while
+ * every stored selection hides it. A changed selection therefore contributes nothing from the
+ * previous batch, not even while the new detail is still loading, so an old row can never be
+ * displayed, retried or turned into a material batch under the new selection's text. When both
+ * sources describe the same selected batch their rows are merged and de-duplicated in first-seen
+ * order, because both then describe that one batch's own preflight.
+ */
+export function reviewMaterialScope(input: ReviewMaterialScopeInput): ReviewMaterialScope {
+  const selected = input.selectedBatchId;
+  const prepared = input.prepared ?? null;
+  const detail = input.detail ?? null;
+  const fromPrepared = prepared !== null && prepared.batchId === selected;
+  const fromStored = detail !== null && detail.batch.batchId === selected;
+  const rows: BlockedRow[] = [];
+  const seen = new Set<string>();
+  const add = (blocks: readonly ModelBatchBlockedProblemView[]): void => {
+    for (const row of blockedProblemRows(blocks)) {
+      const identity = row.problemKey + '\u0000' + row.reason + '\u0000' + row.action;
+      if (!seen.has(identity)) {
+        seen.add(identity);
+        rows.push(row);
+      }
+    }
+  };
+  if (fromPrepared && prepared !== null) {
+    add(prepared.blocked);
+  }
+  if (fromStored && detail !== null) {
+    add(detail.batch.materialBlocks);
+  }
+  // Only a selected batch has a detail read in flight; with no selection there is nothing loading, so
+  // the page never shows the "reading the selected batch" sentence over the empty selection.
+  return { rows, loading: selected !== null && input.detailPending, fromPrepared, fromStored };
+}
+
+/**
+ * The blocked rows of the preparation result the page may still show.
+ *
+ * They belong to the batch that preparation created, so they are only usable while that same batch
+ * is the selected one; a preparation that created no batch (`batchId === null`) is usable while no
+ * batch is selected, which is exactly the state a fully blocked preparation leaves the page in.
+ * Selecting another stored batch therefore hides them instead of lending them to that batch.
+ */
+export function preparedBlockedRows(
+  prepared: ModelBatchPrepareResult | null | undefined,
+  selectedBatchId: string | null,
+): readonly BlockedRow[] {
+  return prepared !== null && prepared !== undefined && prepared.batchId === selectedBatchId
+    ? blockedProblemRows(prepared.blocked)
+    : [];
 }
 
 /** The short problem label the page shows: the external key of a canonical problem key. */

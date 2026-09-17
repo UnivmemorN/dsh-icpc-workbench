@@ -10,9 +10,12 @@
  * - **v0** means "no store tables yet": an empty file is initialized transactionally, a file
  *   with our marker table but no data tables is migrated after a consistent backup, and any
  *   other v0 layout is rejected instead of being migrated.
- * - **v1** … **v9** (the previous versions of this build) are recognized exactly — marker
- *   plus their own table set — copied consistently and then migrated to the current version in one
- *   transaction that only adds tables. Existing rows are retained.
+ * - **v1** … **v11** (the versions of this build this store recognizes) are recognized exactly:
+ *   the marker plus **their whole user-table set**, compared for equality after SQLite internal
+ *   tables are excluded. A missing table and an unexpected table are both `unsupported_schema`,
+ *   decided before any backup, DDL or write. A supported older database is then copied consistently
+ *   and migrated to the current version in one transaction that only adds tables; existing rows are
+ *   retained.
  * - A failure while initializing or migrating rolls back, so the original file stays readable.
  *
  * Historical DDL is frozen: {@link SCHEMA_DDL_V1}/{@link applySchemaV1},
@@ -20,7 +23,8 @@
  * creating exactly their own version's tables **and write exactly their own literal
  * `user_version`**, so a fixture built with them is a real older database and the migration under
  * test is the real one. Schema v9 changes only the Luogu diagnostics JSON contract. Schema v10 adds the
- * recoverable problem_dispositions table; older writers must refuse this version.
+ * recoverable problem_dispositions table. Schema v11 adds the durable bulk material-refresh batch
+ * table; older writers must refuse this version.
  *
  * All metadata the adapter writes are immutable JSON bodies plus indexed identity columns.
  */
@@ -31,7 +35,8 @@ import { StorageError } from './errors.js';
 export const STORE_MARKER = 'dsh-icpc-workbench/training-store';
 
 /** Schema version this build reads and writes. */
-export const STORE_SCHEMA_VERSION = 10;
+export const STORE_SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION_V10 = 10;
 export const SCHEMA_VERSION_V9 = 9;
 export const SCHEMA_VERSION_V8 = 8;
 export const SCHEMA_VERSION_V7 = 7;
@@ -504,6 +509,35 @@ export const SCHEMA_DDL_V10: readonly string[] = [
    )`,
   `CREATE INDEX problem_dispositions_by_state ON problem_dispositions (source_instance_id, state, problem_key)`,
 ];
+
+/**
+ * Schema v11 — durable bulk platform-material refresh batches (Sprint 34A).
+ *
+ * One additive table. `material_refresh_batches` holds one row per bulk refresh over 1..100 selected
+ * stored problems: the ordered item list, each item's per-item account selection, optional official
+ * tutorial URL, statement flag, attempts, sanitized outcome and snapshot metadata, plus the batch
+ * status, revision and timestamps. The canonical JSON `body` stays the source of truth for reads,
+ * exactly like every other table here, and the indexed columns are scoping/ordering only.
+ *
+ * The table deliberately has **no** column and no body field for a Cookie, a credential reference, a
+ * statement, a raw tag, an editorial body, an upstream response body or a raw exception text: a bulk
+ * refresh is platform IO whose durable record is metadata, so those values are not representable. It
+ * is separate from `analysis_batches`, `sync_checkpoints`, every `luogu_*` row and the model-operation
+ * tables: this aggregate owns its own lifecycle and cannot touch a model or a sync checkpoint.
+ */
+export const STORE_TABLES_V11: readonly string[] = [...STORE_TABLES_V10, 'material_refresh_batches'];
+export const SCHEMA_DDL_V11: readonly string[] = [
+  `CREATE TABLE material_refresh_batches (
+     batch_id TEXT PRIMARY KEY NOT NULL,
+     status TEXT NOT NULL,
+     revision INTEGER NOT NULL,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     item_count INTEGER NOT NULL,
+     body TEXT NOT NULL
+   )`,
+  `CREATE INDEX material_refresh_batches_by_status ON material_refresh_batches (status, created_at, batch_id)`,
+];
 export type SchemaState =
   | 'empty'
   | 'legacy_v0'
@@ -516,6 +550,7 @@ export type SchemaState =
   | 'v7'
   | 'v8'
   | 'v9'
+  | 'v10'
   | 'current';
 
 function pragmaRow(db: DatabaseSync, sql: string): Record<string, unknown> | undefined {
@@ -554,8 +589,8 @@ export function readMarker(db: DatabaseSync): string | null {
  *
  * Throws {@link StorageError} with `schema_too_new` for a database from a newer build (before
  * any journal-mode switch or byte change) and `unsupported_schema` for anything this build
- * must not migrate: a foreign database, a store version whose marker or expected table set is
- * incomplete, or an unreadable version.
+ * must not migrate: a foreign database, a store version whose marker is absent or whose
+ * user-table set is not exactly the one that version defines, or an unreadable version.
  */
 export function detectSchemaState(db: DatabaseSync): SchemaState {
   const version = readUserVersion(db);
@@ -574,8 +609,13 @@ export function detectSchemaState(db: DatabaseSync): SchemaState {
   const tables = tableNames(db);
   if (version === STORE_SCHEMA_VERSION) {
     requireStoreMarker(db, version);
-    requireTables(tables, STORE_TABLES_V10, version);
+    requireTables(tables, STORE_TABLES_V11, version);
     return 'current';
+  }
+  if (version === SCHEMA_VERSION_V10) {
+    requireStoreMarker(db, version);
+    requireTables(tables, STORE_TABLES_V10, version);
+    return 'v10';
   }
   if (version === SCHEMA_VERSION_V9) {
     requireStoreMarker(db, version);
@@ -646,13 +686,27 @@ function requireStoreMarker(db: DatabaseSync, version: number): void {
   }
 }
 
+/**
+ * Require the database's user-table set to be **exactly** the tables of its declared version.
+ *
+ * A recognized version is a whole layout, not a subset: a missing table means the file is not the
+ * database it claims to be, and an extra table means it carries something this build does not know
+ * how to migrate. Either way the file is refused with `unsupported_schema` — `detectSchemaState`
+ * runs before the store takes its pre-migration backup, runs any DDL or writes anything, so a
+ * migration never copies and never "repairs" a layout it does not recognize. SQLite internal tables
+ * (`sqlite_%`) are already excluded by {@link tableNames}, so `sqlite_sequence` and friends never
+ * make a legitimate store look foreign.
+ */
 function requireTables(tables: readonly string[], expected: readonly string[], version: number): void {
   const missing = expected.filter((table) => !tables.includes(table));
-  if (missing.length > 0) {
+  const unexpected = tables.filter((table) => !expected.includes(table));
+  if (missing.length > 0 || unexpected.length > 0) {
     throw new StorageError(
       'unsupported_schema',
-      `database schema v${version} is missing tables: ${missing.join(', ')}`,
-      { missing, version },
+      `database schema v${version} does not match the recognized table set (missing: ${
+        missing.length === 0 ? 'none' : missing.join(', ')
+      }; unexpected: ${unexpected.length === 0 ? 'none' : unexpected.join(', ')})`,
+      { missing, unexpected, version },
     );
   }
 }
@@ -943,6 +997,31 @@ export function migrateToSchemaV10(db: DatabaseSync, from: number): void {
     if (from < 10) for (const statement of SCHEMA_DDL_V10) db.exec(statement);
     db.exec('PRAGMA user_version = 10');
   }, 'schema v10 migration');
+}
+
+/**
+ * Add exactly the missing versions and end at the current schema (v11), in one transaction.
+ *
+ * The caller has already taken (and verified) the pre-migration backup. Every historical DDL helper
+ * keeps writing **its own** literal version, so a v10 fixture stays a genuine v10 database; only this
+ * function moves a file to the version this build writes. The v10 DDL is gated on `from` so an
+ * existing v10 file never has its `problem_dispositions` table re-created, and v11 is applied
+ * unconditionally — this helper only ever runs on a database that has not reached v11.
+ */
+export function migrateToSchemaV11(db: DatabaseSync, from: number): void {
+  inTransaction(db, () => {
+    if (from < 1) applySchemaV1(db);
+    if (from < 2) applySchemaV2(db);
+    if (from < 3) applySchemaV3(db);
+    if (from < 4) applySchemaV4(db);
+    if (from < 5) for (const statement of SCHEMA_DDL_V5) db.exec(statement);
+    if (from < 6) for (const statement of SCHEMA_DDL_V6) db.exec(statement);
+    if (from < 7) for (const statement of SCHEMA_DDL_V7) db.exec(statement);
+    if (from < 8) for (const statement of SCHEMA_DDL_V8) db.exec(statement);
+    if (from < 10) for (const statement of SCHEMA_DDL_V10) db.exec(statement);
+    for (const statement of SCHEMA_DDL_V11) db.exec(statement);
+    db.exec('PRAGMA user_version = 11');
+  }, 'schema v11 migration');
 }
 
 function inTransaction(db: DatabaseSync, work: () => void, label: string): void {

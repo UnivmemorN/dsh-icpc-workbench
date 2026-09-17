@@ -22,6 +22,7 @@ import type { ApiRequest } from '../application/workbench-api.js';
 import {
   COMPLETION_MODES,
   TRAINING_TASK_KINDS,
+  assertCredentialFreeHttpUrl,
   assertIsoTimestamp,
   invariant,
   parseAccountId,
@@ -52,6 +53,12 @@ import {
   MAX_SUPPLEMENT_STATEMENT_CHARS,
 } from '../application/import-types.js';
 import {
+  MATERIAL_REFRESH_BATCH_STATUSES,
+  MAX_MATERIAL_REFRESH_BATCH_ITEMS,
+  MAX_MATERIAL_REFRESH_BATCH_LIST_LIMIT,
+  MIN_MATERIAL_REFRESH_BATCH_ITEMS,
+} from '../application/material-refresh-batch-types.js';
+import {
   MAX_USER_ANSWER_LABEL_CHARS,
   MAX_USER_ANSWER_TEXT_CHARS,
   WORKBENCH_API_ORIGINS,
@@ -60,6 +67,10 @@ import {
   type ApiManualAccountContext,
   type ApiManualEditorialInput,
   type ApiManualProblemContext,
+  type ApiMaterialBatchIdRequest,
+  type ApiMaterialBatchItemRequest,
+  type ApiMaterialBatchListRequest,
+  type ApiMaterialBatchPrepareRequest,
   type ApiMaterialRefreshRequest,
   type ApiMaterialSupplementRequest,
   type ApiPlanAdoptRequest,
@@ -617,6 +628,148 @@ function validateSupplementEditorial(value: unknown): ApiSupplementEditorial {
     url: requiredString('editorial.url', object['url'], MAX_API_TEXT_CHARS),
     title: requiredString('editorial.title', object['title'], MAX_API_TEXT_CHARS),
     note: requiredString('editorial.note', object['note'], MAX_API_NOTE_CHARS),
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// material.prepare / material.start / material.detail / material.list / material.cancel /
+// material.retryFailed (Sprint 34A)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * `material.prepare` request: 1..100 explicitly selected items.
+ *
+ * The list is a closed contract with no "all filtered results" form, so one request can never turn
+ * into an unbounded selection. Every item is checked here, before the service is even called: the
+ * canonical problem key through the domain's own parser, an optional account id through the domain's
+ * own parser (a malformed spelling is a 400, not a store lookup), an optional official tutorial URL
+ * as an absolute `http`/`https` URL **without embedded credentials**, and an optional statement flag.
+ * No field exists for a Cookie, a session, a credential reference, a statement body or a raw tag, so a
+ * credential-like field is refused as an unknown field rather than silently dropped. Duplicate
+ * canonical keys are refused here too, because a request that names one problem twice cannot describe
+ * one ordered batch. Whether the named problem and account are stored is the service's proof.
+ */
+export function validateMaterialBatchPrepare(value: unknown): ApiMaterialBatchPrepareRequest {
+  const object = plainObject('material.prepare', value);
+  requireKeys('material.prepare', object, ['items']);
+  const entries = object['items'];
+  invariant(Array.isArray(entries), 'invalid_input', 'material.prepare.items must be an array', {
+    reason: 'not_an_array',
+    field: 'items',
+  });
+  invariant(
+    entries.length >= MIN_MATERIAL_REFRESH_BATCH_ITEMS && entries.length <= MAX_MATERIAL_REFRESH_BATCH_ITEMS,
+    'invalid_input',
+    `material.prepare.items must hold ${MIN_MATERIAL_REFRESH_BATCH_ITEMS}..${MAX_MATERIAL_REFRESH_BATCH_ITEMS} entries`,
+    { reason: 'out_of_range', field: 'items', length: entries.length },
+  );
+  const seen = new Set<string>();
+  const items = entries.map((entry, index) => {
+    const item = materialBatchItem(`material.prepare.items[${index}]`, entry);
+    invariant(!seen.has(item.problemKey), 'invalid_input', 'material.prepare.items lists a problem twice', {
+      reason: 'duplicate_problem_key',
+      problemKey: item.problemKey,
+      index,
+    });
+    seen.add(item.problemKey);
+    return item;
+  });
+  return { items };
+}
+
+/** One requested item; an unknown field is refused before anything is written. */
+function materialBatchItem(label: string, value: unknown): ApiMaterialBatchItemRequest {
+  const object = plainObject(label, value);
+  requireKeys(label, object, ['problemKey'], ['accountId', 'officialTutorialUrl', 'fetchStatement']);
+  return {
+    problemKey: problemKeyInput(`${label}.problemKey`, object['problemKey']),
+    // A canonical account id through the domain's own parser: a malformed spelling is refused here,
+    // and whether the account is actually stored stays the service's proof.
+    ...(object['accountId'] === undefined
+      ? {}
+      : { accountId: nullableAccountId(`${label}.accountId`, object['accountId']) }),
+    ...(object['officialTutorialUrl'] === undefined
+      ? {}
+      : {
+          officialTutorialUrl: credentialFreeHttpUrlInput(
+            `${label}.officialTutorialUrl`,
+            object['officialTutorialUrl'],
+          ),
+        }),
+    ...(object['fetchStatement'] === undefined
+      ? {}
+      : { fetchStatement: booleanValue(`${label}.fetchStatement`, object['fetchStatement']) }),
+  };
+}
+
+/**
+ * An absolute `http(s)` URL with no embedded userinfo; `null` stays "no URL".
+ *
+ * The official tutorial URL is persisted and later handed to an adapter, so
+ * `https://alice:SECRET@host/...` must be unrepresentable: it is refused here and again by the
+ * aggregate's own row validator. Only the shape is decided at this boundary — whether the URL belongs
+ * to the adapter's official origin remains the adapter's rule (this layer never fetches it).
+ */
+function credentialFreeHttpUrlInput(label: string, value: unknown): string | null {
+  if (value === null) {
+    return null;
+  }
+  const text = requiredString(label, value, MAX_API_TEXT_CHARS);
+  try {
+    return assertCredentialFreeHttpUrl(label, text);
+  } catch (error) {
+    if (isDomainError(error)) {
+      throw new ApiTransportError('invalid_input', `${label} must be an absolute http(s) URL without credentials`);
+    }
+    throw error;
+  }
+}
+
+/** `material.start`: name one stored batch; the run itself is owned background work. */
+export function validateMaterialBatchStart(value: unknown): ApiMaterialBatchIdRequest {
+  return materialBatchIdRequest('material.start', value);
+}
+
+/** `material.detail`: a local read of one stored batch. */
+export function validateMaterialBatchDetail(value: unknown): ApiMaterialBatchIdRequest {
+  return materialBatchIdRequest('material.detail', value);
+}
+
+/** `material.cancel`: an explicit state transition of one stored batch. */
+export function validateMaterialBatchCancel(value: unknown): ApiMaterialBatchIdRequest {
+  return materialBatchIdRequest('material.cancel', value);
+}
+
+/** `material.retryFailed`: an explicit state transition of one stored batch. */
+export function validateMaterialBatchRetryFailed(value: unknown): ApiMaterialBatchIdRequest {
+  return materialBatchIdRequest('material.retryFailed', value);
+}
+
+/** Shared body of the four batch-id operations; `label` only names the origin of a refusal. */
+function materialBatchIdRequest(label: string, value: unknown): ApiMaterialBatchIdRequest {
+  const object = plainObject(label, value);
+  requireKeys(label, object, ['batchId']);
+  return { batchId: requiredString(`${label}.batchId`, object['batchId'], MAX_API_ID_CHARS) };
+}
+
+/**
+ * `material.list` request: an optional status filter and a bounded page size.
+ *
+ * Both fields are optional and both are closed; `status: null` means "every status" exactly like
+ * omitting it, and a page size outside the service's own bound is refused instead of clamped.
+ */
+export function validateMaterialBatchList(value: unknown): ApiMaterialBatchListRequest {
+  const object = plainObject('material.list', value);
+  requireKeys('material.list', object, [], ['status', 'limit']);
+  return {
+    ...(object['status'] === undefined
+      ? {}
+      : object['status'] === null
+        ? { status: null }
+        : { status: enumValue('status', object['status'], MATERIAL_REFRESH_BATCH_STATUSES) }),
+    ...(object['limit'] === undefined
+      ? {}
+      : { limit: boundedInteger('limit', object['limit'], 1, MAX_MATERIAL_REFRESH_BATCH_LIST_LIMIT) }),
   };
 }
 

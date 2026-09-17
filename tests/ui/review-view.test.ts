@@ -9,6 +9,7 @@
  * described as a way to fix material.
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import {
   MATERIALS_BLOCKED_CODE,
@@ -20,9 +21,12 @@ import {
   MATERIAL_BLOCKED_REASON_TEXT,
   MATERIAL_BLOCKS_NOTICE_TEXT,
   NO_RUNNABLE_BATCH_TEXT,
+  PREPARED_BLOCKED_ELSEWHERE_TEXT,
   RECOVER_HINT_TEXT,
+  REVIEW_SCOPE_LOADING_TEXT,
   batchStartState,
   blockedCountText,
+  blockedProblemRows,
   blockedRows,
   diagnosticText,
   failureCodeOf,
@@ -30,9 +34,12 @@ import {
   materialBlockedText,
   materialBlocksOf,
   prepareSummary,
+  preparedBlockedRows,
   preparedStartState,
   problemLabel,
+  reviewMaterialScope,
 } from '../../src/ui/review-view.js';
+import { refreshMaterialProblemKeys } from '../../src/ui/material-batch-view.js';
 import type {
   ModelBatchBlockedProblemView,
   ModelBatchDetailResult,
@@ -121,6 +128,15 @@ const editorialUnknown: ModelBatchBlockedProblemView = {
   reason: 'editorial_unknown',
   action: 'refresh_materials',
 };
+
+/** One stored detail whose own batch id is explicit, so a stale answer is representable. */
+function detailOf(
+  batchId: string,
+  materialBlocks: readonly ModelBatchBlockedProblemView[],
+): ModelBatchDetailResult {
+  const detail = detailResult(materialBlocks);
+  return { ...detail, batch: { ...detail.batch, batchId } };
+}
 
 // ---------------------------------------------------------------------------------------
 // The Chinese explanations
@@ -313,4 +329,267 @@ void test('a failed request exposes its code without becoming the page message',
   assert.equal(failureCodeOf(null), null);
   assert.equal(failureCodeOf({ code: 42 }), null);
   assert.equal(MATERIALS_BLOCKED_CODE, 'materials_blocked');
+});
+
+// ---------------------------------------------------------------------------------------
+// Blocked rows belong to exactly one batch (Sprint 34B1)
+// ---------------------------------------------------------------------------------------
+
+void test('only the selected batch contributes blocked rows, even while a changed detail loads', () => {
+  const preparedA = prepareResult({ batchId: 'batch-A', blocked: [materialMissing] });
+  const detailA = detailOf('batch-A', [materialMissing, editorialUnknown]);
+  const detailB = detailOf('batch-B', [editorialUnknown]);
+
+  // Matching A: preparation and stored detail describe the same batch, so both sources are used and
+  // the row they share is de-duplicated instead of being listed twice.
+  const matching = reviewMaterialScope({
+    selectedBatchId: 'batch-A',
+    prepared: preparedA,
+    detail: detailA,
+    detailPending: false,
+  });
+  assert.deepEqual(
+    { fromPrepared: matching.fromPrepared, fromStored: matching.fromStored, loading: matching.loading },
+    { fromPrepared: true, fromStored: true, loading: false },
+  );
+  assert.deepEqual(matching.rows.map((row) => row.problemKey), [
+    materialMissing.problemKey,
+    editorialUnknown.problemKey,
+  ]);
+  assert.equal(matching.rows.length, 2, 'the shared row is de-duplicated, never listed twice');
+  assert.deepEqual(refreshMaterialProblemKeys(matching.rows).keys, [
+    materialMissing.problemKey,
+    editorialUnknown.problemKey,
+  ]);
+
+  // Prepare A, then select B: only B's own stored rows remain; A's prepared row is never merged in.
+  const selectedB = reviewMaterialScope({
+    selectedBatchId: 'batch-B',
+    prepared: preparedA,
+    detail: detailB,
+    detailPending: false,
+  });
+  assert.equal(selectedB.fromPrepared, false);
+  assert.equal(selectedB.fromStored, true);
+  assert.deepEqual(selectedB.rows.map((row) => row.problemKey), [editorialUnknown.problemKey]);
+  assert.deepEqual(refreshMaterialProblemKeys(selectedB.rows).keys, [editorialUnknown.problemKey]);
+
+  // While B's detail is still loading the page may still hold A's detail: it contributes nothing, so
+  // no row of the previous selection stays displayed or actionable under B.
+  const loadingB = reviewMaterialScope({
+    selectedBatchId: 'batch-B',
+    prepared: preparedA,
+    detail: detailA,
+    detailPending: true,
+  });
+  assert.equal(loadingB.loading, true);
+  assert.equal(loadingB.fromPrepared, false);
+  assert.equal(loadingB.fromStored, false);
+  assert.deepEqual(loadingB.rows, []);
+  assert.equal(refreshMaterialProblemKeys(loadingB.rows).ready, false);
+  assert.match(REVIEW_SCOPE_LOADING_TEXT, /不会显示上一个批次的行/);
+
+  // Nothing selected: nothing is shown, whatever the page still holds.
+  const none = reviewMaterialScope({
+    selectedBatchId: null,
+    prepared: preparedA,
+    detail: detailA,
+    detailPending: false,
+  });
+  assert.deepEqual(
+    { rows: none.rows, loading: none.loading, fromPrepared: none.fromPrepared, fromStored: none.fromStored },
+    { rows: [], loading: false, fromPrepared: false, fromStored: false },
+  );
+
+  // A preparation that created no batch has no batch identity to match, so its rows are never used
+  // for a selected batch and cannot replace or remove that batch's own rows.
+  const noBatch = prepareResult({ batchId: null, blocked: [materialMissing] });
+  const notPrepared = reviewMaterialScope({
+    selectedBatchId: 'batch-A',
+    prepared: noBatch,
+    detail: detailA,
+    detailPending: false,
+  });
+  assert.equal(notPrepared.fromPrepared, false);
+  assert.equal(notPrepared.fromStored, true);
+  assert.deepEqual(notPrepared.rows.map((row) => row.problemKey), [
+    materialMissing.problemKey,
+    editorialUnknown.problemKey,
+  ]);
+});
+
+void test('a row from another batch never supplies the reason or action of the selected one', () => {
+  // The same problem key is blocked in both batches, for different reasons: only the selected batch's
+  // own reason may reach the page, so two batches cannot be conflated by their keys alone.
+  const preparedA = prepareResult({ batchId: 'batch-A', blocked: [{ ...materialMissing, reason: 'material_missing' }] });
+  const detailB = detailOf('batch-B', [{ ...materialMissing, reason: 'editorial_unknown' }]);
+  const selectedB = reviewMaterialScope({
+    selectedBatchId: 'batch-B',
+    prepared: preparedA,
+    detail: detailB,
+    detailPending: false,
+  });
+  assert.equal(selectedB.rows.length, 1);
+  assert.equal(selectedB.rows[0]?.reason, 'editorial_unknown');
+  assert.equal(selectedB.rows[0]?.text, MATERIAL_BLOCKED_REASON_TEXT.editorial_unknown);
+
+  // A hand-supplied row is a local write, so it is displayed but never becomes a platform refresh.
+  const supplementOnly: ModelBatchBlockedProblemView = {
+    problemKey: 'codeforces%3Acodeforces.com||9Z',
+    reason: 'editorial_empty',
+    action: 'supplement_editorial',
+  };
+  const scope = reviewMaterialScope({
+    selectedBatchId: 'batch-B',
+    prepared: null,
+    detail: detailOf('batch-B', [supplementOnly]),
+    detailPending: false,
+  });
+  assert.equal(scope.rows.length, 1);
+  assert.equal(scope.rows[0]?.actionText, MATERIAL_ACTION_TEXT.supplement_editorial);
+  assert.deepEqual(refreshMaterialProblemKeys(scope.rows).keys, []);
+  assert.equal(refreshMaterialProblemKeys(scope.rows).ready, false);
+});
+
+void test('the preparation result rows show only while that preparation own batch is selected', () => {
+  const preparedA = prepareResult({ batchId: 'batch-A', blocked: [materialMissing] });
+  assert.deepEqual(preparedBlockedRows(preparedA, 'batch-A').map((row) => row.problemKey), [
+    materialMissing.problemKey,
+  ]);
+  // Selecting another stored batch hides them instead of lending them to it.
+  assert.deepEqual(preparedBlockedRows(preparedA, 'batch-B'), []);
+  assert.deepEqual(preparedBlockedRows(preparedA, null), []);
+  assert.match(PREPARED_BLOCKED_ELSEWHERE_TEXT, /属于另一个批次/);
+  assert.match(PREPARED_BLOCKED_ELSEWHERE_TEXT, /重新免费准备/);
+
+  // A preparation that created no batch is shown exactly while no batch is selected; with a stored
+  // batch selected it stays hidden, because its rows belong to no selected batch.
+  const allBlocked = prepareResult({ batchId: null, blocked: [materialMissing] });
+  assert.equal(preparedBlockedRows(allBlocked, null).length, 1);
+  assert.deepEqual(preparedBlockedRows(allBlocked, 'batch-B'), []);
+  assert.deepEqual(preparedBlockedRows(null, 'batch-A'), []);
+  assert.deepEqual(preparedBlockedRows(undefined, null), []);
+  assert.deepEqual(blockedProblemRows(undefined), []);
+  assert.deepEqual(blockedProblemRows(null), []);
+  assert.equal(blockedProblemRows([materialMissing])[0]?.text, MATERIAL_BLOCKED_REASON_TEXT.material_missing);
+});
+
+void test('Review and the bank pin the material panel to one scope identity and mix no batch rows', () => {
+  const compact = (path: string): string =>
+    readFileSync(new URL(path, import.meta.url), 'utf8').replace(/\s+/g, '');
+  const review = compact('../../src/ui/Review.tsx');
+  // One pure helper decides the rows; the page never recombines two batches' sources by hand.
+  assert.equal(
+    review.includes(
+      'reviewMaterialScope({selectedBatchId:batchId,prepared,detail:detail.data,detailPending:detail.pending})',
+    ),
+    true,
+  );
+  assert.equal(review.includes('preparedBlockedRows(prepared,batchId)'), true);
+  assert.equal(/prepared\?\.blocked/.test(review), false);
+  assert.equal(review.includes('materialBlocksOf(detail.data'), false);
+  assert.equal(review.includes('blockedRows(detail.data)'), false);
+  assert.equal(review.includes('prepared.blocked.map'), false);
+  // The panel is keyed by the analysis batch plus the canonical ordered refresh keys, so a changed
+  // scope closes/remounts it instead of letting a prior material batch stay startable under new text.
+  assert.equal(review.includes('materialScopeIdentity(batchId,refreshScope.keys)'), true);
+  assert.equal(
+    review.includes('constpanelOpen=materialScopeOpen!==null&&materialScopeOpen===panelScope&&refreshScope.ready;'),
+    true,
+  );
+  assert.equal(review.includes('<BulkMaterialRefreshkey={panelScope}problemKeys={refreshScope.keys}'), true);
+  assert.equal(review.includes('onClick={()=>setMaterialScopeOpen(panelScope)}'), true);
+  assert.equal(review.includes('onClick={()=>setMaterialScopeOpen(null)}'), true);
+  // The bank panel keeps its deliberately captured scope and is keyed by that same identity.
+  const bank = compact('../../src/ui/Bank.tsx');
+  assert.equal(bank.includes('key={materialScopeIdentity(null,materialScope)}'), true);
+});
+
+// ---------------------------------------------------------------------------------------
+// A fully blocked preparation owns the empty selection (Sprint 34B2)
+// ---------------------------------------------------------------------------------------
+
+void test('a fully blocked preparation that created no batch feeds the refresh scope of the empty selection', () => {
+  // `batch.prepare` legitimately answers `batchId: null` with no jobs and a non-empty `blocked` list.
+  const allBlocked = prepareResult({ batchId: null, blocked: [materialMissing, editorialUnknown] });
+  const scope = reviewMaterialScope({
+    selectedBatchId: null,
+    prepared: allBlocked,
+    detail: null,
+    detailPending: false,
+  });
+  // The `null === null` ownership rule is what keeps this preparation usable: it is owned by the
+  // empty selection the preparation itself left behind, not dropped for having no batch id.
+  assert.equal(scope.fromPrepared, true);
+  assert.equal(scope.fromStored, false);
+  assert.equal(scope.loading, false);
+  assert.deepEqual(scope.rows.map((row) => row.problemKey), [
+    materialMissing.problemKey,
+    editorialUnknown.problemKey,
+  ]);
+  // The same rows fill the platform-refresh aggregation, so the free panel stays openable.
+  const refresh = refreshMaterialProblemKeys(scope.rows);
+  assert.deepEqual(refresh.keys, [materialMissing.problemKey, editorialUnknown.problemKey]);
+  assert.equal(refresh.total, 2);
+  assert.equal(refresh.overflow, false);
+  assert.equal(refresh.ready, true);
+  // Only `refresh_materials` rows take part: a hand-supplied editorial or statement stays excluded.
+  assert.deepEqual(
+    refreshMaterialProblemKeys([
+      ...scope.rows,
+      { problemKey: 'codeforces%3Acodeforces.com||9Z', action: 'supplement_editorial' },
+      { problemKey: 'codeforces%3Acodeforces.com||9Y', action: 'supplement_statement' },
+    ]).keys,
+    [materialMissing.problemKey, editorialUnknown.problemKey],
+  );
+  // And the page still lists those rows as belonging to the current preparation.
+  assert.deepEqual(preparedBlockedRows(allBlocked, null).map((row) => row.problemKey), [
+    materialMissing.problemKey,
+    editorialUnknown.problemKey,
+  ]);
+});
+
+void test('the null-batch preparation stays isolated from stored selections and the other way round', () => {
+  const allBlocked = prepareResult({ batchId: null, blocked: [materialMissing] });
+  const storedDetail = detailOf('batch-B', [editorialUnknown]);
+
+  // Selecting a stored batch: a preparation that created no batch owns no stored selection, so it
+  // contributes nothing and cannot add or remove a row of that batch's own preflight.
+  const selectedStored = reviewMaterialScope({
+    selectedBatchId: 'batch-B',
+    prepared: allBlocked,
+    detail: storedDetail,
+    detailPending: false,
+  });
+  assert.equal(selectedStored.fromPrepared, false);
+  assert.equal(selectedStored.fromStored, true);
+  assert.deepEqual(selectedStored.rows.map((row) => row.problemKey), [editorialUnknown.problemKey]);
+  assert.deepEqual(preparedBlockedRows(allBlocked, 'batch-B'), []);
+  assert.deepEqual(refreshMaterialProblemKeys(selectedStored.rows).keys, [editorialUnknown.problemKey]);
+
+  // A preparation that did create a batch owns no empty selection either.
+  const preparedA = prepareResult({ batchId: 'batch-A', blocked: [materialMissing] });
+  const none = reviewMaterialScope({
+    selectedBatchId: null,
+    prepared: preparedA,
+    detail: null,
+    detailPending: false,
+  });
+  assert.equal(none.fromPrepared, false);
+  assert.equal(none.fromStored, false);
+  assert.deepEqual(none.rows, []);
+  assert.equal(refreshMaterialProblemKeys(none.rows).ready, false);
+
+  // A null-batch preparation never lends its rows to a loading selection, and the loading sentence
+  // still covers exactly that state.
+  const loadingStored = reviewMaterialScope({
+    selectedBatchId: 'batch-B',
+    prepared: allBlocked,
+    detail: null,
+    detailPending: true,
+  });
+  assert.equal(loadingStored.loading, true);
+  assert.equal(loadingStored.fromPrepared, false);
+  assert.deepEqual(loadingStored.rows, []);
+  assert.match(REVIEW_SCOPE_LOADING_TEXT, /不会显示上一个批次的行/);
 });

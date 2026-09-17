@@ -126,6 +126,13 @@ import {
   type ModelCallAttemptQuery,
 } from '../../application/batch-types.js';
 import {
+  MATERIAL_REFRESH_BATCH_STATUSES,
+  validateMaterialRefreshBatch,
+  validateMaterialRefreshBatchTransition,
+  type MaterialRefreshBatch,
+  type MaterialRefreshBatchStatus,
+} from '../../application/material-refresh-batch-types.js';
+import {
   COACHING_STATUSES,
   validateCoachingAttempt,
   validateCoachingAttemptTransition,
@@ -188,6 +195,7 @@ import {
   COACHING_ATTEMPT_FIELDS,
   JOB_FIELDS,
   MANUAL_DECISION_FIELDS,
+  MATERIAL_REFRESH_BATCH_FIELDS,
   MODEL_CALL_ATTEMPT_FIELDS,
   PLAN_FIELDS,
   PLAN_OPTIONAL_FIELDS,
@@ -222,6 +230,7 @@ import {
   SCHEMA_VERSION_V7,
   SCHEMA_VERSION_V8,
   SCHEMA_VERSION_V9,
+  SCHEMA_VERSION_V10,
   SCHEMA_VERSION_V1,
   SCHEMA_VERSION_V2,
   SCHEMA_VERSION_V3,
@@ -230,7 +239,7 @@ import {
   backupFileName,
   configureConnection,
   detectSchemaState,
-  migrateToSchemaV10,
+  migrateToSchemaV11,
   readMarker,
   readUserVersion,
 } from './schema.js';
@@ -274,6 +283,17 @@ const UNCLAIMABLE: readonly AnalysisJobStatus[] = ['paused_quota', 'succeeded', 
  */
 const LUOGU_OFFICIAL_BASE_URL = 'https://www.luogu.com.cn';
 const LUOGU_OFFICIAL_DOMAIN = 'www.luogu.com.cn';
+
+/**
+ * Every column of one `material_refresh_batches` row.
+ *
+ * The body is the source of truth for reads, but the indexed columns are the scoping/ordering and
+ * compare-and-set identity of the row. A read therefore always selects them **together with** the
+ * body, and {@link SqliteTrainingStore.readMaterialRefreshBatch} cross-checks the two: selecting only
+ * `body` would leave the reader without the columns it must verify, and trusting the columns alone
+ * would let a row describe different work than the batch it claims to hold.
+ */
+const MATERIAL_REFRESH_BATCH_COLUMNS = 'batch_id, status, revision, created_at, updated_at, item_count, body';
 
 export interface SqliteTrainingStoreOptions {
   /** Explicit database path. The parent directory is created when missing. */
@@ -1499,6 +1519,46 @@ export class SqliteTrainingStore
   async saveBatch(batch: AnalysisBatch, expectedRevision: number | null): Promise<number> {
     this.assertOpen();
     return this.withWrite(() => this.writeBatch(batch, expectedRevision));
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Bulk material-refresh batches (Sprint 34A)
+  // -------------------------------------------------------------------------------------
+
+  async getMaterialRefreshBatch(batchId: string): Promise<MaterialRefreshBatch | null> {
+    this.assertOpen();
+    return this.withRead(() => {
+      const row = this.find(
+        `SELECT ${MATERIAL_REFRESH_BATCH_COLUMNS} FROM material_refresh_batches WHERE batch_id = ?`,
+        [requireId('material batch id', batchId)],
+      );
+      return row === null ? null : this.readMaterialRefreshBatch(row);
+    });
+  }
+
+  async listMaterialRefreshBatches(status: MaterialRefreshBatchStatus | null): Promise<readonly MaterialRefreshBatch[]> {
+    this.assertOpen();
+    return this.withRead(() => {
+      if (status !== null && !MATERIAL_REFRESH_BATCH_STATUSES.includes(status)) {
+        throw new DomainError('invalid_input', `unknown material batch status ${String(status)}`, { status });
+      }
+      const rows =
+        status === null
+          ? this.all(
+              `SELECT ${MATERIAL_REFRESH_BATCH_COLUMNS} FROM material_refresh_batches ORDER BY created_at ASC, batch_id ASC`,
+            )
+          : this.all(
+              `SELECT ${MATERIAL_REFRESH_BATCH_COLUMNS} FROM material_refresh_batches
+                WHERE status = ? ORDER BY created_at ASC, batch_id ASC`,
+              [status],
+            );
+      return rows.map((row) => this.readMaterialRefreshBatch(row));
+    });
+  }
+
+  async saveMaterialRefreshBatch(batch: MaterialRefreshBatch, expectedRevision: number | null): Promise<number> {
+    this.assertOpen();
+    return this.withWrite(() => this.writeMaterialRefreshBatch(batch, expectedRevision));
   }
 
   async getModelCallAttempt(attemptId: string): Promise<ModelCallAttempt | null> {
@@ -3059,6 +3119,116 @@ export class SqliteTrainingStore
   }
 
   /**
+   * Read one material-refresh batch row and re-validate it against **every** indexed column.
+   *
+   * A stored body that is not valid JSON, that parses but violates the record's own closed-shape
+   * rules, or that carries an undeclared member is a `corrupt_row` refusal: the store never repairs
+   * or guesses a batch, because a guessed batch would look like real platform work. The identity and
+   * progress columns (`batch_id`, `status`, `revision`, `created_at`, `updated_at`, `item_count`) are
+   * cross-checked against the body, so a row can neither claim one status while carrying another nor
+   * carry a body whose ordered item list disagrees with the indexed count. Reads select those columns
+   * together with the body for exactly this reason.
+   */
+  private readMaterialRefreshBatch(row: Row): MaterialRefreshBatch {
+    let batch: MaterialRefreshBatch;
+    try {
+      batch = entityFromRow<MaterialRefreshBatch>('material_refresh_batches.body', row);
+      validateMaterialRefreshBatch(batch);
+    } catch (error) {
+      if (error instanceof StorageError && error.code === 'corrupt_row') {
+        throw error;
+      }
+      throw new StorageError('corrupt_row', 'stored material batch is not a valid batch', {
+        cause: String(error),
+      });
+    }
+    const coherent =
+      textColumn(row, 'batch_id') === batch.batchId &&
+      textColumn(row, 'status') === batch.status &&
+      intColumn(row, 'revision') === batch.revision &&
+      textColumn(row, 'created_at') === batch.createdAt &&
+      textColumn(row, 'updated_at') === batch.updatedAt &&
+      intColumn(row, 'item_count') === batch.items.length;
+    if (!coherent) {
+      throw new StorageError('corrupt_row', 'stored material batch columns disagree with its body', {
+        batchId: batch.batchId,
+      });
+    }
+    return batch;
+  }
+
+  /**
+   * Persist a material-refresh batch under optimistic concurrency control.
+   *
+   * The stored revision is the authority: `expectedRevision === null` means "create" and a number must
+   * equal the stored revision, so a stale caller can never overwrite newer progress or resurrect a
+   * cancelled batch. The application's own validators own identity, attempt-monotonicity, immutable
+   * completed items and the legal status transitions, so they cannot drift from the pure records.
+   */
+  private writeMaterialRefreshBatch(batch: MaterialRefreshBatch, expectedRevision: number | null): number {
+    validateMaterialRefreshBatch(batch);
+    invariant(
+      expectedRevision === null || (Number.isInteger(expectedRevision) && expectedRevision >= 1),
+      'invalid_input',
+      'expectedRevision must be null (create) or an integer >= 1 (update)',
+      { batchId: batch.batchId, expectedRevision },
+    );
+    const existing = this.find(
+      `SELECT ${MATERIAL_REFRESH_BATCH_COLUMNS} FROM material_refresh_batches WHERE batch_id = ?`,
+      [batch.batchId],
+    );
+    if (existing === null) {
+      invariant(
+        expectedRevision === null,
+        'invalid_transition',
+        `material batch ${batch.batchId} does not exist; a create must pass expectedRevision null`,
+        { batchId: batch.batchId, expectedRevision },
+      );
+      this.upsertMaterialRefreshBatch(batch, 1);
+      return 1;
+    }
+    const storedRevision = intColumn(existing, 'revision');
+    invariant(
+      expectedRevision !== null,
+      'duplicate_id',
+      `material batch ${batch.batchId} already exists at revision ${storedRevision}`,
+      { batchId: batch.batchId, storedRevision },
+    );
+    invariant(
+      expectedRevision === storedRevision,
+      'invalid_transition',
+      `material batch ${batch.batchId} is at revision ${storedRevision}, not ${expectedRevision}; re-read before saving`,
+      { batchId: batch.batchId, expectedRevision, storedRevision, reason: 'stale_revision' },
+    );
+    // The stored row is read through the same column-cross-checking reader as a public read, so a
+    // corrupt row refuses the compare-and-set instead of being compared against a guessed state.
+    const stored = this.readMaterialRefreshBatch(existing);
+    validateMaterialRefreshBatchTransition(stored, batch);
+    const next = storedRevision + 1;
+    this.upsertMaterialRefreshBatch(batch, next);
+    return next;
+  }
+
+  /** Insert or update one material-refresh batch row; `revision` is the store-assigned token. */
+  private upsertMaterialRefreshBatch(batch: MaterialRefreshBatch, revision: number): void {
+    this.write(
+      `INSERT INTO material_refresh_batches (batch_id, status, revision, created_at, updated_at, item_count, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(batch_id) DO UPDATE SET status = excluded.status, revision = excluded.revision,
+         updated_at = excluded.updated_at, item_count = excluded.item_count, body = excluded.body`,
+      [
+        batch.batchId,
+        batch.status,
+        revision,
+        batch.createdAt,
+        batch.updatedAt,
+        batch.items.length,
+        bodyOf({ ...batch, revision }, MATERIAL_REFRESH_BATCH_FIELDS),
+      ],
+    );
+  }
+
+  /**
    * Insert one reserved attempt, or advance an existing one.
    *
    * A new attempt must be `reserved`: reservation is what makes an in-flight call visible, so
@@ -3494,11 +3664,11 @@ export class SqliteTrainingStore
    *
    * 1. `detectSchemaState` runs first — a database this build must refuse is only read, never
    *    switched into another journal mode or otherwise touched.
-   * 2. A supported older database (v0 through v8) is backed up **before** `configureConnection`,
+   * 2. A supported older database (v0 through v10) is backed up **before** `configureConnection`,
    *    so the backup is the database as it was found and switching the journal mode is not part
    *    of the pre-migration state. The copy is verified before migration starts, at the literal
    *    version the file was found in.
-   * 3. `migrateToSchemaV10` applies only the missing versions in one transaction and ends at the
+   * 3. `migrateToSchemaV11` applies only the missing versions in one transaction and ends at the
    *    current version; every existing row is retained, and exactly one pre-migration backup was
    *    already taken.
    * 4. `configureConnection` (busy timeout, WAL, synchronous) runs only after initialization
@@ -3517,7 +3687,8 @@ export class SqliteTrainingStore
       state === 'v6' ||
       state === 'v7' ||
       state === 'v8' ||
-      state === 'v9'
+      state === 'v9' ||
+      state === 'v10'
     ) {
       // Keep a consistent copy of the database as found before any migration writes to it.
       const from =
@@ -3537,14 +3708,18 @@ export class SqliteTrainingStore
                       ? SCHEMA_VERSION_V6
                       : state === 'v7'
                         ? SCHEMA_VERSION_V7
-                        : state === 'v8' ? SCHEMA_VERSION_V8 : SCHEMA_VERSION_V9;
+                        : state === 'v8'
+                          ? SCHEMA_VERSION_V8
+                          : state === 'v9'
+                            ? SCHEMA_VERSION_V9
+                            : SCHEMA_VERSION_V10;
       const target = this.uniquePath(backupFileName(this.path, from, this.clock()));
       this.vacuumInto(target);
       this.verifyBackup(target, from, from >= SCHEMA_VERSION_V1);
     }
     if (state !== 'current') {
       try {
-        migrateToSchemaV10(this.connection, readUserVersion(this.connection));
+        migrateToSchemaV11(this.connection, readUserVersion(this.connection));
       } catch (error) {
         if (error instanceof StorageError) {
           throw error;

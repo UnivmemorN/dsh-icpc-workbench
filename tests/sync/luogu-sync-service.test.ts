@@ -29,7 +29,7 @@ import {
   type LuoguSyncState,
 } from '../../src/application/luogu-sync-types.js';
 import { PlatformError } from '../../src/application/platform-errors.js';
-import { DEFAULT_PLATFORM_LIMITS, type PlatformLimits } from '../../src/application/ports.js';
+import { DEFAULT_PLATFORM_LIMITS, type PlatformLimits, type ProblemMetadataSource } from '../../src/application/ports.js';
 import {
   DomainError,
   accountIdOf,
@@ -97,7 +97,11 @@ interface World {
   readonly connections: LuoguConnectionAdapter;
   readonly gate: LuoguSourceGate;
   readonly token: CancellationToken;
-  makeService(ownerId: string, limits?: PlatformLimits): LuoguSyncService;
+  makeService(
+    ownerId: string,
+    limits?: PlatformLimits,
+    options?: { readonly authenticatedMetadataFor?: (account: Account) => ProblemMetadataSource },
+  ): LuoguSyncService;
   dispose(): Promise<void>;
 }
 
@@ -153,7 +157,11 @@ async function createWorld(
     connections,
     gate,
     token: createCancellationSource().token,
-    makeService(ownerId: string, limits: PlatformLimits = LIMITS) {
+    makeService(
+      ownerId: string,
+      limits: PlatformLimits = LIMITS,
+      options: { readonly authenticatedMetadataFor?: (account: Account) => ProblemMetadataSource } = {},
+    ) {
       const submissionsFor = createStoredSubmissionsSource({
         store,
         vault,
@@ -167,6 +175,9 @@ async function createWorld(
         sourceInstance: instance,
         submissionsFor,
         metadataSource: metadata.adapter,
+        ...(options.authenticatedMetadataFor === undefined
+          ? {}
+          : { authenticatedMetadataFor: options.authenticatedMetadataFor }),
         ownerId,
         now: () => clock.now(),
         wait: waits.wait,
@@ -1628,6 +1639,107 @@ void test('a rate-limited metadata item is rotated once and stops the phase with
       record?.value.missingMetadata[2],
       problemKeyOf(world.instance, 'P3002'),
       'the failed key is rotated to the end instead of being dropped',
+    );
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('a rate-limited anonymous metadata report establishes the source-wide deadline for the next operation', async () => {
+  const world = await createWorld();
+  try {
+    const service = world.makeService('svc-meta-source-deadline');
+    await seedBacklog(world, world.alice.id, ['P5001']);
+    world.metadata.fail.set(
+      'P5001',
+      new PlatformError({
+        code: 'rate_limited',
+        operation: 'problem',
+        retryable: true,
+        retryAfterMs: 30_000,
+        detail: 'the metadata read was rate limited',
+      }),
+    );
+
+    const mark = world.waits.delays.length;
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.equal(status.failure?.code, 'rate_limited');
+    assert.equal(
+      Date.parse(status.failure?.retryAt ?? '') - Date.parse(status.failure?.at ?? ''),
+      30_000,
+      'the durable backoff still honors the declared delay',
+    );
+
+    // The refusal was answered as a *report*, so the sanitized error is the only place its delay
+    // exists. The next gated operation of the same source must still wait for it.
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    assert.deepEqual(
+      world.waits.delays.slice(mark),
+      [30_000],
+      'the next gated metadata operation waited the retained provider deadline, not the 2s floor',
+    );
+  } finally {
+    await world.dispose();
+  }
+});
+
+void test('an authenticated metadata fallback report establishes the same shared source deadline', async () => {
+  const world = await createWorld();
+  try {
+    const authenticated: ProblemMetadataSource = {
+      sourceInstance: world.instance,
+      fetchProblem: async () => {
+        throw new PlatformError({
+          code: 'unavailable',
+          operation: 'problem',
+          retryable: true,
+          retryAfterMs: 45_000,
+          detail: 'the authenticated metadata read is temporarily unavailable',
+        });
+      },
+    };
+    const service = world.makeService('svc-meta-auth-deadline', LIMITS, {
+      authenticatedMetadataFor: () => authenticated,
+    });
+    await seedBacklog(world, world.alice.id, ['P6001']);
+    world.metadata.fail.set(
+      'P6001',
+      new PlatformError({
+        code: 'auth_required',
+        operation: 'problem',
+        retryable: false,
+        detail: 'the anonymous metadata read was asked to log in',
+      }),
+    );
+
+    const mark = world.waits.delays.length;
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    const status = await service.status(world.alice.id);
+    assert.equal(status.failure?.code, 'unavailable', 'the authenticated answer is the final one');
+    assert.equal(
+      Date.parse(status.failure?.retryAt ?? '') - Date.parse(status.failure?.at ?? ''),
+      45_000,
+      'the authenticated report declared the durable retry instant',
+    );
+    assert.deepEqual(
+      world.waits.delays.slice(mark),
+      [2_000],
+      'only the source floor separated the two attempts of the failing pass',
+    );
+
+    // Both attempts of the next drain wait the deadline the authenticated report declared: the
+    // anonymous one because the deadline is source-wide, the authenticated one because it is its own.
+    const afterAuth = world.waits.delays.length;
+    assert.equal((await service.start(world.alice.id, 'metadata')).outcome, 'started');
+    await service.settle();
+    assert.deepEqual(
+      world.waits.delays.slice(afterAuth),
+      [45_000, 45_000],
+      'the retained authenticated deadline delayed the anonymous and the authenticated attempt alike',
     );
   } finally {
     await world.dispose();

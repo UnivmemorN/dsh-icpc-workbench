@@ -2514,6 +2514,13 @@ export class LuoguSyncService {
    * dispatching it on a stale claim. `beforeCommit` is the caller's own import-transaction hook and
    * is shared by both attempts.
    *
+   * Both attempts hand the gate the same result extractor: the accepted import service answers a
+   * provider refusal as a **report**, not as a thrown error, so the sanitized report error's
+   * `retryAfterMs` is the only place that delay exists. The gate folds it into the source-wide
+   * not-before instant while this operation still owns the FIFO slot, so a later operation of any
+   * transport of this source — the next metadata key, a history page, a connection probe or a
+   * business read — waits for the provider's own deadline.
+   *
    * An absent factory leaves the anonymous refusal unchanged. A configured factory failure is
    * visible as its own fixed error; the final reader outcome alone determines the item result.
    */
@@ -2525,24 +2532,34 @@ export class LuoguSyncService {
     beforeCommit: () => Promise<void>,
   ): Promise<RefreshProblemMetadataReport> {
     const request: RefreshProblemMetadataRequest = { problemRef, token, limits: this.limits, beforeCommit };
-    const anonymous = await this.gate.run(token, async () => {
-      throwIfCancelled(token);
-      await prepare('before a metadata request');
-      throwIfCancelled(token);
-      return this.imports.refreshProblemMetadata(this.metadataSource, request);
-    });
+    const retryAfterOf = (report: RefreshProblemMetadataReport): number | null =>
+      report.error === null ? null : report.error.retryAfterMs;
+    const anonymous = await this.gate.run(
+      token,
+      async () => {
+        throwIfCancelled(token);
+        await prepare('before a metadata request');
+        throwIfCancelled(token);
+        return this.imports.refreshProblemMetadata(this.metadataSource, request);
+      },
+      retryAfterOf,
+    );
     if (anonymous.status === 'fetched' || anonymous.error === null || anonymous.error.code !== 'auth_required') {
       return anonymous;
     }
     if (this.authenticatedMetadataFor === null) return anonymous;
-    return this.gate.run(token, async () => {
-      throwIfCancelled(token);
-      await prepare('before an authenticated metadata request');
-      throwIfCancelled(token);
-      const source = this.authenticatedMetadataSource(account, token);
-      throwIfCancelled(token);
-      return this.imports.refreshProblemMetadata(source, request);
-    });
+    return this.gate.run(
+      token,
+      async () => {
+        throwIfCancelled(token);
+        await prepare('before an authenticated metadata request');
+        throwIfCancelled(token);
+        const source = this.authenticatedMetadataSource(account, token);
+        throwIfCancelled(token);
+        return this.imports.refreshProblemMetadata(source, request);
+      },
+      retryAfterOf,
+    );
   }
 
   /** Resolve a configured reader only after the request owns a live lease. */

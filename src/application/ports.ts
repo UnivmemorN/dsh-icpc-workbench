@@ -21,6 +21,7 @@ import type {
   ModelCallAttempt,
   ModelCallAttemptQuery,
 } from './batch-types.js';
+import type { MaterialRefreshBatch, MaterialRefreshBatchStatus } from './material-refresh-batch-types.js';
 import type {
   Account,
   AiTagSuggestion,
@@ -167,6 +168,12 @@ export interface FetchEditorialRequest {
  * `absent` means an analysis may fall back to the reasoning role, while auth/forbidden/
  * rate-limit/unavailable/changed-response are operational failures that must never be
  * disguised as "no editorial" (that would spend reasoning budget on a broken request).
+ *
+ * `rate_limited` and `unavailable` may both carry the provider's declared Retry-After. It is
+ * optional (and `null`-safe) because a producer that observed no declaration must be able to say so
+ * without inventing one; a consumer that sees a positive value treats it as the earliest instant any
+ * further request to that source may be dispatched — the source-wide cooldown, not a promise that
+ * the request will succeed.
  */
 export type EditorialFetchResult =
   | {
@@ -179,7 +186,13 @@ export type EditorialFetchResult =
   | { readonly status: 'auth_required'; readonly detail: string }
   | { readonly status: 'forbidden'; readonly detail: string }
   | { readonly status: 'rate_limited'; readonly detail: string; readonly retryAfterMs: number | null }
-  | { readonly status: 'unavailable'; readonly detail: string; readonly retryable: boolean }
+  | {
+      readonly status: 'unavailable';
+      readonly detail: string;
+      readonly retryable: boolean;
+      /** Provider-declared delay in milliseconds; absent/`null` means "no declaration". */
+      readonly retryAfterMs?: number | null;
+    }
   | { readonly status: 'changed_response'; readonly detail: string; readonly sample: string | null };
 
 /**
@@ -805,6 +818,25 @@ export interface TrainingStore {
    * strictly after `updatedAt`.
    */
   saveBatch(batch: AnalysisBatch, expectedRevision: number | null): Promise<number>;
+  /**
+   * One durable bulk material-refresh batch by id, or `null` when it is not stored.
+   *
+   * A dedicated aggregate: it shares no table, no revision sequence and no status vocabulary with
+   * {@link TrainingStore.getBatch} or a sync checkpoint, so a bulk platform-material refresh can never
+   * be confused with a model batch or with incremental sync progress.
+   */
+  getMaterialRefreshBatch(batchId: string): Promise<MaterialRefreshBatch | null>;
+  /** Stored material-refresh batches, oldest first; `status: null` reads every status. */
+  listMaterialRefreshBatches(status: MaterialRefreshBatchStatus | null): Promise<readonly MaterialRefreshBatch[]>;
+  /**
+   * Persist a material-refresh batch under optimistic concurrency control; returns the stored revision.
+   *
+   * `expectedRevision` is `null` only for the first save and the previously read revision for every
+   * update, so a stale caller is refused before any write. Identity (batch id, item list, creation
+   * time) and every completed item are immutable, attempts only move forward, and only the declared
+   * status transitions are accepted — all enforced by the application's own record validators.
+   */
+  saveMaterialRefreshBatch(batch: MaterialRefreshBatch, expectedRevision: number | null): Promise<number>;
   getModelCallAttempt(attemptId: string): Promise<ModelCallAttempt | null>;
   /** Attempts of one batch and/or job, in deterministic `requestedAt, attemptId` order. */
   listModelCallAttempts(query: ModelCallAttemptQuery): Promise<readonly ModelCallAttempt[]>;

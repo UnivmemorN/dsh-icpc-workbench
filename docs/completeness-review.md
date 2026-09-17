@@ -56,3 +56,20 @@ A selected problem without a material snapshot is reported as blocked
 (`material_missing` → action `refresh_materials`): no job and no model call is created for it,
 the rest of the selection is prepared normally, and the UI links the user to the problem detail
 to refresh or paste real material first.
+
+## Material refresh scope
+
+Refreshing platform material is a material operation, never an analysis one, and it never repairs
+a stored analysis batch:
+
+* The tag-review surface aggregates the blocked rows of the **currently selected** analysis batch
+  only, and only those whose action is exactly `refresh_materials`. `supplement_editorial` and
+  `supplement_statement` rows are local hand-supplied writes and never enter a platform refresh;
+  changing the selected batch keeps none of the previous batch's rows.
+* Keys are de-duplicated in first-seen order, and a scope of more than 100 unique keys is refused
+  with an explicit sentence instead of being silently truncated.
+* A completed refresh writes **new** material snapshots. The stored analysis batch keeps the
+  immutable snapshot it captured, so its completed results and decisions are never rewritten.
+* The only remedy is a new **free** preparation of a batch followed by an explicit paid-analysis
+  start. Nothing in the refresh surface can prepare, start or resume a tag analysis, and no refresh
+  action creates a model call, a model attempt or budget use.

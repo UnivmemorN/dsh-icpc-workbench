@@ -63,6 +63,8 @@ interface World {
   innerHook: ((label: string) => Promise<void>) | null;
   /** How the next inner operation fails, if it does. */
   innerFailure: unknown;
+  /** What the stub editorial read answers; `null` means the plain synthetic absence. */
+  editorialAnswer: EditorialFetchResult | null;
 }
 
 /**
@@ -83,6 +85,7 @@ function world(): World {
     now: () => now,
     innerHook: null,
     innerFailure: undefined,
+    editorialAnswer: null,
     gate: createLuoguSourceGate({
       now: () => now,
       wait: async (ms, token) => {
@@ -139,7 +142,10 @@ function world(): World {
       ),
     fetchEditorial: (request: FetchEditorialRequest) => {
       const label = `fetchEditorial:${request.account?.id ?? 'anonymous'}`;
-      return wrap(label, { status: 'absent', detail: 'synthetic' } satisfies EditorialFetchResult);
+      return wrap(
+        label,
+        state.editorialAnswer ?? ({ status: 'absent', detail: 'synthetic' } satisfies EditorialFetchResult),
+      );
     },
     fetchAccountProfile: (request: FetchAccountProfileRequest) =>
       wrap(`fetchAccountProfile:${request.account.id}`, {
@@ -375,4 +381,94 @@ void test('the wrapper refuses to be built without a usable gate', () => {
     () => createGatedLuoguAdapter({ adapter: null as unknown as PlatformAdapter, gate: w.gate }),
     TypeError,
   );
+});
+
+void test('a declared editorial Retry-After holds the source-wide deadline for the next operation', async () => {
+  const w = world();
+  const a = gated(w);
+  const ref = { sourceInstanceId: SOURCE.id, domain: null, externalKey: 'P1001' };
+
+  // An *authenticated* editorial read answers the provider's rate limit as data, not as a throw.
+  w.editorialAnswer = { status: 'rate_limited', detail: 'synthetic 429', retryAfterMs: 7_000 };
+  const limited = await a.editorial(ACCOUNT_A.id);
+  assert.equal(limited.status, 'rate_limited');
+  // The following operation is an *anonymous* catalog read of the same source: a different
+  // transport, but the same gate, so it waits for the deadline the editorial answer declared.
+  await a.adapter.listProblems({ cursor: null, limit: 10, token: TOKEN, limits: LIMITS });
+
+  const editorialStep = w.steps.find((step) => step.what === `inner:fetchEditorial:${ACCOUNT_A.id}`);
+  const catalogStep = w.steps.find((step) => step.what === 'inner:listProblems');
+  assert.ok(editorialStep !== undefined && catalogStep !== undefined, JSON.stringify(w.steps));
+  assert.equal(
+    catalogStep.at - editorialStep.at,
+    7_000,
+    'the anonymous read of the same source waited the authenticated answer Retry-After',
+  );
+
+  // An `unavailable` outage that declared a delay is retained the same way.
+  w.editorialAnswer = { status: 'unavailable', detail: 'synthetic 503', retryable: true, retryAfterMs: 4_000 };
+  await a.adapter.fetchEditorial({ problemRef: ref, token: TOKEN, limits: LIMITS });
+  await a.adapter.fetchProblem({ problemRef: ref, token: TOKEN, limits: LIMITS });
+
+  const unavailableStep = w.steps.find((step) => step.what === 'inner:fetchEditorial:anonymous');
+  const problemStep = w.steps.find((step) => step.what === 'inner:fetchProblem');
+  assert.ok(unavailableStep !== undefined && problemStep !== undefined, JSON.stringify(w.steps));
+  // The catalog read above finished at 7s, when the retained provider deadline had just elapsed, so
+  // the next whole operation is paced by the *ordinary* source floor — a cooldown replaces the floor
+  // only while it reaches further than the floor does, and it never removes the between-operations
+  // quiet time of an operation that already completed.
+  assert.equal(
+    unavailableStep.at - catalogStep.at,
+    LUOGU_SOURCE_MIN_INTERVAL_MS,
+    'the ordinary floor still separates two whole operations after a cooldown elapsed',
+  );
+  assert.equal(
+    problemStep.at - unavailableStep.at,
+    4_000,
+    'an unavailable answer that declared Retry-After delays the next operation as well',
+  );
+  // Every wait of this timeline is accounted for: the 7s provider deadline replaced the floor for the
+  // catalog read, the ordinary 2s floor then separated that completed read from the anonymous
+  // editorial read, and the 4s provider deadline replaced the floor for the problem read.
+  assert.deepEqual(
+    w.waits,
+    [7_000, LUOGU_SOURCE_MIN_INTERVAL_MS, 4_000],
+    `each operation waited the later of the source floor and the retained deadline: ${JSON.stringify(w.steps)}`,
+  );
+});
+
+void test('a thrown anonymous 429 holds the source-wide deadline for the next authenticated operation', async () => {
+  const w = world();
+  const a = gated(w);
+  const failure = new PlatformError({
+    code: 'rate_limited',
+    operation: 'editorial',
+    retryable: true,
+    retryAfterMs: 9_000,
+    detail: 'synthetic 429',
+  });
+  w.innerFailure = failure;
+  await assert.rejects(
+    a.adapter.fetchEditorial({
+      problemRef: { sourceInstanceId: SOURCE.id, domain: null, externalKey: 'P1001' },
+      token: TOKEN,
+      limits: LIMITS,
+    }),
+    (error: unknown) => error === failure,
+    'the thrown failure is rethrown unchanged',
+  );
+  w.innerFailure = undefined;
+  // The authenticated submission read goes through the same gate, so it waits the deadline the
+  // anonymous refusal declared instead of starting after the two-second floor.
+  await a.submissions(ACCOUNT_A.id);
+
+  const thrownStep = w.steps.find((step) => step.what === 'inner:fetchEditorial:anonymous');
+  const submissionsStep = w.steps.find((step) => step.what === 'inner:listSubmissions');
+  assert.ok(thrownStep !== undefined && submissionsStep !== undefined, JSON.stringify(w.steps));
+  assert.equal(
+    submissionsStep.at - thrownStep.at,
+    9_000,
+    'the authenticated operation waited the deadline of the anonymous 429',
+  );
+  assert.deepEqual(w.waits, [9_000]);
 });

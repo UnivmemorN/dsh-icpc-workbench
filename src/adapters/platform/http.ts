@@ -544,7 +544,15 @@ export class HttpTransport {
         ) {
           // Either the retry budget is spent, the failure is terminal, or the provider asked for
           // a longer pause than this transport may take: report the declared delay instead of
-          // retrying early. The real attempt count (redirect hops included) is only known here.
+          // retrying early. A positive `Retry-After` is still a transport-wide fact, so it becomes
+          // this transport's shared not-before instant: a later request — whichever call site queued
+          // it — dispatches no earlier than the provider's deadline. The wait itself stays
+          // cancellation-aware because `pace` performs it through the injected wait. The real attempt
+          // count (redirect hops included) is only known here.
+          if (error.retryAfterMs !== null && error.retryAfterMs > 0) {
+            const deadline = this.clock() + error.retryAfterMs;
+            this.nextSlotAt = this.nextSlotAt === null ? deadline : Math.max(this.nextSlotAt, deadline);
+          }
           throw this.withAttempts(error, counter.count);
         }
         if (error.retryAfterMs !== null && error.retryAfterMs > 0) {

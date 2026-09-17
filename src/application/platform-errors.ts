@@ -197,7 +197,9 @@ export function editorialFailureFromPlatformError(
     case 'rate_limited':
       return { status: 'rate_limited', detail: error.detail, retryAfterMs: error.retryAfterMs };
     case 'unavailable':
-      return { status: 'unavailable', detail: error.detail, retryable: error.retryable };
+      // A 503 (or any other temporary outage) may declare Retry-After too; dropping it here would
+      // lose the provider's own deadline before the source gate could retain it.
+      return { status: 'unavailable', detail: error.detail, retryable: error.retryable, retryAfterMs: error.retryAfterMs };
     case 'changed_response':
       return { status: 'changed_response', detail: error.detail, sample: error.sample };
     case 'invalid_input':

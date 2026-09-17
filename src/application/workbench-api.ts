@@ -72,6 +72,13 @@ import type {
 } from './workbench-types.js';
 import type { MergedBankBrowseRequest } from './merged-bank-service.js';
 import type {
+  MaterialRefreshBatchItemView,
+  MaterialRefreshBatchListView,
+  MaterialRefreshBatchStatus,
+  MaterialRefreshBatchSummaryView,
+  MaterialRefreshBatchView,
+} from './material-refresh-batch-types.js';
+import type {
   VirtualPerformanceDeleteRequest,
   VirtualPerformanceLedgerView,
   VirtualPerformanceListRequest,
@@ -212,6 +219,26 @@ export const PERFORMANCE_API_OPERATIONS = {
   performanceList: 'performance.list',
   performanceSave: 'performance.save',
   performanceDelete: 'performance.delete',
+} as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
+
+/**
+ * Durable bulk platform-material refresh operations (Sprint 34A).
+ *
+ * Registered separately from the accepted single-item `material.refresh`/`material.supplement`
+ * routes, whose requests and semantics are unchanged. All six operations are platform-IO only: none
+ * of them can name a model, create a model attempt or start a tag analysis, so preparing or starting
+ * a bulk refresh can never spend model budget. `material.prepare`, `material.detail` and
+ * `material.list` are local reads/writes; `material.start`, `material.cancel` and
+ * `material.retryFailed` are explicit state transitions, and start returns before its owned background
+ * work finishes.
+ */
+export const MATERIAL_BATCH_API_OPERATIONS = {
+  materialBatchPrepare: 'material.prepare',
+  materialBatchStart: 'material.start',
+  materialBatchDetail: 'material.detail',
+  materialBatchList: 'material.list',
+  materialBatchCancel: 'material.cancel',
+  materialBatchRetryFailed: 'material.retryFailed',
 } as const satisfies Readonly<Record<string, WorkbenchApiOperation>>;
 
 /**
@@ -613,6 +640,61 @@ export interface ApiMaterialSupplementResult {
   readonly snapshot: ApiSnapshotWriteView;
   readonly material: ApiMaterialDeclarationView | null;
 }
+
+/**
+ * One explicitly selected item of a bulk material refresh (Sprint 34A).
+ *
+ * The closed contract mirrors the aggregate exactly: a canonical problem key, an optional stored
+ * account the read may authenticate as, an optional official tutorial URL the adapter validates
+ * against its own origin, and the statement flag. The account id must be canonically encoded and is
+ * resolved against the store before the batch is written; the tutorial URL must be an absolute
+ * `http(s)` URL without embedded credentials. There is deliberately no field for a title, a statement
+ * body, a raw tag, a Cookie, a credential or a mirror choice, so a request cannot smuggle hidden
+ * metadata or a secret into the durable batch.
+ */
+export interface ApiMaterialBatchItemRequest {
+  readonly problemKey: string;
+  readonly accountId?: string | null;
+  readonly officialTutorialUrl?: string | null;
+  readonly fetchStatement?: boolean;
+}
+
+/** Request of `material.prepare`: 1..100 explicit items, unique by canonical problem key. */
+export interface ApiMaterialBatchPrepareRequest {
+  readonly items: readonly ApiMaterialBatchItemRequest[];
+}
+
+/** Request naming one stored batch, used by start/detail/cancel/retryFailed. */
+export interface ApiMaterialBatchIdRequest {
+  readonly batchId: string;
+}
+
+/** Request of `material.list`: an optional status filter and a bounded page size. */
+export interface ApiMaterialBatchListRequest {
+  readonly status?: MaterialRefreshBatchStatus | null;
+  readonly limit?: number;
+}
+
+/**
+ * One item of a batch answer.
+ *
+ * Metadata only: identity, selection flags, status, attempts, the sanitized failure and the snapshot
+ * descriptor. The stored official tutorial URL is represented by `hasOfficialTutorial`. The stored
+ * account id is not exposed at all: an `AccountId` encodes its handle, so there is no `accountId`
+ * field and no substitute identifier derived from one. No field exists for a problem title, a
+ * statement, an editorial body, a raw platform tag, an account handle/display name or a raw provider
+ * error text.
+ */
+export type ApiMaterialBatchItemView = MaterialRefreshBatchItemView;
+
+/** One batch answer: the ordered items plus the per-status totals. */
+export type ApiMaterialBatchView = MaterialRefreshBatchView;
+
+/** One row of `material.list`: the same metadata without the item list. */
+export type ApiMaterialBatchSummaryView = MaterialRefreshBatchSummaryView;
+
+/** Answer of `material.list`, newest first, with the filtered total before the page slice. */
+export type ApiMaterialBatchListView = MaterialRefreshBatchListView;
 
 // ---------------------------------------------------------------------------------------
 // Luogu connection / synchronization operations (Sprint 17d1)
@@ -1053,6 +1135,12 @@ export interface WorkbenchApiMap {
   'import.apply': ApiEndpoint<ApiImportRequest, ApiImportApplyResult>;
   'material.refresh': ApiEndpoint<ApiMaterialRefreshRequest, ApiMaterialRefreshResult>;
   'material.supplement': ApiEndpoint<ApiMaterialSupplementRequest, ApiMaterialSupplementResult>;
+  'material.prepare': ApiEndpoint<ApiMaterialBatchPrepareRequest, ApiMaterialBatchView>;
+  'material.start': ApiEndpoint<ApiMaterialBatchIdRequest, ApiMaterialBatchView>;
+  'material.detail': ApiEndpoint<ApiMaterialBatchIdRequest, ApiMaterialBatchView>;
+  'material.list': ApiEndpoint<ApiMaterialBatchListRequest, ApiMaterialBatchListView>;
+  'material.cancel': ApiEndpoint<ApiMaterialBatchIdRequest, ApiMaterialBatchView>;
+  'material.retryFailed': ApiEndpoint<ApiMaterialBatchIdRequest, ApiMaterialBatchView>;
   'problem.list': ApiEndpoint<ApiProblemListRequest, ApiProblemListResult>;
   'problem.browse': ApiEndpoint<ApiProblemBrowseRequest, ApiProblemBrowseResult>;
   'problem.mergedBrowse': ApiEndpoint<ApiProblemMergedBrowseRequest, ApiProblemMergedBrowseResult>;

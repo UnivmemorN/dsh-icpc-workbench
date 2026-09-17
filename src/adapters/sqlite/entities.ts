@@ -188,6 +188,26 @@ export const BATCH_FIELDS: readonly string[] = [
   'updatedAt',
   'lastError',
 ];
+/**
+ * Declared fields of one durable bulk material-refresh batch (Sprint 34A).
+ *
+ * The canonical body carries the ordered items and their per-item selection, attempts and sanitized
+ * outcomes; `status`/`revision`/`created_at`/`updated_at`/`item_count` have their own indexed columns
+ * for listing and the revision compare-and-set. No declared field can hold a Cookie, a credential
+ * reference, a statement, a raw tag, an editorial body, an upstream response body or an exception
+ * text — the aggregate has no member for any of them.
+ */
+export const MATERIAL_REFRESH_BATCH_FIELDS: readonly string[] = [
+  'batchId',
+  'items',
+  'status',
+  'revision',
+  'createdAt',
+  'updatedAt',
+  'startedAt',
+  'finishedAt',
+  'cancelledAt',
+];
 export const MODEL_CALL_ATTEMPT_FIELDS: readonly string[] = [
   'attemptId',
   'batchId',

@@ -301,8 +301,14 @@ export async function registerBusinessApi(options: RegisterBusinessApiOptions): 
   };
 }
 
-/** Release registrations in reverse order, collecting failures instead of stopping at the first. */
-async function releaseAll(disposers: readonly (() => Promise<void>)[]): Promise<readonly unknown[]> {
+/**
+ * Release registrations in reverse order, collecting failures instead of stopping at the first.
+ *
+ * Exported because every route-registering module of this plugin owns the same disposal discipline:
+ * one module registers its routes through this helper chain instead of keeping a second, subtly
+ * different copy of it.
+ */
+export async function releaseAll(disposers: readonly (() => Promise<void>)[]): Promise<readonly unknown[]> {
   const failures: unknown[] = [];
   for (let index = disposers.length - 1; index >= 0; index -= 1) {
     const dispose = disposers[index];
@@ -318,9 +324,15 @@ async function releaseAll(disposers: readonly (() => Promise<void>)[]): Promise<
   return failures;
 }
 
+/** Release options every route-registering module of this plugin shares; see {@link releaseAll}. */
+export interface ApiRegistrationOptions {
+  /** Observer for cleanup failures; a throwing observer never replaces the original failure. */
+  readonly onDisposeError?: BusinessApiInternalErrorHook;
+}
+
 /** Release the owned registrations, report every failure and reject when any step failed. */
-async function releaseOwned(
-  options: RegisterBusinessApiOptions,
+export async function releaseOwned(
+  options: ApiRegistrationOptions,
   disposers: readonly (() => Promise<void>)[],
 ): Promise<void> {
   const failures = await releaseAll(disposers);
@@ -337,7 +349,7 @@ interface CleanupError extends Error {
   cleanupFailures: readonly unknown[];
 }
 
-function cleanupError(failures: readonly unknown[]): CleanupError {
+export function cleanupError(failures: readonly unknown[]): CleanupError {
   const error = new Error(
     `the business API could not be released: ${failures.length} registration disposer(s) failed`,
   ) as CleanupError;
@@ -347,7 +359,7 @@ function cleanupError(failures: readonly unknown[]): CleanupError {
 }
 
 /** Attach cleanup failures to the original registration failure without replacing it. */
-function attachCleanupFailures(error: unknown, failures: readonly unknown[]): unknown {
+export function attachCleanupFailures(error: unknown, failures: readonly unknown[]): unknown {
   if (failures.length === 0 || error === null || (typeof error !== 'object' && typeof error !== 'function')) {
     return error;
   }
@@ -361,8 +373,8 @@ function attachCleanupFailures(error: unknown, failures: readonly unknown[]): un
 }
 
 /** Report one cleanup failure without ever replacing the failure that caused the rollback. */
-function reportDisposeFailure(
-  options: RegisterBusinessApiOptions,
+export function reportDisposeFailure(
+  options: ApiRegistrationOptions,
   failure: unknown,
   rollingBack: boolean,
 ): void {

@@ -29,7 +29,7 @@ import {
   SCHEMA_VERSION_V8,
   STORE_TABLES_V4,
   STORE_TABLES_V8,
-  STORE_TABLES_V10,
+  STORE_TABLES_V11,
   applySchemaV1,
   applySchemaV3,
   initializeSchemaV2,
@@ -260,6 +260,7 @@ void test('a fresh path is initialized with the marker, the current schema and i
     'luogu_sync_states',
     'manual_decisions',
     'manual_revisions',
+    'material_refresh_batches',
     'plan_attempts',
     'plans',
     'problems',
@@ -289,6 +290,11 @@ void test('a fresh path is initialized with the marker, the current schema and i
     0,
     'the reserved ability-evaluation table starts empty',
   );
+  assert.equal(
+    rawScalar(nested, 'SELECT count(*) FROM material_refresh_batches'),
+    0,
+    'no bulk material-refresh batch exists before a prepare',
+  );
   fx.removeDirectory(paths.dir);
 });
 
@@ -297,11 +303,11 @@ void test('a database from a newer schema is rejected before anything is written
   rawExec(paths.path, [
     'CREATE TABLE problems (x TEXT)',
     `INSERT INTO problems (x) VALUES ('foreign data')`,
-    // Explicitly verify a v11 database is refused by this build's v10 store before any write.
+    // Explicitly verify a v12 database is refused by this build's v11 store before any write.
     `PRAGMA user_version = ${STORE_SCHEMA_VERSION + 1}`,
   ]);
-  assert.equal(STORE_SCHEMA_VERSION, 10);
-  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 11);
+  assert.equal(STORE_SCHEMA_VERSION, 11);
+  assert.equal(rawScalar(paths.path, 'PRAGMA user_version'), 12);
   const before = fingerprint(paths.path);
   const beforeBytes = readFileSync(paths.path);
   assert.equal(rawScalar(paths.path, 'PRAGMA journal_mode'), 'delete', 'the fixture starts in rollback journal mode');
@@ -369,7 +375,7 @@ void test('a genuine v8 database is backed up at v8 and migrated to the current 
   assert.equal(migrated.userVersion, STORE_SCHEMA_VERSION, 'the genuine v8 file ends at the current schema');
   assert.equal(migrated.marker, STORE_MARKER);
   assert.equal(migrated.integrity, 'ok');
-  assert.deepEqual(migrated.tables, [...STORE_TABLES_V10].sort(), 'current schema adds only disposition storage');
+  assert.deepEqual(migrated.tables, [...STORE_TABLES_V11].sort(), 'current schema adds the bulk material-refresh table');
   assert.equal(rawScalar(paths.path, 'SELECT body FROM problems'), canonicalJson(scope.problem));
 
   const backups = readdirSync(paths.dir).filter((name) => name.includes('.backup-v8-') && name.endsWith('.sqlite'));

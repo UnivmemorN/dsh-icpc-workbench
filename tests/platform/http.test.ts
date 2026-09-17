@@ -5,9 +5,9 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { HttpTransport } from '../../src/adapters/platform/http.js';
+import { HttpTransport, type WaitFn } from '../../src/adapters/platform/http.js';
 import { isPlatformError } from '../../src/application/platform-errors.js';
-import { createCancellationSource } from '../../src/domain/index.js';
+import { DomainError, createCancellationSource } from '../../src/domain/index.js';
 import {
   createHttpHarness,
   hangUntilAbort,
@@ -491,4 +491,94 @@ test('an oversized Content-Length cancels the unread body and aborts the transpo
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(cancelled, true);
   assert.equal(signal?.aborted, true);
+});
+
+test('a positive Retry-After becomes the shared not-before instant of later requests', async () => {
+  let calls = 0;
+  const harness = createHttpHarness({
+    maxRetries: 0,
+    routes: {
+      '/api/a': () => {
+        calls += 1;
+        return calls === 1
+          ? new Response('busy', { status: 429, headers: { 'retry-after': '5' } })
+          : jsonResponse({ ok: true });
+      },
+    },
+  });
+  const source = createCancellationSource();
+  await assert.rejects(
+    harness.transport.request('/api/a', { token: source.token, operation }),
+    (error) =>
+      isPlatformError(error) && error.code === 'rate_limited' && error.retryAfterMs === 5000 && error.attempts === 1,
+  );
+  assert.deepEqual(
+    harness.requests.map((request) => request.at),
+    [0],
+    'the first request dispatched immediately',
+  );
+  assert.deepEqual(harness.waits, [], 'giving up on the retry budget must not sleep through the delay');
+
+  // The provider deadline is now shared transport state: a later request — whichever call site queued
+  // it — dispatches no earlier than that deadline even though the first request never retried.
+  const response = await harness.transport.request('/api/a', { token: source.token, operation });
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    harness.requests.map((request) => request.at),
+    [0, 5000],
+  );
+  assert.deepEqual(harness.waits, [5000]);
+});
+
+test('cancellation during a shared Retry-After cooldown dispatches nothing', async () => {
+  const harness = createHttpHarness({
+    maxRetries: 0,
+    routes: { '/api/a': () => new Response('busy', { status: 429, headers: { 'retry-after': '5' } }) },
+  });
+  // A deterministic cooldown wait: it resolves only when the test releases it and rejects the moment
+  // the caller cancels. No real timer and no real sleep are involved anywhere in this case.
+  const releases: (() => void)[] = [];
+  const cooldown: WaitFn = (_ms, token) =>
+    new Promise<void>((resolve, reject) => {
+      if (token.cancelled) {
+        reject(new DomainError('cancelled', 'cancelled before the shared cooldown started'));
+        return;
+      }
+      const off = token.onCancel(() => {
+        off();
+        reject(new DomainError('cancelled', 'cancelled during the shared cooldown'));
+      });
+      releases.push(() => {
+        off();
+        resolve();
+      });
+    });
+  const transport = new HttpTransport({
+    origin: 'https://codeforces.com',
+    maxRetries: 0,
+    fetchImpl: harness.impl.fetchImpl,
+    clock: harness.impl.clock,
+    wait: cooldown,
+  });
+
+  const first = createCancellationSource();
+  await assert.rejects(
+    transport.request('/api/a', { token: first.token, operation }),
+    (error) => isPlatformError(error) && error.code === 'rate_limited' && error.retryAfterMs === 5000,
+  );
+  assert.equal(harness.requests.length, 1);
+
+  const second = createCancellationSource();
+  const pendingRequest = transport.request('/api/a', { token: second.token, operation });
+  await tick();
+  assert.equal(releases.length, 1, 'the cooled-down request is waiting on the provider deadline');
+  assert.equal(harness.requests.length, 1, 'nothing was dispatched during the cooldown');
+  second.cancel('user');
+  await assert.rejects(pendingRequest, (error) => codeOf(error) === 'cancelled');
+  assert.equal(harness.requests.length, 1, 'a cancelled cooldown dispatches nothing');
+  for (const release of releases) {
+    release();
+  }
+  await tick();
+  assert.equal(harness.requests.length, 1, 'an abandoned cooldown still dispatches nothing');
 });

@@ -18,7 +18,14 @@ The statement is problem.content with name/background/description/formatI/format
 Official CF API documentation requires at most one request per two seconds:
 https://codeforces.com/apiHelp . Enforce this minimum across requests on the same instance, with cancellable queueing and finite timeout/retries.
 
-Authenticated editorial retrieval has not been verified. Never request secrets through logs or store them in the training DB; normal host credential mechanisms or user-supplied manual text can be added without bypassing access controls. Do not claim Luogu editorial or live CF HTML acceptance from synthetic fixtures.
+Authenticated Luogu editorial retrieval is verified only within the limited live scope recorded in
+[Stage 33C](reports/stage-33c-luogu-editorial-read.md): on 2026-09-16 a real account read returned
+`found` with matching non-zero source/solution counts (P1001 56/56, UVA10082 9/9), a platform
+`count=0`/`result=[]` answer was reported as `absent` (P17462), and a read with no account selected
+was `auth_required` rather than `absent`. Unobserved shapes are handled defensively and must not be
+claimed from fixtures: the authenticated direct `content-only` response shape and its live HTTP
+status/content type, login-redirect and CAPTCHA shapes, the `time` field's unit, write-up
+`language`, and the authenticated statement read for private/test problems. Never request secrets through logs or store them in the training DB; normal host credential mechanisms or user-supplied manual text can be added without bypassing access controls. Do not claim Luogu editorial or live CF HTML acceptance from synthetic fixtures.
 
 ## Additional import probes
 - /problem/list?page=1 + Lentille header:200JSON; data.problems={perPage:50,count:17466,result:[...]}; each item has pid/type/name/difficulty/tags/totalSubmit/totalAccepted/flag/provider.

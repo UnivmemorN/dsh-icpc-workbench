@@ -170,6 +170,10 @@ function anonymousEditorialCodeFailure(
       status: 'unavailable',
       detail: `${label} did not answer solution material`,
       retryable: errorCode >= 500,
+      // An envelope error code declares no delay of its own; `null` says exactly that instead of
+      // inventing one, while a transport-level Retry-After is still preserved by
+      // `anonymousEditorialFailureFrom` below.
+      retryAfterMs: null,
     };
   }
   return { status: 'changed_response', detail: `${label} answered an unrecognized error code`, sample: null };
@@ -213,6 +217,7 @@ function anonymousEditorialFailureFrom(
       status: 'unavailable',
       detail: ANONYMOUS_EDITORIAL_FAILURE_DETAILS.unavailable,
       retryable: false,
+      retryAfterMs: null,
     };
   }
   if (typeof typed.retryable !== 'boolean') {
@@ -220,6 +225,7 @@ function anonymousEditorialFailureFrom(
       status: 'unavailable',
       detail: ANONYMOUS_EDITORIAL_FAILURE_DETAILS.unavailable,
       retryable: false,
+      retryAfterMs: null,
     };
   }
   const code = typed.code as PlatformErrorCode;
@@ -232,7 +238,15 @@ function anonymousEditorialFailureFrom(
     case 'rate_limited':
       return { status: 'rate_limited', detail, retryAfterMs: safeRetryAfterMs(typed.retryAfterMs) };
     case 'unavailable':
-      return { status: 'unavailable', detail, retryable: typed.retryable };
+      return {
+        status: 'unavailable',
+        detail,
+        retryable: typed.retryable,
+        // A temporary outage may declare Retry-After as well; the validated delay survives here and
+        // becomes the source-wide not-before instant at the gate, so a following operation of any
+        // transport of this source cannot be dispatched before the provider's own deadline.
+        retryAfterMs: safeRetryAfterMs(typed.retryAfterMs),
+      };
     case 'changed_response':
       return { status: 'changed_response', detail, sample: null };
     case 'cancelled':
