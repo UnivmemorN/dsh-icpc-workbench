@@ -311,7 +311,7 @@ export function LuoguSyncPanel({
     }
     void submit('probe', async (signal) => {
       await api.request('luogu.probe', { accountId: target }, signal);
-      setMessage('已按当前保存的凭据检查登录状态。');
+      setMessage('已验证当前保存的 Cookie，洛谷接受了这次认证读取。');
     });
   }
 
@@ -525,7 +525,7 @@ export function LuoguSyncPanel({
           )}
           {supported && value.connection !== null && (
             <button type="button" disabled={!controls.probe.enabled} aria-busy={pending === 'probe'} onClick={probe}>
-              {pending === 'probe' ? '检查中…' : '检查登录'}
+              {pending === 'probe' ? '验证中…' : '验证已保存的 Cookie'}
             </button>
           )}
           {supported && (

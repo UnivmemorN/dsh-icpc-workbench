@@ -576,7 +576,7 @@ void test('a failure is explained by the half of the pass that failed, and a leg
   const history = status({ failure: historyFailure });
   assert.equal(luoguSyncFailureGuidance(historyFailure), LUOGU_HISTORY_FAILURE_GUIDANCE.auth_required);
   assert.match(luoguSyncFailureGuidance(historyFailure), /读取提交记录/);
-  assert.match(luoguSyncFailureGuidance(historyFailure), /检查登录/);
+  assert.match(luoguSyncFailureGuidance(historyFailure), /验证已保存的 Cookie/);
   assert.match(luoguAttemptSummary(history), /在读取提交记录时失败/);
   assert.match(
     luoguNextRunSummary({ ...history, settings: { ...history.settings, automaticEnabled: true } }),
@@ -589,10 +589,10 @@ void test('a failure is explained by the half of the pass that failed, and a leg
   const legacy = status({ failure: legacyFailure });
   const legacyAdvice = luoguSyncFailureGuidance(legacyFailure);
   assert.equal(legacyAdvice, LUOGU_FAILURE_GUIDANCE.auth_required);
-  assert.match(legacyAdvice, /检查登录/);
+  assert.match(legacyAdvice, /验证已保存的 Cookie/);
   assert.doesNotMatch(legacyAdvice, /失效|过期/);
   assert.match(luoguAttemptSummary(legacy), /失败/);
-  assert.match(luoguAttemptSummary(legacy), /检查登录/);
+  assert.match(luoguAttemptSummary(legacy), /验证已保存的 Cookie/);
   assert.doesNotMatch(
     luoguAttemptSummary(legacy),
     /在读取提交记录时|在补齐题目资料时/,
@@ -600,7 +600,7 @@ void test('a failure is explained by the half of the pass that failed, and a leg
   );
   assert.match(
     luoguNextRunSummary({ ...legacy, settings: { ...legacy.settings, automaticEnabled: true } }),
-    /检查登录/,
+    /验证已保存的 Cookie/,
   );
 
   // The stage-aware helper covers every code: a stage-specific sentence wins where one exists, and
@@ -629,7 +629,7 @@ void test('a successful probe after a sync failure is a current login check, nev
   });
   const check = luoguLoginCheckSummary(afterProbe);
   assert.ok(check !== null);
-  assert.match(check, /检查成功/);
+  assert.match(check, /验证成功/);
   assert.match(check, /最近一次同步/);
   assert.match(check, /仍然失败/);
   assert.match(check, /不代表同步成功/);

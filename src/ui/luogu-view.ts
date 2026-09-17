@@ -399,7 +399,7 @@ export const LUOGU_FAILURE_STAGE_LABELS: Readonly<Record<LuoguSyncFailureStage, 
  */
 export const LUOGU_FAILURE_GUIDANCE: Readonly<Record<LuoguSyncFailureCode, string>> = {
   auth_required:
-    '这次请求被平台要求登录：请在普通浏览器里确认这个账号仍能正常登录，再点「检查登录」核对当前登录；若检查也失败，再重新复制 Cookie 值并重新连接。已同步的记录、进度与待补资料都会保留。',
+    '这次请求被平台要求登录：请在普通浏览器里确认这个账号仍能正常登录，再点「验证已保存的 Cookie」核对当前登录；若这次 Cookie 验证也失败，再重新复制 Cookie 值并重新连接。已同步的记录、进度与待补资料都会保留。',
   forbidden: '平台拒绝了这次访问：请确认账号在普通浏览器里可用，然后重新连接或手动继续。',
   rate_limited: '平台限流：进度已保留，会在计划的重试时间后继续，请不要连续手动点击。',
   timeout: '请求超时：多为网络或平台繁忙，进度已保留，可稍后手动继续。',
@@ -433,7 +433,7 @@ export const LUOGU_FAILURE_GUIDANCE: Readonly<Record<LuoguSyncFailureCode, strin
  */
 export const LUOGU_METADATA_FAILURE_GUIDANCE: Readonly<Partial<Record<LuoguSyncFailureCode, string>>> = {
   auth_required:
-    '上一轮补齐题目资料时被洛谷要求登录。请先点「重试此题」或手动继续同步；当前版本在匿名读取要求登录时会使用当前账号保存的会话重试。仍失败时请点「检查登录」，按结果重新连接。这不等于保存的登录凭据一定过期；已同步的提交记录、历史覆盖与检查点都会保留，待补题目资料继续排队。',
+    '上一轮补齐题目资料时被洛谷要求登录。请先点「重试此题」或手动继续同步；当前版本在匿名读取要求登录时会使用当前账号保存的会话重试。仍失败时请点「验证已保存的 Cookie」，按结果重新连接。这不等于保存的登录凭据一定过期；已同步的提交记录、历史覆盖与检查点都会保留，待补题目资料继续排队。',
   forbidden:
     '上一轮在补齐题目资料时被平台拒绝访问：这通常是题目自己的访问权限或平台限制（例如自建 U / T 类题目），具体原因需要核对。已经同步的提交记录、历史覆盖与检查点都会保留，待补题目资料会继续排队；可以打开原题检查、稍后重试或手工补充。',
   changed_response:
@@ -448,7 +448,7 @@ export const LUOGU_METADATA_FAILURE_GUIDANCE: Readonly<Partial<Record<LuoguSyncF
  */
 export const LUOGU_HISTORY_FAILURE_GUIDANCE: Readonly<Partial<Record<LuoguSyncFailureCode, string>>> = {
   auth_required:
-    '上一轮在读取提交记录（需要登录的步骤）时被平台要求重新登录：已经提交的页面、历史覆盖与检查点都会保留。请先在普通浏览器里确认账号能正常登录，并点「检查登录」核对当前登录，然后手动继续同步；若登录检查也失败，再重新复制 Cookie 值并重新连接。',
+    '上一轮在读取提交记录（需要登录的步骤）时被平台要求重新登录：已经提交的页面、历史覆盖与检查点都会保留。请先在普通浏览器里确认账号能正常登录，并点「验证已保存的 Cookie」核对当前登录，然后手动继续同步；若这次 Cookie 验证也失败，再重新复制 Cookie 值并重新连接。',
 };
 
 /**
@@ -509,7 +509,7 @@ export function luoguLoginCheckSummary(status: ApiLuoguStatusView | null): strin
   if (!Number.isFinite(checked) || !Number.isFinite(failed) || checked <= failed) {
     return null;
   }
-  return `当前登录检查：${luoguTime(connection.checkedAt)} 检查成功，保存的登录凭据现在可用；但这只说明现在能登录，最近一次同步（${luoguTime(failure.at)}）仍然失败，需要按上面的说明处理，并不代表同步成功。`;
+  return `当前 Cookie 验证：${luoguTime(connection.checkedAt)} 验证成功，保存的登录凭据现在可用；但这只说明现在能登录，最近一次同步（${luoguTime(failure.at)}）仍然失败，需要按上面的说明处理，并不代表同步成功。`;
 }
 
 /** Text of a `luogu.start` answer; every outcome is stated as committed, never as completed. */
@@ -578,7 +578,7 @@ export type LuoguAction =
 
 export const LUOGU_ACTION_LABELS: Readonly<Record<LuoguAction, string>> = {
   connect: '连接',
-  probe: '检查登录',
+  probe: '验证已保存的 Cookie',
   disconnect: '断开连接',
   start: '开始 / 继续同步',
   reconcile: '全历史完整核对',
@@ -1109,5 +1109,5 @@ export const LUOGU_MANUAL_STILL_AVAILABLE =
 
 /** Unsupported-OS sentence; the platform is disclosed so the reason is checkable. */
 export function luoguUnsupportedOsNote(platform: string): string {
-  return `当前系统（${platform}）没有可用的安全凭据存储，因此「连接 / 检查登录 / 断开」不可用。账号、题库、导入与 AI 功能仍然可以使用。`;
+  return `当前系统（${platform}）没有可用的安全凭据存储，因此「连接 / 验证已保存的 Cookie / 断开」不可用。账号、题库、导入与 AI 功能仍然可以使用。`;
 }

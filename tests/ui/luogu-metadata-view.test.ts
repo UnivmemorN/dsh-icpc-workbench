@@ -311,7 +311,7 @@ void test('a code-only issue or retry result is explained by its failure code, n
   };
   const auth = luoguMetadataIssueText(authIssue);
   assert.match(auth, /登录/);
-  assert.match(auth, /检查登录/);
+  assert.match(auth, /验证已保存的 Cookie/);
   assert.match(auth, /累计失败 2 次/);
   assert.doesNotMatch(auth, /已经用|再试过一次/, 'a legacy diagnosis cannot prove an authenticated attempt occurred');
   assert.doesNotMatch(auth, /没有可用的原因分类/, 'a known code is not rendered as "no reason"');

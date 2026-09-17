@@ -241,7 +241,7 @@ export function luoguMetadataReasonText(reason: PlatformErrorReason | null): str
  */
 export const LUOGU_METADATA_CODE_TEXT: Readonly<Record<LuoguSyncFailureCode, string>> = {
   auth_required:
-    '上次读取这道题时，洛谷要求有效登录。可点「重试此题」：当前版本在匿名读取被要求登录时，会使用当前账号保存的会话重试。仍失败时请点「检查登录」，按结果重新连接。这不等于保存的登录凭据一定过期。',
+    '上次读取这道题时，洛谷要求有效登录。可点「重试此题」：当前版本在匿名读取被要求登录时，会使用当前账号保存的会话重试。仍失败时请点「验证已保存的 Cookie」，按结果重新连接。这不等于保存的登录凭据一定过期。',
   forbidden:
     '洛谷拒绝了对这道题的访问：可能是题目的访问权限或平台限制（自建 U / T 类题目常见），具体原因需要核对；可打开原题检查、稍后重试或手工补充。',
   rate_limited: '洛谷限流，这次没有取到这道题的公开资料：进度不受影响，请稍后重试，不要连续点击。',
